@@ -16,9 +16,15 @@
 
 #include "quant_batch_matmul_v3_utils.h"
 #include "quant_batch_matmul_v3_tiling_key.h"
-#include "quant_batch_matmul_v3_int8.h"
 
 #include "kernel_operator.h"
+
+// The opc compile injects the tiling data struct (class QBMTilingData)
+// generated from the op's REGISTER_TILING_DATA_CLASS. Alias it to the
+// name the compute classes expect.
+typedef QBMTilingData QBMParams;
+
+#include "quant_batch_matmul_v3_int8.h"
 
 using namespace AscendC;
 using namespace QBM;
