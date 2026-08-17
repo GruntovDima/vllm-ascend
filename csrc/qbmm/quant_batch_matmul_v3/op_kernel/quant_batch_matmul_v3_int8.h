@@ -102,6 +102,7 @@
 
 #include "quant_batch_matmul_v3_utils.h"
 #include "quant_batch_matmul_v3_config.h"
+#include "quant_batch_matmul_v3_tiling_data.h"
 #include "kernel_operator.h"
 
 namespace QBM {
