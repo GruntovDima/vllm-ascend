@@ -265,7 +265,7 @@ if (BUILD_OPEN_PROJECT)
                 OUTPUT_STRIP_TRAILING_WHITESPACE
                 OUTPUT_VARIABLE PREPARE_BUILD_OUTPUT_VARIABLE)
         if (result)
-            message(FATAL_ERROR "Error: ops prepare build failed.")
+            message(FATAL_ERROR "Error: ops prepare build failed.\n${PREPARE_BUILD_OUTPUT_VARIABLE}")
         endif ()
 
         file(REMOVE ${ASCEND_CUSTOM_OPTIONS})
