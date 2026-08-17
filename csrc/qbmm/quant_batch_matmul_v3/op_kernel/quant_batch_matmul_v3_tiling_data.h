@@ -10,8 +10,11 @@
 
 /*!
  * \file quant_batch_matmul_v3_tiling_data.h
- * \brief Kernel-side tiling data structs. Field order and names must match
- *        BEGIN_TILING_DATA_DEF(QBMParams) in op_host/quant_batch_matmul_v3_tiling.h.
+ * \brief Kernel-side tiling data struct. Field order and names must match
+ *        BEGIN_TILING_DATA_DEF(QBMTilingData) in op_host/quant_batch_matmul_v3_tiling.h.
+ *        The tiling struct must be flat: the tbe opc compile generates the
+ *        GET_TILING_DATA_WITH_STRUCT codegen from the registered class and
+ *        does not support nested struct fields.
  * \author Feodor Pisnitchenko
  */
 
@@ -20,7 +23,7 @@
 
 #include <cstdint>
 
-struct QBMParams {
+struct QBMTilingData {
     uint32_t batch;
     uint32_t M;
     uint32_t K;
@@ -52,8 +55,7 @@ struct QBMParams {
     uint32_t ubCalcM;          // inner-tile Phase D control (Q == 1 only)
 };
 
-struct QBMTilingData {
-    QBMParams params;
-};
+// The compute classes take the flat struct under the legacy name.
+typedef QBMTilingData QBMParams;
 
 #endif // QUANT_BATCH_MATMUL_V3_TILING_DATA_H

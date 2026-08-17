@@ -685,19 +685,19 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     uint32_t usedCoreNum = std::min(gridCores, std::max(1U, totalWork));
 
     QBMTilingData tilingData;
-    tilingData.params.set_batch(batch);
-    tilingData.params.set_M(M);
-    tilingData.params.set_K(K);
-    tilingData.params.set_N(N);
-    tilingData.params.set_usedCoreNum(usedCoreNum);
-    tilingData.params.set_hasPertoken(hasPertoken);
-    tilingData.params.set_quantGroupNum(quantGroupNum);
-    tilingData.params.set_maxOneTurnToken(baseM);
-    tilingData.params.set_maxWeightColOneTurn(baseN);
-    tilingData.params.set_baseK(baseK);
-    tilingData.params.set_scaleType(scaleType);
-    tilingData.params.set_isPerTensor(isPerTensor);
-    tilingData.params.set_phaseXChunk(t.phaseXChunk);
+    tilingData.set_batch(batch);
+    tilingData.set_M(M);
+    tilingData.set_K(K);
+    tilingData.set_N(N);
+    tilingData.set_usedCoreNum(usedCoreNum);
+    tilingData.set_hasPertoken(hasPertoken);
+    tilingData.set_quantGroupNum(quantGroupNum);
+    tilingData.set_maxOneTurnToken(baseM);
+    tilingData.set_maxWeightColOneTurn(baseN);
+    tilingData.set_baseK(baseK);
+    tilingData.set_scaleType(scaleType);
+    tilingData.set_isPerTensor(isPerTensor);
+    tilingData.set_phaseXChunk(t.phaseXChunk);
     uint32_t pxChunk = t.phaseXChunk;
     uint32_t pxFullPairs = 0;
     uint32_t pxTail = K;
@@ -706,16 +706,16 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
         pxFullPairs = K / (2 * pxChunk);
         pxTail = K - pxFullPairs * 2 * pxChunk;
     }
-    tilingData.params.set_phaseXFullPairs(pxFullPairs);
-    tilingData.params.set_phaseXTail(pxTail);
+    tilingData.set_phaseXFullPairs(pxFullPairs);
+    tilingData.set_phaseXTail(pxTail);
 
-    tilingData.params.set_MCoreNum(grid.MCoreNum);
-    tilingData.params.set_NCoreNum(grid.NCoreNum);
-    tilingData.params.set_wChunkKPasses(t.wChunkKPasses);
+    tilingData.set_MCoreNum(grid.MCoreNum);
+    tilingData.set_NCoreNum(grid.NCoreNum);
+    tilingData.set_wChunkKPasses(t.wChunkKPasses);
     const uint32_t scaleCoalesce =
         ComputeScaleCoalesce(quantGroupNum, baseN, N,
                              isPerTensor, scaleType);
-    tilingData.params.set_scaleCoalesce(scaleCoalesce);
+    tilingData.set_scaleCoalesce(scaleCoalesce);
 
     // L2 cache hint mode for every GM tensor's SetL2CacheHint.
     // CacheMode enum: DISABLE=0, NORMAL=1, PERSISTENT=4.
@@ -737,15 +737,15 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     } else if (sharedWeightFits) {
         l2HintMode = 4U;  // PERSISTENT
     }
-    tilingData.params.set_l2HintMode(l2HintMode);
+    tilingData.set_l2HintMode(l2HintMode);
 
     // L2 super-tile geometry is disabled: a single super-tile covers the
     // full work space, and the kernel's outer (mTSuperIdx, nTSuperIdx)
     // loops collapse to one iteration.
-    tilingData.params.set_mTileCntL2(1U);
-    tilingData.params.set_nTileCntL2(1U);
-    tilingData.params.set_mTileBlock(totalMTiles);
-    tilingData.params.set_nTileBlock(totalColBatch);
+    tilingData.set_mTileCntL2(1U);
+    tilingData.set_nTileCntL2(1U);
+    tilingData.set_mTileBlock(totalMTiles);
+    tilingData.set_nTileBlock(totalColBatch);
 
     // L0C ping-pong: when 2*baseM*baseN*4 fits L0C, double-buffer L0C so
     // the Mmad of cb_{i+1} on half b can overlap the VDEQ16 of cb_i on
@@ -754,7 +754,7 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
         static_cast<uint64_t>(baseM) * baseN * 4U;
     const uint32_t dbL0c =
         (2U * l0cHalfBytes <= compileInfoPtr->l0CSize) ? 1U : 0U;
-    tilingData.params.set_dbL0c(dbL0c);
+    tilingData.set_dbL0c(dbL0c);
 
     // Pertoken coalesce: when (B*M*4) fits a small UB budget, fire
     // ONE MTE2 at Process entry covering ALL B*M floats; per-mTile use
@@ -766,12 +766,12 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
         (hasPertoken &&
          static_cast<uint64_t>(batch) * M * 4U <= PT_COALESCE_BUDGET_BYTES)
         ? 1U : 0U;
-    tilingData.params.set_pertokenCoalesce(pertokenCoalesce);
-    tilingData.params.set_hasBias(hasBias);
-    tilingData.params.set_kTail(kTail);
+    tilingData.set_pertokenCoalesce(pertokenCoalesce);
+    tilingData.set_hasBias(hasBias);
+    tilingData.set_kTail(kTail);
     // Inner-tile Phase D is disabled: ubCalcM=0 routes the kernel to its
     // single-shot Phase D drain over the full mAligned range.
-    tilingData.params.set_ubCalcM(0U);
+    tilingData.set_ubCalcM(0U);
 
     context->SetBlockDim(usedCoreNum);
 

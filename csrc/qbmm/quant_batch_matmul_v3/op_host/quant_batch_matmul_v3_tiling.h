@@ -22,7 +22,12 @@
 
 namespace optiling {
 
-BEGIN_TILING_DATA_DEF(QBMParams)
+// NOTE: the tiling data struct must be FLAT. The tbe opc compile extracts the
+// struct definition from REGISTER_TILING_DATA_CLASS to generate the
+// GET_TILING_DATA_WITH_STRUCT codegen; nested TILING_DATA_FIELD_DEF_STRUCT
+// entries are not exported and the kernel compile then lacks the tiling
+// macros entirely.
+BEGIN_TILING_DATA_DEF(QBMTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, batch);
 TILING_DATA_FIELD_DEF(uint32_t, M);
 TILING_DATA_FIELD_DEF(uint32_t, K);
@@ -60,11 +65,6 @@ TILING_DATA_FIELD_DEF(uint32_t, kTail);            // K % 32; non-zero requires 
 //                                partial VDEQ16 does not race with the
 //                                still-in-flight MTE3 CopyOut.
 TILING_DATA_FIELD_DEF(uint32_t, ubCalcM);
-END_TILING_DATA_DEF;
-REGISTER_TILING_DATA_CLASS(QBMParamsOp, QBMParams)
-
-BEGIN_TILING_DATA_DEF(QBMTilingData)
-TILING_DATA_FIELD_DEF_STRUCT(QBMParams, params);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(QuantBatchMatmulV3, QBMTilingData)

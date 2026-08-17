@@ -39,6 +39,6 @@ __global__ __aicore__ void quant_batch_matmul_v3(
 
     QBMInt8Compute<SCALE_UINT64> op;
     op.Init(x1, x2, scale, offset, bias, pertokenScale, y,
-            workspace, &tilingData.params, &tPipe);
+            workspace, &tilingData, &tPipe);
     op.Process();
 }
