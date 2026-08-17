@@ -287,6 +287,120 @@ def maybe_trans_nz(weight: torch.Tensor) -> torch.Tensor:
     return torch_npu.npu_format_cast(weight, ACL_FORMAT_FRACTAL_NZ)
 
 
+# ---------------------------------------------------------------------------
+# ZN (K-major int8 fractal) layout for the 310P quant_batch_matmul_v3 consumer.
+# CANN 9.0.0 has no plain FRACTAL_ZN ACL enum (only the RNN/LSTM variants), so
+# "ZN" is this byte layout carried under FRACTAL_NZ (id 29) with a logical
+# [K, N] view:
+#   standard: zn[k // 32, n // 16, n % 16, k % 32]  (storage [K1, N1, 16, 32])
+#   compact K-tail: when K % 32 != 0, an [N1, N0, K_tail] section is appended
+#                   (total bytes = K * N, no zero padding)
+#   blocked: when N1 > BLOCKED_N1, N is split into column blocks of <= 65280
+#            columns, each block standard-ZN, concatenated (per-block K1 stride)
+# Reference: quant-batch-matmul/device_tests/generate_data.py
+ZN_N0 = 16
+ZN_K0 = 32
+BLOCKED_N1 = 4080                  # kernel's BLOCKED_ZN_NG (config.h)
+MAX_N_PER_BLOCK = BLOCKED_N1 * ZN_N0   # 65280 columns per blocked-ZN block
+
+
+def _zn_standard_bytes(weight: torch.Tensor) -> torch.Tensor:
+    """Flat ZN bytes of a [K, N] int8 tensor (full K0-groups + compact K-tail).
+
+    Pure tensor ops (CPU or NPU); returns a contiguous 1-D tensor with
+    K * N elements. Mirrors generate_data.py::_nd_to_standard_zn.
+    """
+    assert weight.dim() == 2 and weight.dtype == torch.int8
+    K, N = weight.shape
+    assert N % ZN_N0 == 0, f"N={N} must be divisible by {ZN_N0}"
+    k_aligned = (K // ZN_K0) * ZN_K0
+    k_tail = K - k_aligned
+    parts = []
+    if k_aligned > 0:
+        full = weight[:k_aligned].reshape(k_aligned // ZN_K0, ZN_K0, N // ZN_N0, ZN_N0)
+        parts.append(full.permute(0, 2, 3, 1).contiguous().reshape(-1))
+    if k_tail > 0:
+        partial = weight[k_aligned:].t().reshape(N // ZN_N0, ZN_N0, k_tail)
+        parts.append(partial.contiguous().reshape(-1))
+    if not parts:
+        return weight.new_empty(0, dtype=weight.dtype)
+    return torch.cat(parts)
+
+
+def _zn_blocked_bytes(weight: torch.Tensor) -> torch.Tensor:
+    """Flat blocked-ZN bytes for N1 > BLOCKED_N1 (N > 65280).
+
+    Each column block of up to MAX_N_PER_BLOCK columns is standard-ZN with
+    the block's own N1; blocks concatenate in N order (no padding).
+    Mirrors generate_data.py::_nd_to_blocked_zn; requires K % 32 == 0.
+    """
+    assert weight.dim() == 2 and weight.dtype == torch.int8
+    K, N = weight.shape
+    assert N % ZN_N0 == 0
+    assert K % ZN_K0 == 0, "blocked ZN requires K % 32 == 0"
+    blocks = []
+    for col in range(0, N, MAX_N_PER_BLOCK):
+        blocks.append(_zn_standard_bytes(weight[:, col:col + MAX_N_PER_BLOCK]))
+    return torch.cat(blocks)
+
+
+def nd_to_zn(weight: torch.Tensor) -> torch.Tensor:
+    """Convert an [N, K] int8 ND weight into the ZN layout.
+
+    Returns a FRACTAL_NZ (acl_format=29) tensor with a logical [K, N] view
+    whose physical bytes are the ZN sequence (standard or blocked by N1) --
+    exactly what quant_batch_matmul_v3 consumes with transpose_x2=False.
+    Tagging mirrors the device-test idiom (run_one.py): empty_with_format on
+    the logical [K, N] shape + copy_memory_ of the K*N-byte flat buffer.
+    """
+    assert weight.dim() == 2, f"expected a 2-D [N, K] weight, got {weight.shape}"
+    assert weight.dtype == torch.int8, f"expected int8, got {weight.dtype}"
+    N, K = weight.shape
+    assert N % ZN_N0 == 0, (
+        f"N={N} must be divisible by {ZN_N0} (quant_batch_matmul_v3 ZN contract)"
+    )
+    weight_kn = weight.t().contiguous()  # [K, N] view for the byte mapping
+    if N // ZN_N0 > BLOCKED_N1:
+        bytes_flat = _zn_blocked_bytes(weight_kn)
+    else:
+        bytes_flat = _zn_standard_bytes(weight_kn)
+    zn = torch_npu.empty_with_format(
+        (K, N), dtype=torch.int8, device=weight.device, acl_format=ACL_FORMAT_FRACTAL_NZ
+    )
+    torch_npu.copy_memory_(zn, bytes_flat.contiguous())
+    return zn
+
+
+def nz_to_zn(weight: torch.Tensor) -> torch.Tensor:
+    """Reinterpret a FRACTAL_NZ int8 weight (logical [N, K]) as ZN.
+
+    The [K, N] transposed view of the NZ tensor carries the K-major ZN byte
+    order, so only a logical transpose is needed (no bytes move).
+    """
+    assert weight.dim() == 2 and weight.dtype == torch.int8
+    N, K = weight.shape
+    assert N % ZN_N0 == 0 and K % ZN_K0 == 0
+    return weight.transpose(0, 1)
+
+
+def maybe_trans_zn(weight: torch.Tensor) -> torch.Tensor:
+    """310P weight policy for the quant_batch_matmul_v3 (ZN) consumer.
+
+    - fp32 / meta: passthrough (never converted)
+    - non-310P: passthrough (ZN is a 310P-only byte layout)
+    - 310P: non-fp32/non-meta weights -> nd_to_zn, regardless of
+      weight_nz_mode (same short-circuit as _should_trans_nz on 310P)
+
+    Deliberately does not reuse _should_trans_nz: that policy gates the
+    FRACTAL_NZ conversion on non-310P devices via weight_nz_mode and its
+    contract is NZ (logical shape preserved); ZN additionally swaps the
+    logical view to [K, N] and only the qbmm_v3 consumer understands it.
+    """
+    if weight.dtype == torch.float32 or weight.is_meta or not is_310p():
+        return weight
+    return nd_to_zn(weight)
+
+
 def _round_up(x: int, align: int):
     # round up x to align, for example, if align is 16, x will be rounded up to 16, 32, 48, etc.
     # input: 15, 16 -> output: 16

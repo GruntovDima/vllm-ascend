@@ -127,9 +127,9 @@ class TestAscendW8A8LinearMethod310(TestBase):
         self.assertTrue(torch.equal(output, expected_y_output))
 
     @patch("vllm_ascend.utils.get_current_hardware_profile", return_value=get_hardware_profile(AscendDeviceType._310P))
-    @patch("torch_npu.npu_format_cast")
-    def test_process_weights_after_loading_calls_nz_format_cast_310p(self, mock_npu_format_cast, _mock_is_310p):
-        mock_npu_format_cast.side_effect = lambda x, fmt: x
+    @patch("vllm_ascend._310p.quantization.methods.w8a8_static.maybe_trans_zn")
+    def test_process_weights_after_loading_calls_zn_conversion_310p(self, mock_maybe_trans_zn, _mock_profile):
+        mock_maybe_trans_zn.side_effect = lambda x: x
 
         layer = MagicMock()
 
@@ -152,4 +152,4 @@ class TestAscendW8A8LinearMethod310(TestBase):
 
         self.method.process_weights_after_loading(layer)
 
-        mock_npu_format_cast.assert_called_once()
+        mock_maybe_trans_zn.assert_called_once()

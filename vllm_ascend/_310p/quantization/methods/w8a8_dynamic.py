@@ -27,7 +27,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import build_fused_experts_input
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
 from vllm_ascend.quantization.methods.base import AscendMoEScheme, QuantType
-from vllm_ascend.utils import maybe_trans_nz
+from vllm_ascend.utils import maybe_trans_nz, maybe_trans_zn
 
 from .registry import register_scheme
 from .w8a8_base import AscendW8A8Linear310pScheme
@@ -111,6 +111,9 @@ class AscendW8A8DynamicFusedMoEMethod310(AscendMoEScheme):
         return final_hidden_states
 
     def process_weights_after_loading(self, layer):
+        # NOTE: fused_moe consumes these as FRACTAL_NZ logical [E, 2F, H] /
+        # [E, H, F] (no [K, N] swap, no ZN bytes), so the ZN layout does not
+        # apply here -- keep maybe_trans_nz (NZ, no transpose).
         layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
         layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(layer.w13_weight_scale.data.shape[0], -1)
@@ -177,7 +180,7 @@ class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
         return output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # cast quantized weight tensors in NZ format for higher inference speed
-        layer.weight.data = maybe_trans_nz(layer.weight.data).transpose(0, 1)
+        # cast quantized weight tensors into the ZN layout for higher inference speed
+        layer.weight.data = maybe_trans_zn(layer.weight.data)
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_offset.data = layer.weight_offset.data.flatten()

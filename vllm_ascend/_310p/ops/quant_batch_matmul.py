@@ -48,8 +48,11 @@ def quant_batch_matmul(
     Args:
         x1: int8 activation, shape [..., M, K].
         x2: int8 weight, shape [..., K, N] (ND) or the FRACTAL_NZ tensor in
-            [K, N] view with K-major blocks as produced by
-            maybe_trans_nz(weight[N, K]).transpose(0, 1).
+            [K, N] view carrying the ZN byte layout (storage [K1, N1, 16, 32]
+            with a compact [N1, N0, K_tail] section when K % 32 != 0, or the
+            blocked-ZN variant for N1 > 4080) as produced by
+            vllm_ascend.utils.nd_to_zn / maybe_trans_zn. ZN total bytes =
+            K * N (no padding).
         scale: per-channel weight dequant scale, shape [N] (int64
             pre-encoded or fp32), or [1], or [Q, N] for group-wise quant.
         offset: optional fp32 dequant offset added after the matmul.

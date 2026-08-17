@@ -20,7 +20,7 @@ from typing import Any
 import torch
 
 from vllm_ascend._310p.ops.quant_batch_matmul import quant_batch_matmul
-from vllm_ascend.utils import maybe_trans_nz
+from vllm_ascend.utils import maybe_trans_zn
 
 from .registry import register_scheme
 from .w8a8_base import AscendW8A8Linear310pScheme
@@ -61,9 +61,10 @@ class AscendW8A8LinearMethod310(AscendW8A8Linear310pScheme):
 
         # NOTE(310P):
         # quant_batch_matmul_v3 consumes the weight as a FRACTAL_NZ tensor in
-        # [K, N] view with K-major blocks (storage [K1, N1, 16, 32]) -- exactly
-        # what maybe_trans_nz(weight).transpose(0, 1) produces in
-        # process_weights_after_loading. transpose_x2 is therefore False.
+        # [K, N] view carrying the ZN byte layout (storage [K1, N1, 16, 32]
+        # with a compact K-tail when K % 32 != 0) -- exactly what
+        # maybe_trans_zn(weight) produces in process_weights_after_loading.
+        # transpose_x2 is therefore False.
         return quant_batch_matmul(
             x,
             layer.weight.data,
@@ -91,7 +92,7 @@ class AscendW8A8LinearMethod310(AscendW8A8Linear310pScheme):
         ).to(layer.aclnn_input_scale.dtype)
 
         # ---- matmul stage tensor ----
-        layer.weight.data = maybe_trans_nz(layer.weight.data).transpose(0, 1)
+        layer.weight.data = maybe_trans_zn(layer.weight.data)
 
         # ---- dequant stage tensors ----
         layer.weight_scale.data = torch.flatten(layer.weight_scale.data)
