@@ -35,10 +35,10 @@ __global__ __aicore__ void quant_batch_matmul_v3(
         workspace = workSpace;
     }
 
-    GET_TILING_DATA_MEMBER(QBMTilingData, params, params_, tiling);
+    GET_TILING_DATA_WITH_STRUCT(QBMTilingData, tilingData, tiling);
 
     QBMInt8Compute<SCALE_UINT64> op;
     op.Init(x1, x2, scale, offset, bias, pertokenScale, y,
-            workspace, &params_, &tPipe);
+            workspace, &tilingData.params, &tPipe);
     op.Process();
 }
