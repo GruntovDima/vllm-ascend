@@ -53,8 +53,8 @@ class TestAscendW8A8LinearMethod310(TestBase):
         self.assertEqual(params["weight_offset"].shape, (10, 1))
 
     @patch("torch.ops.vllm.quantize")
-    @patch("torch_npu.npu_quant_matmul")
-    def test_apply_with_x_not_int8_310(self, mock_npu_quant_matmul, mock_quantize):
+    @patch("vllm_ascend._310p.quantization.methods.w8a8_static.quant_batch_matmul")
+    def test_apply_with_x_not_int8_310(self, mock_quant_batch_matmul, mock_quantize):
         layer = MagicMock()
         layer.aclnn_input_scale = torch.randn(256)
         layer.aclnn_input_scale_reciprocal = 1.0 / layer.aclnn_input_scale
@@ -69,7 +69,7 @@ class TestAscendW8A8LinearMethod310(TestBase):
         mock_quantize.return_value = expect_x_output
 
         expected_y_output = torch.randn(32, 256)
-        mock_npu_quant_matmul.return_value = expected_y_output
+        mock_quant_batch_matmul.return_value = expected_y_output
 
         output = self.method.apply(layer, x, tp_rank=0)
 
@@ -79,8 +79,8 @@ class TestAscendW8A8LinearMethod310(TestBase):
             layer.aclnn_input_scale_reciprocal,
             layer.aclnn_input_offset,
         )
-        mock_npu_quant_matmul.assert_called_once()
-        (args, kwargs) = mock_npu_quant_matmul.call_args
+        mock_quant_batch_matmul.assert_called_once()
+        (args, kwargs) = mock_quant_batch_matmul.call_args
 
         # positional args
         self.assertTrue(torch.equal(args[0], expect_x_output))
@@ -89,13 +89,14 @@ class TestAscendW8A8LinearMethod310(TestBase):
 
         # kwargs
         self.assertTrue(torch.equal(kwargs["bias"], layer.quant_bias))
+        self.assertFalse(kwargs["transpose_x2"])
         self.assertEqual(kwargs["output_dtype"], layer.params_dtype)
 
         self.assertTrue(torch.equal(output, expected_y_output))
 
     @patch("torch.ops.vllm.quantize")
-    @patch("torch_npu.npu_quant_matmul")
-    def test_apply_with_x_is_int8_310(self, mock_npu_quant_matmul, mock_quantize):
+    @patch("vllm_ascend._310p.quantization.methods.w8a8_static.quant_batch_matmul")
+    def test_apply_with_x_is_int8_310(self, mock_quant_batch_matmul, mock_quantize):
         layer = MagicMock()
         layer.aclnn_input_scale = torch.randn(256)
         layer.aclnn_input_offset = torch.randint(-128, 127, (256,), dtype=torch.int8)
@@ -107,19 +108,20 @@ class TestAscendW8A8LinearMethod310(TestBase):
         x = torch.randint(-128, 127, (32, 128), dtype=torch.int8)
 
         expected_y_output = torch.randn(32, 256)
-        mock_npu_quant_matmul.return_value = expected_y_output
+        mock_quant_batch_matmul.return_value = expected_y_output
 
         output = self.method.apply(layer, x, tp_rank=0)
 
         mock_quantize.assert_not_called()
-        mock_npu_quant_matmul.assert_called_once()
-        (args, kwargs) = mock_npu_quant_matmul.call_args
+        mock_quant_batch_matmul.assert_called_once()
+        (args, kwargs) = mock_quant_batch_matmul.call_args
 
         self.assertTrue(torch.equal(args[0], x))
         self.assertTrue(torch.equal(args[1], layer.weight.data))
         self.assertTrue(torch.equal(args[2], layer.deq_scale))
 
         self.assertTrue(torch.equal(kwargs["bias"], layer.quant_bias))
+        self.assertFalse(kwargs["transpose_x2"])
         self.assertEqual(kwargs["output_dtype"], layer.params_dtype)
 
         self.assertTrue(torch.equal(output, expected_y_output))

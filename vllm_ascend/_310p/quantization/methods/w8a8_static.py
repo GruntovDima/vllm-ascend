@@ -18,8 +18,8 @@
 from typing import Any
 
 import torch
-import torch_npu
 
+from vllm_ascend._310p.ops.quant_batch_matmul import quant_batch_matmul
 from vllm_ascend.utils import maybe_trans_nz
 
 from .registry import register_scheme
@@ -60,16 +60,16 @@ class AscendW8A8LinearMethod310(AscendW8A8Linear310pScheme):
         quant_bias = layer.quant_bias if tp_rank == 0 else None
 
         # NOTE(310P):
-        # - Current torch_npu.npu_quant_matmul on Ascend 310P expects the weight layout in a transposed form
-        #   for correct/efficient execution, so we pass `layer.weight.T` here.
-        # - This is a temporary workaround. The planned replacement quant-matmul op will accept the
-        #   canonical (non-transposed) weight layout directly, so this explicit transpose will be removed
-        #   once that op is enabled on 310P.
-        return torch_npu.npu_quant_matmul(
+        # quant_batch_matmul_v3 consumes the weight as a FRACTAL_NZ tensor in
+        # [K, N] view with K-major blocks (storage [K1, N1, 16, 32]) -- exactly
+        # what maybe_trans_nz(weight).transpose(0, 1) produces in
+        # process_weights_after_loading. transpose_x2 is therefore False.
+        return quant_batch_matmul(
             x,
             layer.weight.data,
             layer.deq_scale,
             bias=quant_bias,
+            transpose_x2=False,
             output_dtype=layer.params_dtype,
         )
 

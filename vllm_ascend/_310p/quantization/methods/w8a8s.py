@@ -17,8 +17,8 @@
 
 
 import torch
-import torch_npu
 
+from vllm_ascend._310p.ops.quant_batch_matmul import quant_batch_matmul
 from vllm_ascend.utils import maybe_trans_nz
 
 from .registry import register_scheme
@@ -50,11 +50,12 @@ class AscendW8A8SLinearMethod310(AscendW8A8Linear310pScheme):
 
         quant_bias = layer.quant_bias if tp_rank == 0 else None
 
-        return torch_npu.npu_quant_matmul(
+        return quant_batch_matmul(
             x,
-            layer.weight.data.transpose(0, 1),
+            layer.weight.data,
             layer.deq_scale,
             bias=quant_bias,
+            transpose_x2=False,
             output_dtype=layer.params_dtype,
         )
 
@@ -63,4 +64,6 @@ class AscendW8A8SLinearMethod310(AscendW8A8Linear310pScheme):
         layer.aclnn_input_scale = layer.input_scale.data.repeat(expanding_factor)
         layer.aclnn_input_scale_reciprocal = 1.0 / layer.aclnn_input_scale.data
         layer.aclnn_input_offset = layer.input_offset.data.repeat(expanding_factor).to(layer.aclnn_input_scale.dtype)
-        layer.weight.data = maybe_trans_nz(layer.weight.data)
+        # quant_batch_matmul_v3 expects the NZ weight in [K, N] view with
+        # K-major blocks; transpose at load time to avoid per-forward work.
+        layer.weight.data = maybe_trans_nz(layer.weight.data).transpose(0, 1)
