@@ -11,8 +11,20 @@
 file(GLOB SUBDIRECTORIES LIST_DIRECTORIES true RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/*)
 # 遍历子目录
 foreach(SUBDIR ${SUBDIRECTORIES})
+  if (DEFINED ASCEND_OP_NAME AND NOT "${ASCEND_OP_NAME}" STREQUAL "")
+    if (NOT "${ASCEND_OP_NAME}" STREQUAL "all" AND NOT "${ASCEND_OP_NAME}" STREQUAL "ALL")
+      if (NOT ${SUBDIR} IN_LIST ASCEND_OP_NAME)
+        continue()
+      endif ()
+    endif ()
+  endif ()
+
   # 检查子目录中是否存在 CMakeLists.txt
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${SUBDIR}/CMakeLists.txt)
     add_subdirectory(${SUBDIR})
+  else()
+    if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${SUBDIR}/op_host/CMakeLists.txt)
+      add_subdirectory(${SUBDIR}/op_host)
+    endif()
   endif()
 endforeach()
