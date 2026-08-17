@@ -19,8 +19,6 @@
 
 #include "register/op_def_registry.h"
 
-ge::graphStatus InferShapeForQuantBatchMatmulV3(gert::InferShapeContext* context);
-
 namespace ops {
 class QuantBatchMatmulV3 : public OpDef {
 public:
@@ -147,8 +145,6 @@ public:
             .ExtendCfgInfo("aclnnSupport.value", "support_aclnn");
 
         this->AICore().AddConfig("ascend310p", config_310p);
-
-        this->SetInferShape(InferShapeForQuantBatchMatmulV3);
     }
 };
 
