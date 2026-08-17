@@ -16,3 +16,14 @@ if (BUILD_OPEN_PROJECT)
 endif()
 
 add_modules_sources(OPTYPE quant_batch_matmul_v3 ACLNNTYPE aclnn)
+
+# The tiling helper sources are not covered by add_modules_sources' globs
+# (which only pick up *_tiling*.cpp / *fallback*.cpp / op_tiling/*.cpp), so
+# compile them into the tiling object explicitly. Otherwise liboptiling.so
+# links with an undefined cost-model symbol and the tbe dlopen fails.
+target_sources(${OPHOST_NAME}_tiling_obj PRIVATE
+    tiling_cost_model.cpp
+)
+target_include_directories(${OPHOST_NAME}_tiling_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
