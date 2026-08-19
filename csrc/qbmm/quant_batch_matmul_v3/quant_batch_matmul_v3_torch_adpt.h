@@ -41,7 +41,9 @@ at::Tensor quant_batch_matmul_v3(
 
     // The generated aclnn wrapper selects the FRACTAL_NZ / ND kernel variant
     // from x2's storage format, so no format dispatch is needed here.
-    // dtype is the output dtype code: 1 = FP16.
+    // dtype is the output dtype code: 1 = FP16. It must be an lvalue --
+    // EXEC_NPU_CMD forwards arguments as non-const lvalue references.
+    const int64_t dtype = 1;
     EXEC_NPU_CMD(aclnnQuantBatchMatmulV3,
                  x1,
                  x2,
@@ -49,7 +51,7 @@ at::Tensor quant_batch_matmul_v3(
                  offset,
                  bias,
                  pertoken_scale,
-                 static_cast<int64_t>(1),
+                 dtype,
                  transpose_x1,
                  transpose_x2,
                  group_size,
