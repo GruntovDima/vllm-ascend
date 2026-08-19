@@ -515,11 +515,20 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     auto x2Tensor = context->GetInputTensor(1);
     if (x1Tensor == nullptr || x2Tensor == nullptr) return ge::GRAPH_FAILED;
 
-    auto compileInfoPtr = context->GetCompileInfo<QBMCompileInfo>();
-    if (compileInfoPtr == nullptr) return ge::GRAPH_FAILED;
-
-    const uint32_t aicNum = compileInfoPtr->aicNum;
+    // Platform info is read directly from the TilingContext: the aclnn
+    // runtime executor does not run the TilingParse callback, so a
+    // GetCompiledInfo-based flow returns nullptr there and the tiling
+    // fails with GRAPH_FAILED. Same approach as causal_conv1d_v310.
+    fe::PlatFormInfos* platformInfoPtr = context->GetPlatformInfo();
+    if (platformInfoPtr == nullptr) return ge::GRAPH_FAILED;
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfoPtr);
+    const uint32_t aicNum = ascendcPlatform.GetCoreNumAic();
     if (aicNum == 0U) return ge::GRAPH_FAILED;
+    const uint64_t ubSize = ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB);
+    const uint64_t l1Size = ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L1);
+    const uint64_t l0ASize = ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_A);
+    const uint64_t l0BSize = ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_B);
+    const uint64_t l0CSize = ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C);
 
     // Get dimensions from x1 shape: [..., M, K]
     auto& x1Shape = x1Tensor->GetStorageShape();
@@ -627,7 +636,7 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     // Reserve UB for the persistent ubBias_ buffer (N int32 + bank pad)
     // so the tile picker's feasibility check sees the reduced workspace
     // budget. Mirrors the layout in the kernel's Init.
-    uint64_t ubSizeForPicker = compileInfoPtr->ubSize;
+    uint64_t ubSizeForPicker = ubSize;
     if (hasBias != 0) {
         uint64_t biasReserve =
             ((static_cast<uint64_t>(N) * sizeof(int32_t) + 31U) / 32U) * 32U +
@@ -644,9 +653,9 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     // strides and scatter destination sizes.
     Int8TilingResult t = ComputeInt8Tiling(
         M, N, K_padded, quantGroupNum, batch, aicNum,
-        ubSizeForPicker, compileInfoPtr->l0ASize,
-        compileInfoPtr->l0BSize, compileInfoPtr->l0CSize,
-        compileInfoPtr->l1Size, isPerTensor, scaleType,
+        ubSizeForPicker, l0ASize,
+        l0BSize, l0CSize,
+        l1Size, isPerTensor, scaleType,
         hasPertoken);
     if (t.baseM == 0) {
         return ge::GRAPH_FAILED;
@@ -753,7 +762,7 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     const uint64_t l0cHalfBytes =
         static_cast<uint64_t>(baseM) * baseN * 4U;
     const uint32_t dbL0c =
-        (2U * l0cHalfBytes <= compileInfoPtr->l0CSize) ? 1U : 0U;
+        (2U * l0cHalfBytes <= l0CSize) ? 1U : 0U;
     tilingData.set_dbL0c(dbL0c);
 
     // Pertoken coalesce: when (B*M*4) fits a small UB budget, fire
@@ -794,20 +803,8 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
 }
 
 ASCENDC_EXTERN_C ge::graphStatus TilingPrepareForQBM(gert::TilingParseContext* context) {
-    if (context == nullptr) return ge::GRAPH_FAILED;
-    fe::PlatFormInfos* platformInfoPtr = context->GetPlatformInfo();
-    if (platformInfoPtr == nullptr) return ge::GRAPH_FAILED;
-    auto compileInfoPtr = context->GetCompiledInfo<QBMCompileInfo>();
-    if (compileInfoPtr == nullptr) return ge::GRAPH_FAILED;
-
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfoPtr);
-    compileInfoPtr->aicNum = ascendcPlatform.GetCoreNumAic();
-    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, compileInfoPtr->ubSize);
-    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L1, compileInfoPtr->l1Size);
-    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_A, compileInfoPtr->l0ASize);
-    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_B, compileInfoPtr->l0BSize);
-    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, compileInfoPtr->l0CSize);
-
+    // The aclnn runtime executor does not invoke the TilingParse callback;
+    // TilingQBM reads platform info directly from the TilingContext instead.
     return ge::GRAPH_SUCCESS;
 }
 
