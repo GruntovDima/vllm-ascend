@@ -524,11 +524,12 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfoPtr);
     const uint32_t aicNum = ascendcPlatform.GetCoreNumAic();
     if (aicNum == 0U) return ge::GRAPH_FAILED;
-    const uint64_t ubSize = ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB);
-    const uint64_t l1Size = ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L1);
-    const uint64_t l0ASize = ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_A);
-    const uint64_t l0BSize = ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_B);
-    const uint64_t l0CSize = ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C);
+    uint64_t ubSize = 0, l1Size = 0, l0ASize = 0, l0BSize = 0, l0CSize = 0;
+    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
+    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L1, l1Size);
+    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_A, l0ASize);
+    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_B, l0BSize);
+    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, l0CSize);
 
     // Get dimensions from x1 shape: [..., M, K]
     auto& x1Shape = x1Tensor->GetStorageShape();
