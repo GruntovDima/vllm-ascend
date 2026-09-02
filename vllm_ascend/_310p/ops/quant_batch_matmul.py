@@ -15,9 +15,22 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
+
 import torch
 
 _OP_NAME = "quant_batch_matmul_v3"
+
+
+def use_custom_quant_batch_matmul() -> bool:
+    """Whether 310P linear layers should use the custom QBM implementation."""
+    # vLLM sanitizes unknown VLLM_* variables before spawning EngineCore.
+    # Prefer the unreserved name so the opt-out reaches the worker process.
+    value = os.getenv(
+        "ASCEND_310P_USE_CUSTOM_QBM",
+        os.getenv("VLLM_ASCEND_310P_USE_CUSTOM_QBM", "1"),
+    )
+    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _require_quant_batch_matmul() -> None:

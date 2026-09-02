@@ -18,9 +18,13 @@
 from typing import Any
 
 import torch
+import torch_npu
 
-from vllm_ascend._310p.ops.quant_batch_matmul import quant_batch_matmul
-from vllm_ascend.utils import maybe_trans_zn
+from vllm_ascend._310p.ops.quant_batch_matmul import (
+    quant_batch_matmul,
+    use_custom_quant_batch_matmul,
+)
+from vllm_ascend.utils import maybe_trans_nz, maybe_trans_zn
 
 from .registry import register_scheme
 from .w8a8_base import AscendW8A8Linear310pScheme
@@ -65,12 +69,20 @@ class AscendW8A8LinearMethod310(AscendW8A8Linear310pScheme):
         # with a compact K-tail when K % 32 != 0) -- exactly what
         # maybe_trans_zn(weight) produces in process_weights_after_loading.
         # transpose_x2 is therefore False.
-        return quant_batch_matmul(
+        if use_custom_quant_batch_matmul():
+            return quant_batch_matmul(
+                x,
+                layer.weight.data,
+                layer.deq_scale,
+                bias=quant_bias,
+                transpose_x2=False,
+                output_dtype=layer.params_dtype,
+            )
+        return torch_npu.npu_quant_matmul(
             x,
-            layer.weight.data,
+            layer.weight,
             layer.deq_scale,
             bias=quant_bias,
-            transpose_x2=False,
             output_dtype=layer.params_dtype,
         )
 
@@ -92,7 +104,10 @@ class AscendW8A8LinearMethod310(AscendW8A8Linear310pScheme):
         ).to(layer.aclnn_input_scale.dtype)
 
         # ---- matmul stage tensor ----
-        layer.weight.data = maybe_trans_zn(layer.weight.data)
+        if use_custom_quant_batch_matmul():
+            layer.weight.data = maybe_trans_zn(layer.weight.data)
+        else:
+            layer.weight.data = maybe_trans_nz(layer.weight.data).transpose(0, 1)
 
         # ---- dequant stage tensors ----
         layer.weight_scale.data = torch.flatten(layer.weight_scale.data)

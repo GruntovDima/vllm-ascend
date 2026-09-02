@@ -43,6 +43,13 @@ __global__ __aicore__ void quant_batch_matmul_v3(
 
     GET_TILING_DATA_WITH_STRUCT(QBMTilingData, tilingData, tiling);
 
+    // Temporary dispatch probe: exactly one line per QBM launch (core 0 only).
+    // Remove after the runtime trace has been collected.
+    if (GetBlockIdx() == 0) {
+        printf("[QBM_TRACE] QuantBatchMatmulV3 dispatched: trans=%d template=%d pertoken=%d option=%d\n",
+               TRANS, KERNEL_TEMPLATE_TYPE, PERTOKEN, OPTIONATTR);
+    }
+
     QBMInt8Compute<SCALE_UINT64> op;
     op.Init(x1, x2, scale, offset, bias, pertokenScale, y,
             workspace, &tilingData, &tPipe);
