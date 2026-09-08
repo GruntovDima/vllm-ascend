@@ -2144,6 +2144,17 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "chunk_fwd_o(Tensor q, Tensor k, Tensor v, Tensor h, float scale, *, Tensor? g=None, Tensor? g_gamma=None, int[]? cu_seqlens=None, int[]? chunk_indices=None, int? chunk_size=None, bool? transpose_state_layout=False) -> Tensor"
     );
     ops.impl("chunk_fwd_o", torch::kPrivateUse1, &vllm_ascend::chunk_fwd_o);
+    ops.def(
+        "quant_batch_matmul_v3_x(Tensor x1, "
+        "                       Tensor x2, "
+        "                       Tensor scale, "
+        "                       Tensor? offset=None, "
+        "                       Tensor? pertoken_scale=None, "
+        "                       Tensor? bias=None, "
+        "                       bool transpose_x1=False, "
+        "                       bool transpose_x2=False, "
+        "                       int group_size=0) -> Tensor");
+    ops.impl("quant_batch_matmul_v3_x", torch::kPrivateUse1, &vllm_ascend::quant_batch_matmul_v3_x);
 }
 #else
 // Pybind on other platform
