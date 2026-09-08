@@ -2359,6 +2359,17 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "int max_spec_len) -> Tensor(a!)"
     );
     ops.impl("npu_rejection_sample_greedy_310", torch::kPrivateUse1, &vllm_ascend::npu_rejection_sample_greedy_310);
+    ops.def(
+        "quant_batch_matmul_v3_x(Tensor x1, "
+        "                       Tensor x2, "
+        "                       Tensor scale, "
+        "                       Tensor? offset=None, "
+        "                       Tensor? pertoken_scale=None, "
+        "                       Tensor? bias=None, "
+        "                       bool transpose_x1=False, "
+        "                       bool transpose_x2=False, "
+        "                       int group_size=0) -> Tensor");
+    ops.impl("quant_batch_matmul_v3_x", torch::kPrivateUse1, &vllm_ascend::quant_batch_matmul_v3_x);
 }
 #else
 // Pybind on other platform

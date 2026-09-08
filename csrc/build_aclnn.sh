@@ -38,6 +38,7 @@ resolve_op_dir() {
     for candidate_dir in \
         "${ROOT_DIR}/csrc/moe/${op_name}" \
         "${ROOT_DIR}/csrc/gmm/${op_name}" \
+        "${ROOT_DIR}/csrc/qbmm/${op_name}" \
         "${ROOT_DIR}/csrc/attention/${op_name}" \
         "${ROOT_DIR}/csrc/mc2/${op_name}" \
         "${ROOT_DIR}/csrc/ffn/${op_name}" \
@@ -90,6 +91,7 @@ if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
         "copy_and_expand_dflash_inputs"
         "adn_rms_norm"
         "rejection_sample_greedy_v310"
+        "quant_batch_matmul_v3_x"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend310p"
