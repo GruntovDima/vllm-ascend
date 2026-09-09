@@ -15,6 +15,11 @@
 # This file is a part of the vllm-ascend project.
 #
 
+from __future__ import annotations
+
+from copy import copy
+from typing import TYPE_CHECKING
+
 import torch
 import vllm.envs as envs
 
@@ -25,6 +30,9 @@ from vllm_ascend.sample.sampler import (
     AscendTopKTopPSampler,
 )
 from vllm_ascend.utils import global_stream, npu_stream_switch
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 _CPU_GENERATOR_CACHE_310P: dict[int, tuple[torch.Generator, torch.Generator]] = {}
 
@@ -185,3 +193,49 @@ class AscendSampler310(AscendSampler):
     def __init__(self, logprobs_mode=DEFAULT_LOGPROBS_MODE):
         super().__init__(logprobs_mode=logprobs_mode)
         self.topk_topp_sampler = AscendTopKTopPSampler310(logprobs_mode=logprobs_mode)
+
+    def sample_tree(self, logits: torch.Tensor, metadata: SamplingMetadata) -> torch.Tensor:
+        """Sample every tree node with the existing target sampler on NPU.
+
+        The caller validates a single request without history-dependent
+        processors. Each row is a hypothetical prefix, not a new request.
+        A seeded request uses one advancing RNG shared across rows, NOT a
+        generator re-seeded at each node. Prime the existing 310P CPU RNG cache
+        before aliasing its source across rows, including on a root-only first
+        step. Only scalar uniforms are generated on CPU; logits, filtering,
+        probabilities and inverse-CDF selection stay on NPU.
+
+        Unvisited rows also consume draws. Fixed seeds reproduce sampling for
+        fixed logits/topology, but are not token-identical to serial AR or to
+        another tree width. No new process-global RNG state is introduced.
+        """
+        if logits.ndim != 2 or logits.shape[0] < 1:
+            raise ValueError("Tree sampling requires nonempty [nodes, vocab] logits")
+        if metadata.all_greedy:
+            return self.greedy_sample(logits)
+        if not metadata.all_random:
+            raise ValueError("Tree sampling requires one request, not mixed sampling modes")
+        if set(metadata.generators) - {0}:
+            raise ValueError("Tree sampling requires a single request RNG at index zero")
+        holder = getattr(metadata, "thinking_budget_state_holder", None)
+        if holder is not None and holder.has_tracked_requests():
+            raise ValueError("Tree sampling does not support thinking-token budgets")
+
+        expanded = copy(metadata)
+        for name in ("temperature", "top_k", "top_p"):
+            value = getattr(metadata, name)
+            if value is not None:
+                if value.ndim != 1 or value.numel() != 1:
+                    raise ValueError(f"Tree sampling requires one {name} value")
+                setattr(expanded, name, value.expand(logits.shape[0]))
+        _prepare_cpu_generators_310p(metadata.generators)
+        expanded.generators = (
+            {node: metadata.generators[0] for node in range(logits.shape[0])}
+            if metadata.generators else {}
+        )
+        try:
+            return self.forward(logits, expanded).sampled_token_ids.flatten()
+        finally:
+            # Restore request-indexed cache ownership after temporary row
+            # expansion, retaining the RNG state advanced by the sampler.
+            _prepare_cpu_generators_310p(metadata.generators)

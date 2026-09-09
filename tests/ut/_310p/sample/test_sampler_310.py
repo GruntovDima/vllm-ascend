@@ -1,3 +1,4 @@
+import importlib.util
 import sys
 import unittest
 from contextlib import nullcontext
@@ -8,33 +9,40 @@ from unittest.mock import MagicMock, patch
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
-if "vllm" not in sys.modules:
+
+def load_sampler_module():
+    # Load the production file without executing package initialization,
+    # which imports vLLM logging/runtime even in this CPU-only test.
     vllm_module = ModuleType("vllm")
     vllm_envs_module = ModuleType("vllm.envs")
     vllm_envs_module.VLLM_BATCH_INVARIANT = False  # type: ignore[attr-defined]
     vllm_module.envs = vllm_envs_module  # type: ignore[attr-defined]
-    sys.modules["vllm"] = vllm_module
-    sys.modules["vllm.envs"] = vllm_envs_module
-
-if "vllm_ascend.sample.sampler" not in sys.modules:
     sample_sampler_module = ModuleType("vllm_ascend.sample.sampler")
     sample_sampler_module.DEFAULT_LOGPROBS_MODE = "raw_logprobs"  # type: ignore[attr-defined]
     sample_sampler_module.AscendSampler = type("AscendSampler", (), {})  # type: ignore[attr-defined]
     sample_sampler_module.AscendTopKTopPSampler = type(  # type: ignore[attr-defined]
         "AscendTopKTopPSampler", (), {}
     )
-    sys.modules["vllm_ascend.sample.sampler"] = sample_sampler_module
-
-if "vllm_ascend.utils" not in sys.modules:
     utils_module = ModuleType("vllm_ascend.utils")
     utils_module.global_stream = lambda: MagicMock()  # type: ignore[attr-defined]
     utils_module.npu_stream_switch = lambda _: nullcontext()  # type: ignore[attr-defined]
-    sys.modules["vllm_ascend.utils"] = utils_module
+    config_module = ModuleType("vllm_ascend.ascend_config")
+    config_module.get_ascend_config = MagicMock()  # type: ignore[attr-defined]
+    stubs = {
+        "vllm": vllm_module, "vllm.envs": vllm_envs_module,
+        "vllm_ascend.sample.sampler": sample_sampler_module,
+        "vllm_ascend.utils": utils_module, "vllm_ascend.ascend_config": config_module,
+    }
+    source = PROJECT_ROOT / "vllm_ascend/_310p/sample/sampler.py"
+    spec = importlib.util.spec_from_file_location("_standalone_sampler_310p", source)
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict(sys.modules, stubs):
+        spec.loader.exec_module(module)
+    return module
 
-from vllm_ascend._310p.sample import sampler as sampler_310p  # noqa: E402
+
+sampler_310p = load_sampler_module()
 
 
 class _SourceGenerator:

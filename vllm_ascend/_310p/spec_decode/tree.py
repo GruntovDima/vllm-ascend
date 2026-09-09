@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Backend-independent tree topology and greedy target verification.
+"""Backend-independent tree topology and target-sample verification.
 
 Node zero is the already-sampled input token, not a draft candidate. Flat
 indices identify scratch-cache slots; depths identify relative RoPE positions.
@@ -153,18 +153,27 @@ class TreeVerification:
     accepted_input_indices: tuple[int, ...]
 
 
-def greedy_verify(
+def verify_target_samples(
     tree: TokenTree,
     target_token_ids: Sequence[int],
     *,
     max_output_tokens: int | None = None,
 ) -> TreeVerification:
-    """Follow target predictions only through direct children of each node.
+    """Follow target samples only through direct children of each node.
 
-    ``target_token_ids[i]`` is the full target model's greedy next token at
-    input node i. Predictions must have been computed with ancestor-only
+    ``target_token_ids[i]`` is a draw from the full target distribution at
+    input node i (or its argmax for greedy decoding). Random draws must be
+    independent across nodes and independent of candidate construction.
+    Sampling is from the entire processed target distribution, NOT a
+    renormalization over the candidate children. A nonmatching draw is emitted
+    as the bonus token and ends verification. Thus reaching a node depends
+    only on ancestor draws, and its conditional output distribution is still
+    the target distribution. No draft probabilities or p/q rejection are
+    involved in this direct target-sampling algorithm.
+
+    Predictions must have been computed with ancestor-only
     attention and parent-derived recurrent state; this routine cannot verify
-    those model-side preconditions. It performs no probabilistic rejection.
+    those model-side preconditions or independence of the random draws.
     """
     predictions = tuple(_integer(token, "target token ID") for token in target_token_ids)
     if len(predictions) != tree.num_nodes:
@@ -184,3 +193,13 @@ def greedy_verify(
             break
         node = child
     return TreeVerification(tuple(emitted), tuple(accepted_input_indices))
+
+
+def greedy_verify(
+    tree: TokenTree,
+    target_token_ids: Sequence[int],
+    *,
+    max_output_tokens: int | None = None,
+) -> TreeVerification:
+    """Backward-compatible name for traversal of target argmax predictions."""
+    return verify_target_samples(tree, target_token_ids, max_output_tokens=max_output_tokens)

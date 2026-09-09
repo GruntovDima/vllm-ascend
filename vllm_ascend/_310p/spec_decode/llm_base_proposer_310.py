@@ -72,7 +72,9 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
         """Draft a comb tree using the existing primary-token backbone.
 
         The runner attaches ``tree_mtp_config`` only after validating the
-        eager, greedy tree path. The public budget counts candidate nodes;
+        eager tree path. Target sampling may be random; proposal construction
+        remains deterministic and must not consume the target request RNG.
+        The public budget counts candidate nodes;
         the native proposer instead receives the number of backbone levels.
         Its KV writes remain a linear backbone. The runner must rebuild the
         next first-pass inputs from the accepted target path, not its prefix.
@@ -126,8 +128,8 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
         siblings = getattr(self, "_tree_mtp_sibling_ids", None)
         if siblings is None:
             return _original_sample_draft_from_logits(self, logits, sampling_metadata)
-        if sampling_metadata is not None and not sampling_metadata.all_greedy:
-            raise ValueError("Tree MTP supports only greedy sampling")
+        # Target temperature/top-k/top-p do not turn the deterministic MTP
+        # proposals into samples. All randomness belongs to target verification.
         token_ids = _tree_topk_token_ids(logits, self._tree_mtp_collect_width)
         siblings.append(token_ids)
         # Only this primary candidate enters the next native MTP iteration.

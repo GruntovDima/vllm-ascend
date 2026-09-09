@@ -52,7 +52,7 @@ def load_runner_methods():
     ], type_ignores=[])
     namespace = dict(
         NativeRunner=NativeRunner, torch=torch, copy=copy, json=json, logger=Mock(),
-        TokenTree=tree.TokenTree, greedy_verify=tree.greedy_verify,
+        TokenTree=tree.TokenTree, verify_target_samples=tree.verify_target_samples,
         TreeStepContext=runtime.TreeStepContext, validate_tree_sampling=runtime.validate_tree_sampling,
         SamplerOutput=SimpleNamespace,
     )
@@ -82,7 +82,9 @@ class TestTreeRunner(unittest.TestCase):
         runner.input_batch = SimpleNamespace(
             num_reqs=1, req_ids=["request"], num_computed_tokens_cpu=[prefix],
             num_prompt_tokens=[prompt_tokens], token_ids_cpu=tokens_cpu,
+            sampling_metadata=SimpleNamespace(all_greedy=sampling_changes.get("temperature", 0) == 0),
         )
+        runner.sampler = SimpleNamespace(sample_tree=Mock(side_effect=lambda logits, metadata: logits.argmax(-1)))
         runner.input_ids = SimpleNamespace(gpu=flat_tokens)
         runner.num_accepted_tokens = SimpleNamespace(gpu=torch.tensor([2], dtype=torch.int32))
         runner.requests = {"request": SimpleNamespace(
@@ -178,6 +180,28 @@ class TestTreeRunner(unittest.TestCase):
         self.assertEqual(result.sampled_token_ids.tolist(), [[6]])
         callback.assert_called_once_with((0,))
         self.assertTrue(context.committed)
+
+    def test_random_target_draws_not_argmax_determine_path(self):
+        runner = self.make_runner(temperature=1.0, top_k=50, top_p=0.9, seed=42)
+        context = self.prepare(runner)
+        callback = Mock()
+        context.register_commit("cache", callback)
+        runner.sampler.sample_tree.side_effect = None
+        runner.sampler.sample_tree.return_value = torch.tensor([7, 10, 13, 14, 11])
+        logits = self.logits_for([8, 9, 12, 13, 14])
+        output = runner._sample(logits, object())
+        self.assertEqual(output.sampled_token_ids.tolist(), [[7, 10, 11, -1, -1]])
+        callback.assert_called_once_with((0, 1, 4))
+        runner.sampler.sample_tree.assert_called_once_with(logits, runner.input_batch.sampling_metadata)
+
+    def test_random_draw_outside_children_is_emitted_without_resampling(self):
+        runner = self.make_runner(temperature=1.0)
+        context = self.prepare(runner)
+        runner.sampler.sample_tree.side_effect = None
+        runner.sampler.sample_tree.return_value = torch.tensor([15, 10, 13, 14, 11])
+        output = runner._sample(self.logits_for([7, 10, 13, 14, 11]), None)
+        self.assertEqual(output.sampled_token_ids.tolist(), [[15, -1, -1, -1, -1]])
+        self.assertEqual(context.accepted_input_indices, (0,))
 
     def test_output_budget_excludes_matching_but_unprocessed_child(self):
         runner = self.make_runner(max_tokens=2)

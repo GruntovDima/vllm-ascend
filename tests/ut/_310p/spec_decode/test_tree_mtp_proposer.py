@@ -172,10 +172,17 @@ class TestTreeMTPProposer(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "full-logits"):
             proposer._propose(4)
 
-    def test_random_sampling_rejected(self):
+    def test_random_target_sampling_keeps_deterministic_drafting_and_rng(self):
         proposer = self.make_proposer()
-        with self.assertRaisesRegex(ValueError, "greedy"):
-            proposer._propose(4, sampling_metadata=SimpleNamespace(all_greedy=False))
+        generator = torch.Generator().manual_seed(42)
+        before = generator.get_state().clone()
+        metadata = SimpleNamespace(all_greedy=False, generators={0: generator}, temperature=1.0)
+        result = proposer._propose(4, sampling_metadata=metadata)
+        self.assertEqual(result.tolist(), [[1, 2, 0, 2]])
+        self.assertTrue(torch.equal(generator.get_state(), before))
+
+    def test_probabilistic_drafter_is_still_rejected(self):
+        proposer = self.make_proposer()
         proposer._enable_probabilistic_draft_probs = True
         with self.assertRaisesRegex(ValueError, "greedy"):
             proposer._propose(4)

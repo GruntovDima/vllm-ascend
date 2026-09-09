@@ -52,7 +52,7 @@ from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
-from vllm_ascend._310p.spec_decode.tree import TokenTree, greedy_verify
+from vllm_ascend._310p.spec_decode.tree import TokenTree, verify_target_samples
 from vllm_ascend._310p.spec_decode.tree_runtime import TreeMTPConfig, TreeStepContext, validate_tree_sampling
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
@@ -670,8 +670,9 @@ class NPUModelRunner310(NPUModelRunner):
             raise RuntimeError("Tree target logits must contain one row per node")
         # One intentional host sync for the small traversal; this reference
         # path prioritizes explicit acceptance/rollback over graph execution.
-        predictions = logits.argmax(dim=-1).cpu().tolist()
-        result = greedy_verify(context.tree, predictions, max_output_tokens=context.max_output_tokens)
+        metadata = self.input_batch.sampling_metadata
+        predictions = self.sampler.sample_tree(logits, metadata).cpu().tolist()
+        result = verify_target_samples(context.tree, predictions, max_output_tokens=context.max_output_tokens)
         context.commit(result)
         sampled = torch.full((1, context.num_nodes), -1, dtype=torch.int32, device=logits.device)
         sampled[0, :len(result.emitted_token_ids)] = torch.tensor(
@@ -682,6 +683,7 @@ class NPUModelRunner310(NPUModelRunner):
                 "request_id": context.request_id, "prefix_length": context.prefix_length,
                 "tokens": context.tree.token_ids, "parents": context.tree.parents,
                 "depths": context.tree.depths, "target_predictions": predictions,
+                "sampling": "greedy" if metadata.all_greedy else "target_sample",
                 "accepted_input_indices": result.accepted_input_indices,
                 "emitted_token_ids": result.emitted_token_ids,
                 "committed_cache_writers": {
