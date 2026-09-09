@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from vllm_ascend._310p.lmhead_prune import maybe_prune_lm_head
@@ -143,3 +144,35 @@ def test_pruned_lm_head_preserves_none_logits_on_non_last_rank():
     hidden_states = torch.zeros((1, 4))
     assert model.compute_logits(hidden_states) is None
     assert calls[0] is hidden_states
+
+
+def test_pruned_lm_head_rejects_tensor_parallel_head_before_mutation():
+    original_weight = torch.zeros((3, 4), dtype=torch.int8)
+    lm_head = SimpleNamespace(
+        weight=SimpleNamespace(data=original_weight),
+        deq_scale=SimpleNamespace(data=torch.zeros(3, dtype=torch.int64)),
+        quant_bias=SimpleNamespace(data=torch.zeros(3, dtype=torch.int32)),
+        quant_method=_FakeQuantMethod(),
+        tp_size=2,
+    )
+
+    def original_compute_logits(hidden_states):
+        return lm_head.quant_method.apply(lm_head, hidden_states)
+
+    model = SimpleNamespace(
+        compute_logits=original_compute_logits,
+        lm_head=lm_head,
+        logits_processor=SimpleNamespace(org_vocab_size=3, scale=1.0, soft_cap=None),
+    )
+
+    with (
+        patch.dict("os.environ", {"VLLM_LMHEAD_PRUNE_PACK": "/tmp/prune-pack.pt"}),
+        patch("vllm_ascend._310p.lmhead_prune.torch.load", return_value=_make_pack()),
+        patch("vllm_ascend._310p.lmhead_prune.maybe_trans_nz") as trans_nz,
+        pytest.raises(NotImplementedError, match="supports only tensor-parallel size 1"),
+    ):
+        maybe_prune_lm_head(model)
+
+    assert lm_head.weight.data is original_weight
+    assert model.compute_logits is original_compute_logits
+    trans_nz.assert_not_called()

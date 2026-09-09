@@ -143,6 +143,12 @@ def maybe_prune_lm_head(*models: object) -> None:
         if lm_head is None:
             logger.warning("lm_head prune: no lm_head found on %s; skipped", type(model).__name__)
             continue
+        tp_size = getattr(lm_head, "tp_size", 1)
+        if tp_size != 1:
+            raise NotImplementedError(
+                f"{_ENV} supports only tensor-parallel size 1; "
+                f"{type(model).__name__} has lm_head.tp_size={tp_size}."
+            )
         proc = getattr(owner, "logits_processor", None)
         vocab_size = getattr(proc, "org_vocab_size", None) or pack["orig_vocab"]
         scale = getattr(proc, "scale", 1.0)

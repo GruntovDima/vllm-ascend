@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 import torch
 import torch_npu
 import vllm.envs as envs
@@ -21,6 +23,37 @@ from vllm_ascend.utils import (
 DEFAULT_LOGPROBS_MODE = "raw_logprobs"
 
 _SAMPLING_EPS = 1e-5
+
+_CUSTOM_TOP_K_TOP_P_OP: Callable[..., torch.Tensor] | None = None
+_CUSTOM_TOP_K_TOP_P_RESOLVED = False
+
+
+def _resolve_custom_top_k_top_p_op() -> Callable[..., torch.Tensor] | None:
+    """Resolve the 310P sampling op once, before subsequent decode steps."""
+    global _CUSTOM_TOP_K_TOP_P_OP, _CUSTOM_TOP_K_TOP_P_RESOLVED
+    if _CUSTOM_TOP_K_TOP_P_RESOLVED:
+        return _CUSTOM_TOP_K_TOP_P_OP
+
+    try:
+        if enable_custom_op():
+            _CUSTOM_TOP_K_TOP_P_OP = getattr(
+                torch.ops._C_ascend,
+                "npu_apply_top_k_top_p",
+                None,
+            )
+    except (ImportError, RuntimeError, AttributeError) as exc:
+        logger.warning_once(
+            "310P TopKTopP custom op is unavailable (%s); falling back to the standard sampler.",
+            exc,
+        )
+    else:
+        if _CUSTOM_TOP_K_TOP_P_OP is None:
+            logger.warning_once(
+                "310P TopKTopP custom op is unavailable; falling back to the standard sampler."
+            )
+
+    _CUSTOM_TOP_K_TOP_P_RESOLVED = True
+    return _CUSTOM_TOP_K_TOP_P_OP
 
 
 def random_sample(
@@ -277,21 +310,10 @@ def _apply_top_k_top_p_custom(
     top_k: int | None = None,
 ) -> torch.Tensor:
     """Apply the 310P-specific fused TopKTopP custom operator."""
+    custom_op = None
     if not (p is None and k is None):
-        try:
-            custom_op_available = enable_custom_op() and hasattr(
-                torch.ops._C_ascend, "npu_apply_top_k_top_p"
-            )
-        except (ImportError, RuntimeError, AttributeError) as exc:
-            logger.warning_once(
-                "310P TopKTopP custom op is unavailable (%s); falling back to the standard sampler.",
-                exc,
-            )
-            return _apply_top_k_top_p_pytorch(logits, k, p, top_k)
-        if not custom_op_available:
-            logger.warning_once(
-                "310P TopKTopP custom op is unavailable; falling back to the standard sampler."
-            )
+        custom_op = _resolve_custom_top_k_top_p_op()
+        if custom_op is None:
             return _apply_top_k_top_p_pytorch(logits, k, p, top_k)
 
     if get_ascend_config().enable_reduce_sample:
@@ -310,12 +332,14 @@ def _apply_top_k_top_p_custom(
         gathered_idx = tp_group.all_gather(local_global_idx, dim=-1)
 
         if not (p is None and k is None):
-            gathered_vals = torch.ops._C_ascend.npu_apply_top_k_top_p(gathered_vals, k=k, p=p)
+            assert custom_op is not None
+            gathered_vals = custom_op(gathered_vals, k=k, p=p)
         return gathered_vals, gathered_idx
 
     if p is None and k is None:
         return logits
-    return torch.ops._C_ascend.npu_apply_top_k_top_p(logits, k=k, p=p)
+    assert custom_op is not None
+    return custom_op(logits, k=k, p=p)
 
 
 apply_top_k_top_p = (
