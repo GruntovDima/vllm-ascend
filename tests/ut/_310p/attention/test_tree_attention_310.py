@@ -33,6 +33,8 @@ class FakeContext:
         self.tree = SimpleNamespace(parents=parents)
         self.num_nodes = len(parents)
         self.callbacks = {}
+        self.attention_inputs = {}
+        self.committed = False
 
     def has_commit(self, key):
         return key in self.callbacks
@@ -51,7 +53,7 @@ class TestTreeAttention310(unittest.TestCase):
         nodes = ast.parse(source.read_text()).body
         selected = {
             "_tree_context_from_metadata", "_tree_dimensions", "build_tree_attention_mask",
-            "register_tree_cache_commit", "AscendAttentionBackendImpl310",
+            "get_tree_attention_inputs", "register_tree_cache_commit", "AscendAttentionBackendImpl310",
         }
         namespace = {
             "Any": Any, "Integral": Integral, "torch": torch,
@@ -259,6 +261,47 @@ class TestTreeAttention310(unittest.TestCase):
                 with self.assertRaises((ValueError, NotImplementedError)):
                     self.impl.forward_tree_attention_310(self.query, self.metadata, self.output)
         self.legacy.assert_not_called()
+
+    def test_attention_layers_share_mask_and_lengths_but_not_kv(self):
+        self.impl.forward_tree_attention_310(self.query, self.metadata, self.output)
+        first = self.legacy.call_args.kwargs
+        self.impl.key_cache = torch.zeros_like(self.impl.key_cache)
+        self.impl.forward_tree_attention_310(self.query, self.metadata, self.output)
+        second = self.legacy.call_args.kwargs
+        for name in ("mask", "seq_len", "context_lens"):
+            self.assertIs(first[name], second[name])
+        self.assertIsNot(first["key_cache"], second["key_cache"])
+        self.namespace["torch_npu"].npu_format_cast.assert_called_once()
+
+    def test_attention_input_cache_is_step_local(self):
+        prepare = self.namespace["get_tree_attention_inputs"]
+        first = prepare(self.context, torch.device("cpu"))
+        second = prepare(FakeContext(), torch.device("cpu"))
+        for old, new in zip(first, second):
+            self.assertIsNot(old, new)
+            torch.testing.assert_close(old, new)
+
+    def test_attention_input_cache_rechecks_prefix_topology_and_node_count(self):
+        prepare = self.namespace["get_tree_attention_inputs"]
+        first = prepare(self.context, torch.device("cpu"))
+        self.context.prefix_length += 1
+        second = prepare(self.context, torch.device("cpu"))
+        self.assertIsNot(first[0], second[0])
+        self.assertEqual(second[2].item(), 9)
+        self.context.tree.parents = (-1, 0, 1, 2, 3, 4)
+        third = prepare(self.context, torch.device("cpu"))
+        self.assertIsNot(second[0], third[0])
+        self.assertFalse(torch.equal(second[0], third[0]))
+        self.context.num_nodes = 7
+        with self.assertRaises(ValueError):
+            prepare(self.context, torch.device("cpu"))
+
+    def test_committed_context_cannot_reuse_attention_inputs(self):
+        prepare = self.namespace["get_tree_attention_inputs"]
+        prepare(self.context, torch.device("cpu"))
+        self.context.committed = True
+        with self.assertRaises(RuntimeError):
+            prepare(self.context, torch.device("cpu"))
 
     def test_ordinary_and_mock_metadata_do_not_enable_tree(self):
         for metadata in (SimpleNamespace(attn_state=4), MagicMock(attn_state=4)):
