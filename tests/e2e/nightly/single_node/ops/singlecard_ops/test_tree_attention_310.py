@@ -197,6 +197,13 @@ def main():
                 if label not in first_outputs:
                     first_outputs[label] = baseline
                 row["repeat_vs_first"] = metrics(torch, first_outputs[label], baseline, 0, 0)
+                shared_inputs = next(iter(context.attention_inputs.values()))
+                reused_output = torch.empty_like(output)
+                impl.forward_impl(query_device, None, None, (key_cache, value_cache), metadata, reused_output)
+                current_inputs = next(iter(context.attention_inputs.values()))
+                row["shared_input_identity"] = all(a is b for a, b in zip(shared_inputs, current_inputs))
+                row["shared_input_output"] = metrics(torch, baseline, reused_output, 0, 0)
+                all_checks.extend((row["shared_input_identity"], row["shared_input_output"]["exact_equal"]))
                 all_checks.extend(item["within_tolerance"] for item in row["per_node_golden"])
                 all_checks.append(row["repeat_vs_first"]["exact_equal"])
                 if num_nodes > 1:
@@ -228,6 +235,8 @@ def main():
 
                 emitted = tuple(tree.token_ids[node] for node in path[1:]) + (999,)
                 context.commit(TreeVerification(emitted, path))
+                row["attention_inputs_released"] = not context.attention_inputs
+                all_checks.append(row["attention_inputs_released"])
                 committed_span = prefix + len(path)
                 DeviceOperator.reshape_and_cache(
                     key=next_key_cpu.to(device), value=next_value_cpu.to(device),

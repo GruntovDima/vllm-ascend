@@ -109,6 +109,9 @@ class TreeStepContext:
     gdn_state_indices: dict[str, Any] = field(default_factory=dict, repr=False)
     previous_accepted_tokens: Any = field(default=None, repr=False)
     committed_cache_kinds: tuple[str, ...] = ()
+    # Shared read-only splitfuse inputs for this verification step, not a
+    # prefix/KV cache. The attention backend keys these by device and topology.
+    attention_inputs: dict[Any, tuple[Any, Any, Any]] = field(default_factory=dict, repr=False)
 
     @property
     def num_nodes(self) -> int:
@@ -139,3 +142,4 @@ class TreeStepContext:
         self.committed = True
         self.committed_cache_kinds = tuple(str(key[0]) for key in self._commit_callbacks)
         self._commit_callbacks.clear()
+        self.attention_inputs.clear()

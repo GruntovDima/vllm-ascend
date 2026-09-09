@@ -95,6 +95,32 @@ def build_tree_attention_mask(context: Any, device: torch.device) -> torch.Tenso
     return mask.to(device=device, non_blocking=True)
 
 
+def get_tree_attention_inputs(context: Any, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare the shared FP16/NZ mask and physical lengths once per step.
+
+    Every target attention layer in the eager batch-one pass sees the same
+    ancestry and physical span. KV tensors and block tables remain layer-local.
+    No inputs are reused across contexts, and a changed prefix/topology/device
+    cannot hit an old entry. The fixed FP16/NZ layout is part of this contract.
+    """
+    if context.committed:
+        raise RuntimeError("Cannot run attention on a committed tree step.")
+    num_nodes, prefix_length, parents = _tree_dimensions(context)
+    cache_key = (device, num_nodes, prefix_length, parents)
+    cached = context.attention_inputs.get(cache_key)
+    if cached is not None:
+        return cached
+    additive_mask = build_tree_attention_mask(context, device)
+    mask = torch_npu.npu_format_cast(nd_to_nz_spec(additive_mask).contiguous(), ACL_FORMAT_FRACTAL_NZ)
+    # Physical lengths, never max(depth)+1: scheduler metadata may describe
+    # an optimistic span that would otherwise expose stale sibling slots.
+    query_lens = torch.tensor([num_nodes], dtype=torch.int32, device="cpu")
+    context_lens = torch.tensor([prefix_length + num_nodes], dtype=torch.int32, device=device)
+    cached = (mask, query_lens, context_lens)
+    context.attention_inputs[cache_key] = cached
+    return cached
+
+
 def register_tree_cache_commit(
     context: Any,
     key: torch.Tensor,
@@ -269,12 +295,7 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         block_size = self.key_cache.shape[2]
         if attn_metadata.block_tables.shape[1] * block_size < context_length:
             raise ValueError("Tree attention block table does not cover the physical tree span.")
-        additive_mask = build_tree_attention_mask(context, query.device)
-        mask = torch_npu.npu_format_cast(nd_to_nz_spec(additive_mask).contiguous(), ACL_FORMAT_FRACTAL_NZ)
-        # These are physical lengths, never max(depth)+1. Explicitly bound them
-        # so optimistic scheduler metadata cannot expose stale sibling slots.
-        query_lens = torch.tensor([num_nodes], dtype=torch.int32, device="cpu")
-        context_lens = torch.tensor([context_length], dtype=torch.int32, device=query.device)
+        mask, query_lens, context_lens = get_tree_attention_inputs(context, query.device)
         torch_npu._npu_paged_attention_splitfuse(
             query=query[:num_nodes],
             key_cache=self.key_cache,

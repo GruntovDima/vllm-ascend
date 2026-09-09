@@ -226,11 +226,14 @@ class TestTreeStepContext(unittest.TestCase):
         callback = Mock()
         first.register_commit("cache", callback)
         first.gdn_state_indices["layer"] = [1, 2]
+        first.attention_inputs["device-topology"] = (object(), object(), object())
+        self.assertFalse(second.attention_inputs)
         first.commit(self.tree_module.TreeVerification((6,), (0,)))
         callback.assert_called_once_with((0,))
         self.assertFalse(second.committed)
         self.assertEqual(second.gdn_state_indices, {})
         self.assertFalse(second.has_commit("cache"))
+        self.assertFalse(first.attention_inputs)
 
 
 if __name__ == "__main__":
