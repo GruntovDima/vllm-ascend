@@ -34,11 +34,13 @@ Enable with VLLM_LMHEAD_PRUNE_PACK=/path/pack.pt, a dict with
  pruned head, or K for pruned-out ids), "orig_vocab": int}.
 """
 
+import inspect
 import os
 import types
+from collections.abc import Callable
+from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 from vllm.logger import logger
 
@@ -47,11 +49,50 @@ from vllm_ascend.utils import maybe_trans_nz
 _ENV = "VLLM_LMHEAD_PRUNE_PACK"
 
 
-def _make_pruned_compute_logits(lm_head, inv_map: torch.Tensor, vocab_size: int):
-    pad_cache: dict[tuple[int, int, torch.device, torch.dtype], torch.Tensor] = {}
+def _compute_logits_accepts_spec_step_idx(compute_logits: Callable[..., torch.Tensor | None]) -> bool:
+    """Return whether ``compute_logits`` accepts Step3.5's step keyword."""
+    try:
+        parameters = inspect.signature(compute_logits).parameters
+    except (TypeError, ValueError):
+        return False
+    return "spec_step_idx" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        pruned = lm_head.quant_method.apply(lm_head, hidden_states)
+
+def _make_pruned_compute_logits(
+    original_compute_logits: Callable[..., torch.Tensor | None],
+    inv_map: torch.Tensor,
+    vocab_size: int,
+    pruned_vocab_size: int,
+):
+    pad_cache: dict[tuple[int, int, torch.device, torch.dtype], torch.Tensor] = {}
+    accepts_spec_step_idx = _compute_logits_accepts_spec_step_idx(original_compute_logits)
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        # Delegate projection to the model so MTP implementations retain their
+        # spec_step_idx-based head selection and any model-specific pre-head
+        # transforms. Ordinary model methods generally accept hidden_states
+        # only, so do not inject the Step3.5 keyword into those calls.
+        if accepts_spec_step_idx:
+            kwargs["spec_step_idx"] = spec_step_idx
+        pruned = original_compute_logits(hidden_states, **kwargs)
+        if pruned is None:
+            return None
+        if pruned.shape[-1] == vocab_size:
+            # A step-aware implementation may select another, unpruned head.
+            # Its canonical-vocabulary output is already correct.
+            return pruned
+        if pruned.shape[-1] != pruned_vocab_size:
+            raise RuntimeError(
+                "lm_head prune expected the original compute_logits to return "
+                f"{pruned_vocab_size} or {vocab_size} logits, got {pruned.shape[-1]}"
+            )
         # Expand to the canonical vocab with a single last-dim gather; column
         # K of the cached pad buffer stays -inf for pruned-out ids. Kept to
         # two device ops - eager dispatch overhead at M=1 otherwise eats the
@@ -117,7 +158,13 @@ def maybe_prune_lm_head(*models: object) -> None:
             lm_head.quant_bias.data = pack["quant_bias"].to(dev)
             pruned_heads.add(id(lm_head))
         inv_map = inv_map_cpu[:vocab_size].to(dev)
-        fn = _make_pruned_compute_logits(lm_head, inv_map, vocab_size)
+        original_compute_logits = model.compute_logits
+        fn = _make_pruned_compute_logits(
+            original_compute_logits,
+            inv_map,
+            vocab_size,
+            pack["weight"].shape[0],
+        )
         model.compute_logits = types.MethodType(fn, model)
         logger.info(
             "lm_head pruned: %s vocab %d -> %d rows (embedding-gather scatter)",

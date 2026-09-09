@@ -203,6 +203,7 @@ from vllm_ascend.utils import (
     get_c_env,
     get_kv_cache_tensor_layers,
     global_stream,
+    is_310p,
     is_hidden_state_cache_spec,
     is_score_encoder_cache_manager,
     kv_cache_spec_uses_sparse_sfa_c8,
@@ -3706,12 +3707,21 @@ class NPUModelRunner(GPUModelRunner):
         if cudagraph_runtime_mode is None:
             cudagraph_runtime_mode = _cudagraph_mode
         elif cudagraph_runtime_mode != _cudagraph_mode:
-            # with spec decode the batch descriptor carries draft-token
-            # slots, so the dispatcher does not recognise the padded size and returns
-            # NONE while capture_model is deliberately capturing PIECEWISE. The caller
-            # is the authority during capture -- honour it instead of asserting.
+            is_310p_mtp_capture = (
+                is_graph_capturing
+                and is_310p()
+                and self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+            )
+            assert is_310p_mtp_capture, (
+                f"Cudagraph runtime mode mismatch in dummy_run. "
+                f"Expected {_cudagraph_mode}, but got {cudagraph_runtime_mode}."
+            )
+            # 310P MTP capture carries draft-token slots in the batch descriptor,
+            # so the dispatcher can return NONE for a capture shape selected by
+            # the caller. The caller is authoritative only in this capture path.
             logger.warning(
-                "dummy_run cudagraph mode: dispatcher=%s caller=%s; using caller",
+                "310P MTP capture cudagraph mode: dispatcher=%s caller=%s; using caller",
                 _cudagraph_mode,
                 cudagraph_runtime_mode,
             )

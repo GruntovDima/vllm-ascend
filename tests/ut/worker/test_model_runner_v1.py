@@ -81,6 +81,64 @@ class TestDummyRunSlotInvalidation(unittest.TestCase):
             runner._dummy_run(1)
 
 
+class TestDummyRunCudagraphModeMismatch(unittest.TestCase):
+    @staticmethod
+    def _make_runner(speculative_method: str):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.uniform_decode_query_len = 1
+        runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=8, max_num_seqs=8)
+        runner.dynamic_eplb = False
+        runner.dcp_size = 1
+        runner.speculative_config = SimpleNamespace(method=speculative_method)
+        runner._determine_batch_execution_and_padding = MagicMock(
+            return_value=(CUDAGraphMode.NONE, SimpleNamespace(num_tokens=1, num_reqs=1), None, None, None)
+        )
+        runner.synchronize_input_prep = MagicMock(side_effect=RuntimeError("mismatch accepted"))
+        return runner
+
+    def test_310p_normalized_mtp_capture_accepts_dispatcher_mode_mismatch(self):
+        # SpeculativeConfig.__post_init__ normalizes user-facing MTP aliases,
+        # including qwen3_5_mtp, to the canonical internal method "mtp".
+        runner = self._make_runner("mtp")
+
+        with (
+            patch("vllm_ascend.worker.model_runner_v1.is_310p", return_value=True),
+            self.assertRaisesRegex(RuntimeError, "mismatch accepted"),
+        ):
+            runner._dummy_run(
+                1,
+                cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                is_graph_capturing=True,
+            )
+
+        runner.synchronize_input_prep.assert_called_once_with()
+
+    def test_mode_mismatch_asserts_outside_310p_mtp_capture(self):
+        cases = (
+            (False, "mtp", True),
+            (True, "eagle", True),
+            (True, "mtp", False),
+        )
+        for on_310p, speculative_method, is_graph_capturing in cases:
+            with self.subTest(
+                on_310p=on_310p,
+                speculative_method=speculative_method,
+                is_graph_capturing=is_graph_capturing,
+            ):
+                runner = self._make_runner(speculative_method)
+                with (
+                    patch("vllm_ascend.worker.model_runner_v1.is_310p", return_value=on_310p),
+                    self.assertRaisesRegex(AssertionError, "Cudagraph runtime mode mismatch in dummy_run"),
+                ):
+                    runner._dummy_run(
+                        1,
+                        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                        is_graph_capturing=is_graph_capturing,
+                    )
+
+                runner.synchronize_input_prep.assert_not_called()
+
+
 class TestDeviceMetadataFullGraphEvents(unittest.TestCase):
     def test_full_mode_requires_external_events(self):
         for mode, uses_external_events, should_raise in (
