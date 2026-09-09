@@ -258,9 +258,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
             self.decode_threshold += spec_token_num
-            assert self.decode_threshold <= 16, (
+            max_decode_threshold = self._get_max_decode_threshold()
+            assert self.decode_threshold <= max_decode_threshold, (
                 f"decode_threshold exceeded \
-                npu_fused_infer_attention_score TND layout's limit of 16, \
+                attention backend's query limit of {max_decode_threshold}, \
                 got {self.decode_threshold}"
             )
 
@@ -269,6 +270,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         scheduler_config = vllm_config.scheduler_config
         self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+
+    def _get_max_decode_threshold(self) -> int:
+        """FIA TND limit; specialized non-FIA backends may override it."""
+        return 16
 
     @classmethod
     def get_cudagraph_support(
