@@ -216,6 +216,30 @@ class TestTreeMTPProposer(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.module._tree_topk_token_ids(logits, width)
 
+    def test_boundary_ties_and_noncontiguous_inputs(self):
+        rng = torch.Generator().manual_seed(310)
+        for dtype in (torch.float16, torch.float32, torch.float64):
+            logits = torch.randint(-4, 5, (3, 256), generator=rng).to(dtype)[:, ::2]
+            before = logits.clone()
+            for width in (2, 4, 8, 16, 128):
+                expected = logits.argsort(dim=-1, descending=True, stable=True)[:, :width]
+                actual = self.module._tree_topk_token_ids(logits, width)
+                self.assertTrue(torch.equal(actual, expected))
+            torch.testing.assert_close(logits, before)
+
+    def test_adjacent_fp32_scores_are_not_perturbed_for_tie_breaking(self):
+        # A numerical epsilon applied to logits could reorder these scores.
+        logits = torch.arange(0x3F800000, 0x3F800080, dtype=torch.int32).view(torch.float32).flip(0)[None]
+        for width in (2, 4, 8, 16):
+            actual = self.module._tree_topk_token_ids(logits, width)
+            self.assertEqual(actual.tolist(), [list(range(width))])
+
+    def test_nan_payloads_and_signed_zeros(self):
+        bits = torch.tensor([[0x7F800001, 0x7FC00000, 0x7F800000, 0, -2147483648, -8388608]], dtype=torch.int32)
+        logits = bits.view(torch.float32)
+        expected = logits.argsort(dim=-1, descending=True, stable=True)
+        self.assertTrue(torch.equal(self.module._tree_topk_token_ids(logits, 6), expected))
+
 
 if __name__ == "__main__":
     unittest.main()
