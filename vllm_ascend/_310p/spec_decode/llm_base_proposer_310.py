@@ -31,10 +31,11 @@ _original_sample_draft_from_logits = AscendSpecDecodeBaseProposer._sample_draft_
 def _tree_topk_token_ids(logits: torch.Tensor, width: int) -> torch.Tensor:
     """Distinct siblings ordered by score, breaking ties by lowest token ID.
 
-    ``topk`` does not guarantee stable tie ordering. Repeated reductions avoid
-    sorting the whole vocabulary and keep the first sibling equal to greedy
-    argmax. The availability mask also handles rows containing only -inf.
-    No logits or sampling buffers owned by the caller are modified.
+    Rank scores against the top-k boundaries, then select unique integer-valued
+    FP32 keys: score rank first, inverse token ID second. This repairs ties
+    INCLUDING those at the selection boundary without width full-vocabulary
+    reduction loops, perturbing logits, consuming RNG, or a device/host sync.
+    NaNs sort before +inf. The width-one greedy path is unchanged.
     """
     if logits.ndim != 2 or not logits.is_floating_point():
         raise ValueError("Tree MTP requires floating-point [batch, vocab] logits")
@@ -43,6 +44,27 @@ def _tree_topk_token_ids(logits: torch.Tensor, width: int) -> torch.Tensor:
     if width == 1:
         return logits.argmax(dim=-1, keepdim=True)
 
+    vocab_size = logits.shape[-1]
+    # Every intermediate integer must be exactly representable in FP32.
+    # Qwen3.5's 248320-token vocabulary and widths <=16 fit comfortably.
+    max_exact_key = 1 << 24
+    if logits.dtype in (torch.float16, torch.float32) and (width + 1) * vocab_size <= max_exact_key:
+        scores = logits.contiguous()
+        # On the pinned 310P runtime floating isnan/!= also classify infinities
+        # as NaNs. Inspect IEEE FP32 magnitude bits instead; FP16 -> FP32 is
+        # exact and does not change the score order. Avoid unsupported nan_to_num.
+        magnitude_bits = scores.float().view(torch.int32) & 0x7FFFFFFF
+        nan_mask = magnitude_bits > 0x7F800000
+        finite_or_inf = scores.masked_fill(nan_mask, torch.inf)
+        boundaries = finite_or_inf.topk(width, dim=-1).values.flip(-1).contiguous()
+        ranks = torch.searchsorted(boundaries, finite_or_inf, right=True, out_int32=True)
+        ranks = ranks.masked_fill(nan_mask, width + 1)
+        token_ids = torch.arange(vocab_size, dtype=torch.float32, device=logits.device)
+        keys = ranks.to(torch.float32) * vocab_size - token_ids
+        return keys.topk(width, dim=-1).indices
+
+    # Unusual dtypes or sizes outside the exact key bound retain the reference
+    # algorithm instead of silently losing low token-ID bits in a float key.
     available = torch.ones_like(logits, dtype=torch.bool)
     selected = []
     for _ in range(width):
