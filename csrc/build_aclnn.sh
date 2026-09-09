@@ -85,6 +85,7 @@ if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
     CUSTOM_OPS_ARRAY=(
         "causal_conv1d_v310"
         "recurrent_gated_delta_rule_v310"
+        "tree_gated_delta_rule_v310"
         "chunk_fwd_o"
         "chunk_gated_delta_rule_compute_wy"
         "chunk_gated_delta_rule_fwd_h"

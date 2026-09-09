@@ -72,6 +72,42 @@ def sgmv_expand_meta(
     return y_out
 
 
+def tree_gated_delta_rule_310_meta(query, key, value, beta, initial, g, parents, scale, v_tile=0):
+    return value.new_empty(value.shape), initial.new_empty((query.shape[0], *initial.shape))
+
+
+def tree_gated_delta_rule_310_out_meta(query, key, value, beta, initial, g, parents, scale, v_tile=0, *, out, snapshots):
+    return out, snapshots
+
+
+if hasattr(torch.ops._C_ascend, "npu_tree_gated_delta_rule_310"):
+    register_meta_if_necessary("_C_ascend", "npu_tree_gated_delta_rule_310", tree_gated_delta_rule_310_meta)
+    register_meta_if_necessary("_C_ascend", "npu_tree_gated_delta_rule_310", tree_gated_delta_rule_310_out_meta, "out")
+
+
+def tree_gdn_compact_verify_310_meta(query, key, value, beta, initial, g, parents, scale, v_tile=0):
+    return value.new_empty(value.shape), value.new_empty((*value.shape[:2], 144), dtype=torch.float32)
+
+
+def tree_gdn_compact_verify_310_out_meta(query, key, value, beta, initial, g, parents, scale, v_tile=0, *, out, records):
+    return out, records
+
+
+def tree_gdn_compact_replay_310_meta(key, initial, records, parents, path, v_tile=0):
+    return initial.new_empty((len(path), *initial.shape))
+
+
+def tree_gdn_compact_replay_310_out_meta(key, initial, records, parents, path, v_tile=0, *, accepted):
+    return accepted
+
+
+if hasattr(torch.ops._C_ascend, "npu_tree_gdn_compact_verify_310"):
+    register_meta_if_necessary("_C_ascend", "npu_tree_gdn_compact_verify_310", tree_gdn_compact_verify_310_meta)
+    register_meta_if_necessary("_C_ascend", "npu_tree_gdn_compact_verify_310", tree_gdn_compact_verify_310_out_meta, "out")
+    register_meta_if_necessary("_C_ascend", "npu_tree_gdn_compact_replay_310", tree_gdn_compact_replay_310_meta)
+    register_meta_if_necessary("_C_ascend", "npu_tree_gdn_compact_replay_310", tree_gdn_compact_replay_310_out_meta, "out")
+
+
 if not is_310p():
     register_meta_if_necessary("_C_ascend", "bgmv_expand", bgmv_expand_meta)
     register_meta_if_necessary("_C_ascend", "sgmv_expand", sgmv_expand_meta)
