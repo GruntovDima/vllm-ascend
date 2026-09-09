@@ -36,6 +36,71 @@ if TYPE_CHECKING:
 
 _CPU_GENERATOR_CACHE_310P: dict[int, tuple[torch.Generator, torch.Generator]] = {}
 
+_TREE_COMPACT_MAX_TOP_K = 128
+# Guard the change in FP32 summation order (ascending full CDF vs. head mass).
+# Ambiguous rows use the original filter, not an adjusted sampling threshold.
+_TREE_TOP_P_ROUNDING_GUARD = 1e-5
+
+
+def _try_compact_top_k_310p(
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+    top_k: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, list[int]] | None:
+    """Return filtered candidate logits/IDs, or request the unchanged fallback.
+
+    ``top_k`` is a CPU request parameter, not a device tensor scalar read.
+    The pinned Ascend filter applies top-p to ORIGINAL vocabulary probabilities,
+    independently of top-k, and retains all ties at either cutoff. In particular
+    applying top-p to a renormalized top-k list is not equivalent.
+
+    One batched D2H decision per tree step is intentional in this eager-only
+    path: it avoids executing the full-vocabulary sort on unambiguous inputs.
+    No logits or candidate arrays are transferred to the host.
+    """
+    if (type(top_k) is not int or not 0 < top_k <= _TREE_COMPACT_MAX_TOP_K
+            or top_k >= logits.shape[-1] or logits.dtype != torch.float32 or k is None):
+        return None
+    probs = logits.softmax(dim=-1)
+    # Extra capacity retains small cutoff-tie groups instead of sorting the
+    # whole vocabulary. A final sentinel detects groups that still overflow.
+    capacity = min(2 * top_k, logits.shape[-1] - 1)
+    head, token_ids = probs.topk(capacity + 1, dim=-1)
+    safe = (head[:, top_k - 1] > head[:, capacity]) & (k == top_k)
+    # 310P isnan/isfinite do not reliably distinguish infinities; inspect bits.
+    safe &= ((head.contiguous().view(torch.int32) & 0x7F800000) != 0x7F800000).all(dim=-1)
+    head, token_ids = head[:, :capacity], token_ids[:, :capacity]
+    cutoff = head[:, top_k - 1:top_k]
+    if p is not None and top_k > 1:
+        # For descending candidate j, mass through j in the ascending full
+        # CDF is total - sum(head[:j]). The maximum is always retained.
+        mass_before = torch.cat((torch.zeros_like(head[:, :1]), head[:, :-1].cumsum(-1)), dim=-1)
+        ascending_mass = probs.sum(dim=-1, keepdim=True) - mass_before
+        threshold = 1 - p.unsqueeze(-1)
+        unambiguous = (ascending_mass[:, 1:] - threshold).abs() > _TREE_TOP_P_ROUNDING_GUARD
+        safe &= (unambiguous | (head[:, 1:] < cutoff)).all(dim=-1)
+        safe &= (p > 0) & (p <= 1)
+        retained = ascending_mass > threshold
+        retained[:, 0] = True
+        p_cutoff = head.masked_fill(~retained, float("inf")).amin(dim=-1, keepdim=True)
+        cutoff = torch.maximum(cutoff, p_cutoff)
+    # Copy at most 65 booleans once, never one scalar per node. A boundary tie
+    # in one hypothetical prefix must not force a vocabulary sort on all rows.
+    safe_rows = safe.cpu().tolist()
+    if not any(safe_rows):
+        return None
+    fallback_rows = [row for row, valid in enumerate(safe_rows) if not valid]
+    # Compare probabilities, not logits: rounded probability ties are part of
+    # the original filter's contract. Keep ID order for inverse-CDF sampling.
+    candidate_logits = logits.gather(-1, token_ids).masked_fill(head < cutoff, -float("inf"))
+    if fallback_rows:
+        # These temporary samples will be replaced using the original filter
+        # and the SAME uniforms. Keep their compact CDF finite in the meantime.
+        candidate_logits.masked_fill_(~safe.unsqueeze(-1), 0)
+    token_ids, order = token_ids.sort(dim=-1)
+    return candidate_logits.gather(-1, order), token_ids, fallback_rows
+
 
 def _prepare_cpu_generators_310p(
     generators: dict[int, torch.Generator],
@@ -136,26 +201,26 @@ def fill_exponential_310p(
     )
 
 
+def _request_uniforms_on_current_stream_310p(
+    batch_size: int,
+    generators: dict[int, torch.Generator],
+    device: torch.device,
+) -> torch.Tensor:
+    """Advance each request RNG once and order the small H2D copy."""
+    with npu_stream_switch(global_stream()):
+        uniforms = _generate_request_uniforms_310p(
+            batch_size, generators, device,
+        )
+    torch.npu.current_stream().wait_stream(global_stream())
+    return uniforms
+
+
 def _random_sample_310p(
     probs: torch.Tensor,
     generators: dict[int, torch.Generator],
 ) -> torch.Tensor:
-    """
-    310P does not support the required NPU random-generation path.
-    The previous implementation generated [batch, vocab] random values
-    on the CPU and copied them to the NPU, causing performance degradation on
-    small models and RC devices. This implementation generates only one CPU
-    random value per request and performs inverse-CDF sampling on the NPU,
-    reducing CPU computation and H2D transfer overhead.
-    """
-    with npu_stream_switch(global_stream()):
-        uniforms = _generate_request_uniforms_310p(
-            probs.shape[0],
-            generators,
-            probs.device,
-        )
-
-    torch.npu.current_stream().wait_stream(global_stream())
+    """Generate only one CPU uniform per row; perform inverse CDF on NPU."""
+    uniforms = _request_uniforms_on_current_stream_310p(probs.shape[0], generators, probs.device)
     sampled = _sample_from_cdf_310p(probs, uniforms)
     return sampled.view(-1)
 
@@ -178,6 +243,27 @@ class AscendTopKTopPSampler310(AscendTopKTopPSampler):
             next_token = cand_idx.gather(dim=1, index=pos.unsqueeze(1)).squeeze(1)  # [B]
             return next_token, logits_to_return
         else:
+            # Only sample_tree installs a CPU top-k hint, scoped to this call.
+            # Ordinary decode, graph execution and logprob outputs are unchanged.
+            if self.logprobs_mode not in ("processed_logits", "processed_logprobs"):
+                compact = _try_compact_top_k_310p(logits, k, p, getattr(self, "tree_top_k", None))
+                if compact is not None:
+                    candidate_logits, token_ids, fallback_rows = compact
+                    probs = candidate_logits.softmax(dim=-1, dtype=torch.float32)
+                    if not fallback_rows:
+                        positions = _random_sample_310p(probs, generators)
+                        return token_ids.gather(-1, positions.unsqueeze(-1)).squeeze(-1), None
+                    fallback = torch.tensor(fallback_rows, dtype=torch.int64, device=logits.device)
+                    fallback_logits = self.apply_top_k_top_p(
+                        logits.index_select(0, fallback), k.index_select(0, fallback),
+                        None if p is None else p.index_select(0, fallback),
+                    )
+                    fallback_probs = fallback_logits.softmax(dim=-1, dtype=torch.float32)
+                    uniforms = _request_uniforms_on_current_stream_310p(len(logits), generators, logits.device)
+                    positions = _sample_from_cdf_310p(probs, uniforms)
+                    sampled = token_ids.gather(-1, positions.unsqueeze(-1)).squeeze(-1)
+                    fallback_tokens = _sample_from_cdf_310p(fallback_probs, uniforms.index_select(0, fallback))
+                    return sampled.scatter_(0, fallback, fallback_tokens), None
             logits = self.apply_top_k_top_p(logits, k, p)
             logits_to_return = None
             if self.logprobs_mode == "processed_logits":
@@ -194,7 +280,9 @@ class AscendSampler310(AscendSampler):
         super().__init__(logprobs_mode=logprobs_mode)
         self.topk_topp_sampler = AscendTopKTopPSampler310(logprobs_mode=logprobs_mode)
 
-    def sample_tree(self, logits: torch.Tensor, metadata: SamplingMetadata) -> torch.Tensor:
+    def sample_tree(
+        self, logits: torch.Tensor, metadata: SamplingMetadata, *, top_k: int | None = None,
+    ) -> torch.Tensor:
         """Sample every tree node with the existing target sampler on NPU.
 
         The caller validates a single request without history-dependent
@@ -233,9 +321,12 @@ class AscendSampler310(AscendSampler):
             {node: metadata.generators[0] for node in range(logits.shape[0])}
             if metadata.generators else {}
         )
+        previous_top_k = getattr(self.topk_topp_sampler, "tree_top_k", None)
+        self.topk_topp_sampler.tree_top_k = top_k
         try:
             return self.forward(logits, expanded).sampled_token_ids.flatten()
         finally:
+            self.topk_topp_sampler.tree_top_k = previous_top_k
             # Restore request-indexed cache ownership after temporary row
             # expansion, retaining the RNG state advanced by the sampler.
             _prepare_cpu_generators_310p(metadata.generators)

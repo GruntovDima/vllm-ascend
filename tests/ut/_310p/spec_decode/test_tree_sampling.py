@@ -35,12 +35,16 @@ def load_sampler_adapter():
     method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "sample_tree")
 
     class NativeSampler:
+        def __init__(self):
+            self.topk_topp_sampler = SimpleNamespace(tree_top_k=None)
+
         @staticmethod
         def greedy_sample(logits):
             return logits.argmax(-1)
 
         def forward(self, logits, metadata):
             self.seen_metadata = metadata
+            self.seen_top_k = self.topk_topp_sampler.tree_top_k
             if getattr(self, "fail", False):
                 raise RuntimeError("native sampler failure")
             # Return actual generated uniforms for a precise RNG sequence test.
@@ -96,6 +100,15 @@ class TestTreeSamplingRNG(unittest.TestCase):
         self.assertEqual(set(expanded.generators), set(range(65)))
         self.assertTrue(all(rng is metadata.generators[0] for rng in expanded.generators.values()))
         self.assertEqual(set(self.ns["_CPU_GENERATOR_CACHE_310P"]), {0})
+
+    def test_cpu_top_k_hint_is_scoped_even_on_failure(self):
+        self.sampler.sample_tree(torch.zeros(5, 97), self.metadata(), top_k=50)
+        self.assertEqual(self.sampler.seen_top_k, 50)
+        self.assertIsNone(self.sampler.topk_topp_sampler.tree_top_k)
+        self.sampler.fail = True
+        with self.assertRaisesRegex(RuntimeError, "native sampler failure"):
+            self.sampler.sample_tree(torch.zeros(5, 97), self.metadata(), top_k=50)
+        self.assertIsNone(self.sampler.topk_topp_sampler.tree_top_k)
 
     def test_seeded_nodes_use_distinct_advancing_draws_even_without_prefill(self):
         metadata = self.metadata()
