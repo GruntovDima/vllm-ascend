@@ -174,21 +174,26 @@ def test_topk_topp_forward_and_apply_helpers():
         assert npu_masked.shape == logits.shape
 
 
-def test_custom_topk_topp_falls_back_when_extension_is_unavailable():
+def test_custom_topk_topp_caches_unavailable_extension_result():
     logits = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
     k = torch.tensor([2])
     p = torch.tensor([0.9])
     fallback_result = torch.tensor([[4.0, 3.0, -float("inf"), -float("inf")]])
 
     with (
+        patch("vllm_ascend.sample.sampler._CUSTOM_TOP_K_TOP_P_OP", None),
+        patch("vllm_ascend.sample.sampler._CUSTOM_TOP_K_TOP_P_RESOLVED", False),
         patch("vllm_ascend.sample.sampler.enable_custom_op", return_value=False) as enable,
         patch(
             "vllm_ascend.sample.sampler._apply_top_k_top_p_pytorch",
             return_value=fallback_result,
         ) as fallback,
     ):
-        result = _apply_top_k_top_p_custom(logits, k, p, top_k=2)
+        first_result = _apply_top_k_top_p_custom(logits, k, p, top_k=2)
+        second_result = _apply_top_k_top_p_custom(logits, k, p, top_k=2)
 
-    assert result is fallback_result
+    assert first_result is fallback_result
+    assert second_result is fallback_result
     enable.assert_called_once_with()
-    fallback.assert_called_once_with(logits, k, p, 2)
+    assert fallback.call_count == 2
+    fallback.assert_called_with(logits, k, p, 2)
