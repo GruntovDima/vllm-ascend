@@ -48,7 +48,7 @@ _ENV = "VLLM_LMHEAD_PRUNE_PACK"
 
 
 def _make_pruned_compute_logits(lm_head, inv_map: torch.Tensor, vocab_size: int):
-    pad_cache: dict[int, torch.Tensor] = {}
+    pad_cache: dict[tuple[int, int, torch.device, torch.dtype], torch.Tensor] = {}
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         pruned = lm_head.quant_method.apply(lm_head, hidden_states)
@@ -58,10 +58,11 @@ def _make_pruned_compute_logits(lm_head, inv_map: torch.Tensor, vocab_size: int)
         # pruned matmul's savings.
         pruned2d = pruned.reshape(-1, pruned.shape[-1])
         m, k = pruned2d.shape
-        pad = pad_cache.get(m)
+        cache_key = (m, k, pruned.device, pruned.dtype)
+        pad = pad_cache.get(cache_key)
         if pad is None:
             pad = torch.full((m, k + 1), torch.finfo(pruned.dtype).min, dtype=pruned.dtype, device=pruned.device)
-            pad_cache[m] = pad
+            pad_cache[cache_key] = pad
         pad[:, :k].copy_(pruned2d)
         full = pad.index_select(-1, inv_map)
         return full.reshape(*pruned.shape[:-1], vocab_size)
@@ -79,10 +80,10 @@ def maybe_prune_lm_head(*models: object) -> None:
     pack_path = os.environ.get(_ENV, "")
     if not pack_path:
         return
-    pack = torch.load(pack_path, map_location="cpu")
+    pack = torch.load(pack_path, map_location="cpu", weights_only=True)
     if pack.get("mode") != "int8":
         raise NotImplementedError(f"unsupported prune pack mode {pack.get('mode')!r}")
-    inv_map = pack["inv_map"].npu()
+    inv_map_cpu = pack["inv_map"]
     pruned_heads: set[int] = set()
     for model in models:
         if model is None or not hasattr(model, "compute_logits"):
@@ -106,16 +107,17 @@ def maybe_prune_lm_head(*models: object) -> None:
         scale = getattr(proc, "scale", 1.0)
         if scale != 1.0 or getattr(proc, "soft_cap", None):
             raise NotImplementedError("lm_head pruning supports scale=1.0 / no soft cap only.")
+        dev = lm_head.weight.data.device
         if id(lm_head) not in pruned_heads:
             # Mirror AscendW8A8Static process_weights_after_loading's weight
             # treatment on the sliced rows; activation-quant tensors
             # (aclnn_input_*) depend only on the hidden dim and stay valid.
-            dev = lm_head.weight.data.device
             lm_head.weight.data = maybe_trans_nz(pack["weight"].to(dev)).transpose(0, 1)
             lm_head.deq_scale.data = pack["deq_scale"].to(dev)
             lm_head.quant_bias.data = pack["quant_bias"].to(dev)
             pruned_heads.add(id(lm_head))
-        fn = _make_pruned_compute_logits(lm_head, inv_map[:vocab_size], vocab_size)
+        inv_map = inv_map_cpu[:vocab_size].to(dev)
+        fn = _make_pruned_compute_logits(lm_head, inv_map, vocab_size)
         model.compute_logits = types.MethodType(fn, model)
         logger.info(
             "lm_head pruned: %s vocab %d -> %d rows (embedding-gather scatter)",

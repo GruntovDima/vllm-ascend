@@ -238,6 +238,44 @@ class TestAscendAttentionBackendImpl310(TestBase):
 
 
 class TestAscendAttentionMetadataBuilder310(TestBase):
+    def test_splitfuse_mask_prefers_internal_cpu_seq_lens(self):
+        builder = AscendMetadataBuilder310Direct.__new__(AscendMetadataBuilder310Direct)
+        builder._query_lens_cpu_buffer = torch.zeros(4, dtype=torch.int32)
+        builder._splitfuse_mask_bufs = {}
+        builder.device = torch.device("cpu")
+
+        device_seq_lens = MagicMock()
+        device_seq_lens.__getitem__.return_value = device_seq_lens
+        device_seq_lens.cpu.side_effect = AssertionError("unexpected device-to-host copy")
+        common_attn_metadata = MagicMock()
+        common_attn_metadata.num_reqs = 2
+        common_attn_metadata.query_start_loc = torch.tensor([0, 1, 3], dtype=torch.int32)
+        common_attn_metadata.query_start_loc_cpu = torch.tensor([0, 1, 3], dtype=torch.int32)
+        common_attn_metadata.seq_lens = device_seq_lens
+        common_attn_metadata.seq_lens_cpu = None
+        common_attn_metadata._seq_lens_cpu = torch.tensor([5, 7], dtype=torch.int32)
+
+        attn_metadata = MagicMock()
+        attn_metadata.attn_state = AscendAttentionState.SpecDecoding
+        mask = torch.zeros((1,), dtype=torch.float32)
+
+        with (
+            patch.object(AscendMetadataBuilder310Direct.__bases__[0], "build", return_value=attn_metadata),
+            patch(
+                "vllm_ascend._310p.attention.metadata_builder.is_compressed_mask_supported",
+                return_value=False,
+            ),
+            patch(
+                "vllm_ascend._310p.attention.metadata_builder.AttentionMaskBuilder310."
+                "build_splitfuse_mask_nz_from_host",
+                return_value=mask,
+            ) as build_mask,
+        ):
+            builder.build(0, common_attn_metadata)
+
+        device_seq_lens.cpu.assert_not_called()
+        build_mask.assert_called_once_with([1, 2], [5, 7], torch.device("cpu"))
+
     def test_fill_query_lens_cpu_without_buffer(self):
         builder = AscendMetadataBuilder310Direct.__new__(AscendMetadataBuilder310Direct)
         builder._query_lens_cpu_buffer = None
