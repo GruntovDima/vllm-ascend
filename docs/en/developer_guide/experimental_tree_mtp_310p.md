@@ -15,8 +15,10 @@ is small and not a robust production speedup claim.
 - FP16 activations and recurrent state; text only; batch one; TP/PP/DP/DCP one.
 - Eager, synchronous execution. Prefix caching is disabled and
   `mamba_cache_mode="none"`; ordinary KV caching and live GDN state remain active.
-- Greedy sampling only; no penalties, logprobs, constrained decoding,
-  minimum-token constraint, LoRA or KV transfer.
+- Greedy or stochastic target sampling with temperature, top-k and top-p;
+  seeded and unseeded requests. Proposal construction remains deterministic.
+- No penalties, logprobs, constrained/custom logits processors, minimum-token
+  constraint, thinking-token budget, LoRA or KV transfer. Keep `min_p=0`.
 - Comb-tree width 1, 2, 4, 8 or 16; depth 1 through 4.
   `num_speculative_tokens = width * depth`.
 
@@ -46,7 +48,9 @@ not overwritten.
 3. `0e3b5e15`: batched masked attention, metadata and accepted-path paged KV commit.
 4. `f319cb72`: tree GDN/convolution execution and accepted-state commit.
 5. `c6add8c7`: MTP proposer, runner and opt-in configuration.
-6. The documentation/benchmark commit: this guide and a standalone model probe.
+6. `8b9e7503`: this guide and a standalone model probe.
+7. `ece179a7`: stochastic target verification, RNG handling and distribution tests.
+8. The stochastic benchmark/documentation commit: sampling controls and validation results.
 
 Tests live with the implementation they cover. Generated libraries, tensors,
 profiler dumps, private server configuration and local operator-porting
@@ -78,10 +82,10 @@ splitfuse call per layer with an ancestor-only additive mask. Attention does
 not run on CPU; mask/topology construction and part of candidate selection
 still involve CPU work. A dedicated device-side mask builder is not included.
 
-Greedy verification follows direct children. For an accepted path such as
-`[0, 1, 4]`, the target KV entries are gathered before writes and compacted into
-the canonical chronological slots. Rejected scratch entries need not be
-zero-filled: restored sequence lengths and mappings exclude them, and future
+Verification follows the sampled target token through direct children. For an
+accepted path such as `[0, 1, 4]`, the target KV entries are gathered before
+writes and compacted into the canonical chronological slots. Rejected scratch
+entries need not be zero-filled: restored sequence lengths and mappings exclude them, and future
 writes replace them. Tests poison stale slots and check the next normal decode.
 
 The final emitted bonus token is the next input and is not committed yet.
@@ -108,6 +112,32 @@ processed in a batched compiled convolution call.
 The default is `0`. Tiling selects R64/R32/R16 against platform-reported UB
 capacity; the deepest wide trees can require R32. No `compute_wy` or chunk-GDN
 implementation was changed.
+
+### Stochastic target verification
+
+The target model samples one token for every node using the existing
+`AscendSampler310`, with request temperature/top-k/top-p broadcast over the
+node rows. It samples from the full processed vocabulary, not just from the
+children proposed by MTP. If the sampled token is a child, traversal continues
+there; otherwise that exact sample becomes the bonus token and traversal stops.
+Cache commit is identical to the greedy path, including non-primary siblings.
+
+This is direct target sampling, not draft-probability rejection sampling.
+Candidate construction does not consume target random numbers. With independent
+draws per node, reaching a node depends only on ancestor draws, so the draw at
+that node still has its target conditional distribution. CPU tests exhaustively
+enumerate every outcome of small history-dependent models and compare the
+resulting output-sequence probabilities with serial AR, including fallback
+outside the tree and output-budget truncation. That algebraic check does not
+resolve the existing numerical differences between tree and AR model forwards.
+
+Seeded requests share one advancing RNG across all node rows; each row gets
+a distinct draw. The same seed is not restarted at every node. The existing
+310P sampler creates scalar uniforms on CPU; filtering, softmax and inverse-CDF
+selection remain on NPU. There is no vocabulary-sized CPU sampling transfer.
+Unvisited nodes also consume random draws. Fixed seeds are repeatable for fixed
+logits and topology, but do not promise token-for-token identity with serial AR
+or another tree width. Greedy mode does not consume these random draws.
 
 ## Reproduce the model benchmark
 
@@ -146,7 +176,17 @@ For the original grid, run depth `k=1..4` and width `1,2,4,8,16` with
 `--mtp k*width`; the linear controls use `--mtp k` without `--tree`.
 The script is self-contained; no parent-directory probe or private SSH wrapper
 is needed. Its prompt construction and engine arguments are preserved from
-the measured probe.
+the measured probe; the new sampling arguments default to the original greedy
+settings. For stochastic runs add the same arguments to both tree and linear
+commands:
+
+```bash
+--temperature 1.0 --top-k 50 --top-p 0.9 --seed 42
+```
+
+Use `--seed -1` for unseeded request sampling. Reports record the exact sampling
+parameters. The historical TPOT table below is greedy, not a measurement of
+the newly added stochastic mode.
 
 The probe fixes input to 1024 tokenizer IDs, ignores EOS to produce 2048
 tokens, warms up with eight output tokens, and saves token IDs, prompt hashes,
@@ -158,6 +198,35 @@ Decode TPOT is `(last_token_timestamp - first_token_timestamp) / 2047`;
 prefill is excluded. Wall time per output token including prefill is a separate
 field. This is an offline LLM benchmark, not an HTTP serving benchmark.
 FULL_DECODE_ONLY graph capture is not supported for the current tree path.
+
+## Stochastic model validation, 2026-09-09
+
+Both Qwen3.5-9B runs completed 1,024 input and 2,048 output tokens on physical
+NPU 4, sequentially, with the compatible pins above. Sampling was temperature
+1, top-k 50, top-p 0.9, request seed 42, no penalties and ignored EOS. The
+prompt hashes matched. Tree used depth 4, width 4 and compact GDN; the control
+used ordinary linear MTP with four speculative tokens. Both used eager,
+synchronous batch-one execution with prefix caching disabled. Each engine had
+an eight-token warmup followed by **one** measured request.
+
+| Mode | Decode TPOT (ms) | Tokens per verification | Verification steps | Accepted draft tokens |
+| --- | ---: | ---: | ---: | ---: |
+| Linear MTP k4 | 82.0728 | 2.68283 | 763 | 1284 |
+| Tree MTP k4/w4 | 77.8549 | 3.37232 | 607 | 1440 |
+
+Tree TPOT was 5.14% lower and tokens per verification were 25.70% higher in
+this pair. Counter-derived average cycle time was 262.55 ms for tree versus
+220.19 ms for linear: additional coverage still comes with additional work.
+This single-prompt, single-run comparison is a functionality/performance
+screen, not a stable speedup claim or an accuracy evaluation. Generated
+sequences differ; the shared seed does not force the same RNG consumption.
+
+Raw reports are retained in the test workspace under
+`stochastic_validation_20260909_0944/{component,tree,linear}.json`.
+The sampling extension did not alter native kernels, `compute_wy`, model
+weights or dependencies. The previous native timing-repeatability limitation
+below remains open. Full-model distributional equivalence to AR has not been
+established by these runs.
 
 ## Latest historical model measurements
 
@@ -204,9 +273,20 @@ the tested server copy after line-ending normalization. The full repository
 format check could not run because `pre-commit` was absent; dependencies were
 not installed just for publication.
 
+The stochastic extension passed 110 CPU tests (87 spec-decode, 18 attention,
+five existing sampler tests). On physical NPU 4, all 20 native sampler cases
+passed: 1/5/17/65 node rows across greedy and four stochastic configurations,
+including temperature 1, top-k 50, top-p 0.9. Every case matched serial calls
+to the same sampler on fixed logits and reproduced its seeded result.
+An 8,192-draw check of target probabilities `[0, 0.1, 0.2, 0.7]` observed
+`[0, 0.1015625, 0.1982421875, 0.7001953125]`; the zero-mass token was never
+sampled. Unseeded sampling also passed. These component checks do not prove
+full-model distributional equivalence to AR.
+
 ```bash
 python3 -B -m unittest discover -s tests/ut/_310p/spec_decode -p 'test_tree*.py'
 python3 -B -m unittest discover -s tests/ut/_310p/attention -p 'test_tree*.py'
+python3 -B tests/ut/_310p/sample/test_sampler_310.py
 g++ -std=c++17 -O2 \
   csrc/attention/tree_gated_delta_rule_v310/tests/ut/test_tree_plan.cpp \
   -o csrc/attention/tree_gated_delta_rule_v310/tests/ut/test_tree_plan
@@ -224,6 +304,8 @@ python3 -P tests/e2e/nightly/single_node/ops/singlecard_ops/test_tree_gdn_310.py
   --device 0 --compact-kernel --sweep-shapes --output results/gdn-compact.json
 python3 -P tests/e2e/nightly/single_node/ops/singlecard_ops/test_tree_attention_310.py \
   --device 0 --sweep-shapes --long-context-shapes --output results/attention.json
+python3 -P tests/e2e/nightly/single_node/ops/singlecard_ops/test_tree_sampling_310.py \
+  --device 0 --output results/sampling.json
 ```
 
 Previous kernel/component validation covered nine forms and 148 accepted
@@ -238,7 +320,7 @@ the cause remains unresolved. Correctness checks do not override that failed
 performance gate.
 
 Full-model numerical differences from AR and repeated-run token differences
-remain open. Prefix-state reuse, stochastic tree sampling, asynchronous or
+remain open. Prefix-state reuse, asynchronous or
 graph execution, and device-side mask/selection construction are not
 implemented. This branch should remain opt-in until those contracts and
 performance behavior are addressed.
