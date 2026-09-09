@@ -26,12 +26,13 @@ from vllm_ascend._310p.attention.attention_mask import (
     AttentionMaskBuilder310,
     is_compressed_mask_supported,
 )
+from vllm_ascend._310p.spec_decode.tree_runtime import TreeMTPConfig
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionMetadataBuilder,
     AscendAttentionState,
     AscendMetadata,
 )
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_decodes_and_prefills
 
 QUERY_LENS_CPU_ATTR = "query_lens_cpu"
 SPLITFUSE_MASK_NZ_ATTR = "splitfuse_mask_nz"
@@ -97,6 +98,28 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
             self._query_lens_cpu_buffer = torch.empty(max_num_seqs, dtype=torch.int32, device="cpu", pin_memory=True)
         # Stable-address NZ mask buffers, keyed by the actual query-token count.
         self._splitfuse_mask_bufs: dict[int, torch.Tensor] = {}
+
+    def _get_max_decode_threshold(self) -> int:
+        tree = TreeMTPConfig.from_vllm_config(self.vllm_config)
+        if tree is None:
+            return super()._get_max_decode_threshold()
+        # Validated eager 310P trees use legacy masked ATB, not FIA TND.
+        # Its independently tested capacity is root + up to 64 candidates.
+        return tree.num_candidates + 1
+
+    def _split_decodes_and_prefills(
+        self, common_attn_metadata: AscendCommonAttentionMetadata
+    ) -> tuple[int, int, int, int]:
+        if TreeMTPConfig.from_vllm_config(self.vllm_config) is None:
+            return super()._split_decodes_and_prefills(common_attn_metadata)
+        # A wide tree's decode threshold can exceed a short prompt's length.
+        # Keep actual prefills classified as prefills rather than inferring
+        # their phase solely from query length.
+        return split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=self.decode_threshold,
+            treat_short_extends_as_decodes=False,
+        )
 
     def _fill_query_lens_cpu(
         self, num_reqs: int, query_start_loc_cpu: torch.Tensor, is_drafting: bool = False

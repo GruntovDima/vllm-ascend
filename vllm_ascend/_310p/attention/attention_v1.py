@@ -15,10 +15,13 @@
 # This file is a part of the vllm-ascend project.
 #
 
+from numbers import Integral
 from typing import Any
 
 import torch
 import torch_npu
+from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import (  # type: ignore
     AttentionBackendEnum,
     register_backend,
@@ -33,6 +36,7 @@ from vllm_ascend._310p.attention.metadata_builder import (
     get_query_lens_cpu,
     get_splitfuse_mask_nz,
 )
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -40,9 +44,110 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionState,
     AscendMetadata,
 )
+from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, nd_to_nz_spec
 
 MASK_TYPE_NORM_COMPRESS_SELF_ATTENTION = 3
 MASK_TYPE_NORM_COMPRESS_PAGED_ATTENTION = 5
+TREE_MASK_ALIGNMENT = 16
+
+
+def _tree_context_from_metadata(attn_metadata: Any) -> Any | None:
+    # The context is explicitly attached to this step's metadata. Inspecting
+    # stored attributes also avoids treating dynamic proxy attributes as opt-in.
+    return vars(attn_metadata).get("tree_mtp_context") if attn_metadata is not None else None
+
+
+def _tree_dimensions(context: Any) -> tuple[int, int, tuple[int, ...]]:
+    if context is None:
+        raise ValueError("Tree attention requires an explicitly attached tree step context.")
+    num_nodes, prefix_length = context.num_nodes, context.prefix_length
+    if not isinstance(num_nodes, Integral) or isinstance(num_nodes, bool) or num_nodes < 1:
+        raise ValueError("Tree attention requires a positive integer node count.")
+    if not isinstance(prefix_length, Integral) or isinstance(prefix_length, bool) or prefix_length < 0:
+        raise ValueError("Tree attention requires a nonnegative integer prefix length.")
+    parents = tuple(context.tree.parents)
+    if len(parents) != num_nodes or parents[0] != -1:
+        raise ValueError("Tree attention requires exactly one parent entry per node and root parent -1.")
+    for node, parent in enumerate(parents[1:], 1):
+        if not isinstance(parent, Integral) or isinstance(parent, bool) or not 0 <= parent < node:
+            raise ValueError("Tree attention requires parent-before-child node order.")
+    return int(num_nodes), int(prefix_length), parents
+
+
+def build_tree_attention_mask(context: Any, device: torch.device) -> torch.Tensor:
+    """Build an additive mask in physical prefix-plus-flat-node coordinates.
+
+    The aligned key tail is explicitly masked: nd_to_nz_spec pads with zero,
+    which must not accidentally expose unused cache slots. Build the small
+    tree's row indices on CPU and upload the mask once, not once per node.
+    """
+    num_nodes, prefix_length, parents = _tree_dimensions(context)
+    context_length = prefix_length + num_nodes
+    aligned_length = (context_length + TREE_MASK_ALIGNMENT - 1) // TREE_MASK_ALIGNMENT * TREE_MASK_ALIGNMENT
+    mask = torch.full((num_nodes, aligned_length), -float("inf"), dtype=torch.float16, device="cpu")
+    mask[:, :prefix_length] = 0
+    for node in range(num_nodes):
+        ancestor = node
+        while ancestor >= 0:
+            mask[node, prefix_length + ancestor] = 0
+            ancestor = parents[ancestor]
+    return mask.to(device=device, non_blocking=True)
+
+
+def register_tree_cache_commit(
+    context: Any,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Snapshot rotated dense K/V; compact only the accepted input-node path.
+
+    The original slots must describe C + flat_index, independently of the
+    tree's C + depth RoPE positions. Reusing their prefix handles arbitrary
+    physical block boundaries without decoding or overlapping NZ-cache reads.
+    """
+    num_nodes, _, parents = _tree_dimensions(context)
+    if key.ndim != 3 or value.ndim != 3 or min(key.shape[0], value.shape[0]) < num_nodes:
+        raise ValueError("Tree cache snapshots require K/V shaped [at_least_num_nodes, heads, dim].")
+    if slot_mapping.ndim != 1 or slot_mapping.numel() < num_nodes:
+        raise ValueError("Tree cache snapshots require one physical slot per node.")
+    commit_key = ("tree_attention_kv", id(key_cache), id(value_cache))
+    if context.has_commit(commit_key):
+        # Some upstream paths expose both writer entry points. The first
+        # snapshot belongs to the actual tree pass and must not be replaced.
+        return
+    saved_key = key[:num_nodes].contiguous().clone()
+    saved_value = value[:num_nodes].contiguous().clone()
+    saved_slots = slot_mapping[:num_nodes].contiguous().clone()
+
+    def commit(accepted_indices: tuple[int, ...]) -> None:
+        path = tuple(accepted_indices)
+        if not path:
+            return
+        if len(path) > num_nodes or path[0] != 0:
+            raise ValueError("The accepted input path must start at the root.")
+        for rank, node in enumerate(path):
+            if not isinstance(node, Integral) or isinstance(node, bool) or not 0 <= node < num_nodes:
+                raise ValueError("Accepted input indices must refer to real tree nodes.")
+            if rank and parents[node] != path[rank - 1]:
+                raise ValueError("The accepted input path must follow direct parent-child edges.")
+        indices = torch.tensor(path, dtype=torch.long, device=saved_key.device)
+        # Gather BOTH sources before any write: source and destination slots
+        # can overlap, and the live projection/slot buffers may already change.
+        selected_key = saved_key.index_select(0, indices).contiguous()
+        selected_value = saved_value.index_select(0, indices).contiguous()
+        DeviceOperator.reshape_and_cache(
+            key=selected_key,
+            value=selected_value,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mapping=saved_slots[: len(path)].contiguous(),
+        )
+
+    context.register_commit(commit_key, commit)
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -109,6 +214,81 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.support_compressed_mask = is_compressed_mask_supported()
+
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping) -> None:
+        metadata = get_forward_context().attn_metadata if is_forward_context_available() else None
+        if isinstance(metadata, dict):
+            metadata = metadata.get(layer.layer_name)
+        context = _tree_context_from_metadata(metadata)
+        if context is not None:
+            if self.kv_sharing_target_layer_name is not None:
+                return
+            if len(kv_cache) < 2:
+                raise ValueError("Tree attention requires allocated K and V caches.")
+            register_tree_cache_commit(context, key, value, kv_cache[0], kv_cache[1], slot_mapping)
+        super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+
+    def reshape_and_cache(self, query, key, value, kv_cache, attn_metadata, output):
+        context = _tree_context_from_metadata(attn_metadata)
+        if context is not None and self.kv_sharing_target_layer_name is None:
+            if len(kv_cache) < 2:
+                raise ValueError("Tree attention requires allocated K and V caches.")
+            register_tree_cache_commit(context, key, value, kv_cache[0], kv_cache[1], attn_metadata.slot_mapping)
+        return super().reshape_and_cache(query, key, value, kv_cache, attn_metadata, output)
+
+    def forward_tree_attention_310(self, query, attn_metadata, output):
+        """Verify all flat tree nodes with an explicit, uncompressed mask.
+
+        This composition deliberately uses the legacy splitfuse mask interface.
+        A compressed causal mask cannot describe arbitrary ancestry. Device
+        correctness for this mask family must be established separately.
+        """
+        context = _tree_context_from_metadata(attn_metadata)
+        num_nodes, prefix_length, _ = _tree_dimensions(context)
+        if is_forward_context_available() and _EXTRA_CTX.capturing:
+            raise NotImplementedError("Tree attention currently requires eager execution.")
+        if self.attn_type != AttentionType.DECODER or self.sliding_window is not None:
+            raise NotImplementedError(
+                "Tree attention currently requires full decoder attention without sliding windows."
+            )
+        if attn_metadata.attn_state != AscendAttentionState.SpecDecoding and not (
+            num_nodes == 1 and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+        ):
+            raise ValueError("Tree attention metadata must describe a speculative verification pass.")
+        if attn_metadata.num_actual_tokens != num_nodes or min(query.shape[0], output.shape[0]) < num_nodes:
+            raise ValueError("Tree attention query/output count does not match the tree.")
+        if query.dtype != torch.float16:
+            raise TypeError("310P tree attention requires FP16 queries.")
+        if attn_metadata.block_tables.shape[0] != 1 or attn_metadata.seq_lens.numel() != 1:
+            raise ValueError("Tree attention currently supports batch size one only.")
+        if self.key_cache is None or self.value_cache is None:
+            raise ValueError("Tree attention requires initialized K and V caches.")
+        if not hasattr(torch_npu, "_npu_paged_attention_splitfuse"):
+            raise RuntimeError("Tree attention requires the legacy splitfuse custom-mask operator.")
+        context_length = prefix_length + num_nodes
+        block_size = self.key_cache.shape[2]
+        if attn_metadata.block_tables.shape[1] * block_size < context_length:
+            raise ValueError("Tree attention block table does not cover the physical tree span.")
+        additive_mask = build_tree_attention_mask(context, query.device)
+        mask = torch_npu.npu_format_cast(nd_to_nz_spec(additive_mask).contiguous(), ACL_FORMAT_FRACTAL_NZ)
+        # These are physical lengths, never max(depth)+1. Explicitly bound them
+        # so optimistic scheduler metadata cannot expose stale sibling slots.
+        query_lens = torch.tensor([num_nodes], dtype=torch.int32, device="cpu")
+        context_lens = torch.tensor([context_length], dtype=torch.int32, device=query.device)
+        torch_npu._npu_paged_attention_splitfuse(
+            query=query[:num_nodes],
+            key_cache=self.key_cache,
+            value_cache=self.value_cache,
+            mask=mask,
+            block_table=attn_metadata.block_tables,
+            seq_len=query_lens,
+            context_lens=context_lens,
+            num_kv_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            scale_value=self.scale,
+            out=output[:num_nodes],
+        )
+        return output
 
     def _flash_attention(
         self,
@@ -338,6 +518,8 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         Raises:
             NotImplementedError: If the attention state is not supported on 310P.
         """
+        if _tree_context_from_metadata(attn_metadata) is not None:
+            return self.forward_tree_attention_310(query, attn_metadata, output)
         state = attn_metadata.attn_state
         # Condition for PrefillNoCache: No previous tokens have been processed yet
         if state == AscendAttentionState.PrefillNoCache:
