@@ -17,7 +17,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+from copy import copy
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import Any, cast
@@ -41,6 +43,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend._310p.block_table import MultiGroupBlockTable as MultiGroupBlockTable310
@@ -49,6 +52,8 @@ from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
+from vllm_ascend._310p.spec_decode.tree import TokenTree, greedy_verify
+from vllm_ascend._310p.spec_decode.tree_runtime import TreeMTPConfig, TreeStepContext, validate_tree_sampling
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 from vllm_ascend.spec_decode.utils import (
@@ -83,6 +88,14 @@ class NPUModelRunner310(NPUModelRunner):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.tree_mtp_config = TreeMTPConfig.from_vllm_config(self.vllm_config)
+        self._tree_step: TreeStepContext | None = None
+        self._tree_gdn_request_id: str | None = None
+        self._tree_gdn_indices: dict[str, torch.Tensor] = {}
+        if self.tree_mtp_config is not None:
+            if self.drafter is None:
+                raise ValueError("tree_mtp requires the 310P MTP proposer")
+            self.drafter.tree_mtp_config = self.tree_mtp_config
         self.input_batch = NPUInputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=max(self.model_config.max_model_len, self.max_encoder_len),
@@ -197,7 +210,14 @@ class NPUModelRunner310(NPUModelRunner):
         # 310P must capture SpecDecoding + splitfuse for SpecDecoding uniform decode graphs.
         if self._spec_dummy_capture:
             self.attn_state = AscendAttentionState.SpecDecoding
-        return super()._build_attention_metadata(*args, **kwargs)
+        metadata, common = super()._build_attention_metadata(*args, **kwargs)
+        context = getattr(self, "_tree_step", None)
+        if context is not None and not self._spec_dummy_capture:
+            if not isinstance(metadata, dict):
+                raise ValueError("tree_mtp does not support microbatching")
+            for layer_metadata in metadata.values():
+                layer_metadata.tree_mtp_context = context
+        return metadata, common
 
     def _pad_query_start_loc_for_fia(
         self,
@@ -554,10 +574,151 @@ class NPUModelRunner310(NPUModelRunner):
             max_num_reqs_across_dp = self.max_num_reqs * self.uniform_decode_query_len
             logits_indices = nn.functional.pad(logits_indices, (0, max_num_reqs_across_dp - logits_indices.shape[0]))
 
+        if self.tree_mtp_config is not None:
+            self._prepare_tree_step(scheduler_output, total_num_scheduled_tokens)
+
         return (
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
+        )
+
+    def _prepare_tree_step(self, scheduler_output: SchedulerOutput, num_tokens: int) -> None:
+        """Keep physical scratch slots flat, then assign logical tree positions."""
+        self._tree_step = None
+        if self.input_batch.num_reqs != 1:
+            raise ValueError("tree_mtp requires a single active request")
+        request_id = self.input_batch.req_ids[0]
+        request = self.requests[request_id]
+        if self._tree_gdn_request_id != request_id:
+            self._tree_gdn_indices.clear()
+            self._tree_gdn_request_id = request_id
+        validate_tree_sampling(request.sampling_params)
+        if getattr(request, "mm_features", None):
+            raise ValueError("tree_mtp currently supports text input only")
+        drafts = scheduler_output.scheduled_spec_decode_tokens.get(request_id, [])
+        prefix = int(self.input_batch.num_computed_tokens_cpu[0])
+        if not drafts and prefix < self.input_batch.num_prompt_tokens[0]:
+            # Recompute/preemption can reuse a request ID with new cache
+            # blocks. Never retain checkpoint indices across a new prefill.
+            self._tree_gdn_indices.clear()
+            return
+        if num_tokens != len(drafts) + 1:
+            raise ValueError("tree_mtp verification requires exactly one root plus draft nodes")
+        config = self.tree_mtp_config
+        assert config is not None
+        if len(drafts) > config.num_candidates:
+            raise ValueError("Scheduled tree exceeds the configured candidate capacity")
+        root = int(self.input_batch.token_ids_cpu[0, prefix])
+        # The proposer emits width siblings per primary-backbone depth. A
+        # scheduler budget may trim this topological order, including mid-row.
+        parents = [-1] + [0 if i < config.width else 1 + (i // config.width - 1) * config.width
+                          for i in range(len(drafts))]
+        tree = TokenTree((root, *map(int, drafts)), tuple(parents))
+        remaining = request.sampling_params.max_tokens - len(request.output_token_ids)
+        self._tree_step = TreeStepContext(tree, prefix, request_id, max_output_tokens=max(1, remaining))
+        self._tree_step.gdn_state_indices = self._tree_gdn_indices
+        self._tree_step.previous_accepted_tokens = self.num_accepted_tokens.gpu[:1].clone()
+        positions_cpu = torch.tensor([prefix + depth for depth in tree.depths], dtype=torch.int64)
+        # Input lookup / slot mapping above already used prefix + flat_index.
+        self._positions_cpu_buf[:num_tokens].copy_(positions_cpu)
+        self.positions[:num_tokens].copy_(positions_cpu, non_blocking=True)
+        if self.uses_mrope:
+            self.mrope_positions.cpu[:, :num_tokens].copy_(positions_cpu.unsqueeze(0))
+            self.mrope_positions.gpu[:, :num_tokens].copy_(self.mrope_positions.cpu[:, :num_tokens], non_blocking=True)
+        elif self.uses_xdrope_dim > 0:
+            self.xdrope_positions.cpu[:, :num_tokens].copy_(positions_cpu.unsqueeze(0))
+            self.xdrope_positions.gpu[:, :num_tokens].copy_(self.xdrope_positions.cpu[:, :num_tokens], non_blocking=True)
+
+    def _sample(self, logits, spec_decode_metadata):
+        context = self._tree_step
+        if context is None:
+            return super()._sample(logits, spec_decode_metadata)
+        if logits.shape[0] != context.num_nodes:
+            raise RuntimeError("Tree target logits must contain one row per node")
+        # One intentional host sync for the small traversal; this reference
+        # path prioritizes explicit acceptance/rollback over graph execution.
+        predictions = logits.argmax(dim=-1).cpu().tolist()
+        result = greedy_verify(context.tree, predictions, max_output_tokens=context.max_output_tokens)
+        context.commit(result)
+        sampled = torch.full((1, context.num_nodes), -1, dtype=torch.int32, device=logits.device)
+        sampled[0, :len(result.emitted_token_ids)] = torch.tensor(
+            result.emitted_token_ids, dtype=torch.int32, device=logits.device
+        )
+        if self.tree_mtp_config.trace:
+            logger.info("TREE_MTP_STEP %s", json.dumps({
+                "request_id": context.request_id, "prefix_length": context.prefix_length,
+                "tokens": context.tree.token_ids, "parents": context.tree.parents,
+                "depths": context.tree.depths, "target_predictions": predictions,
+                "accepted_input_indices": result.accepted_input_indices,
+                "emitted_token_ids": result.emitted_token_ids,
+                "committed_cache_writers": {
+                    kind: context.committed_cache_kinds.count(kind) for kind in set(context.committed_cache_kinds)
+                },
+            }))
+        return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
+
+    def propose_draft_token_ids(
+        self, valid_sampled_token_ids, sampling_metadata, scheduler_output,
+        spec_decode_metadata, spec_decode_common_attn_metadata, positions,
+        num_scheduled_tokens, hidden_states, aux_hidden_states=None,
+        sample_hidden_states=None, target_model_batch_desc=None,
+    ):
+        context = self._tree_step
+        if context is None:
+            return super().propose_draft_token_ids(
+                valid_sampled_token_ids, sampling_metadata, scheduler_output,
+                spec_decode_metadata, spec_decode_common_attn_metadata, positions,
+                num_scheduled_tokens, hidden_states, aux_hidden_states,
+                sample_hidden_states, target_model_batch_desc,
+            )
+        if not context.committed:
+            raise RuntimeError("Tree caches must be committed before MTP drafting")
+        self._draft_probs = None
+        self._draft_prob_req_ids = None
+        path = torch.tensor(context.accepted_input_indices, dtype=torch.int64, device=hidden_states.device)
+        count = len(context.accepted_input_indices)
+        prefix = context.prefix_length
+        common = copy(spec_decode_common_attn_metadata)
+        common.query_start_loc_cpu = torch.tensor([0, count], dtype=torch.int32)
+        common.query_start_loc = common.query_start_loc_cpu.to(self.device)
+        seq_cpu = torch.tensor([prefix + count], dtype=torch.int32)
+        common.seq_lens = seq_cpu.to(self.device)
+        common.seq_lens_cpu = seq_cpu
+        common._seq_lens_cpu = seq_cpu
+        common.seq_lens_cpu_upper_bound = seq_cpu
+        computed = torch.tensor([prefix], dtype=torch.int32)
+        common.num_computed_tokens_cpu = computed
+        common._num_computed_tokens_cpu = computed
+        common.num_actual_tokens = common.num_input_tokens = count
+        common.max_query_len = count
+        common.max_seq_len = prefix + count
+        common.actual_seq_lengths_q = [count]
+        common.slot_mapping = common.slot_mapping[:count].clone()
+        common.positions_cpu = torch.arange(prefix, prefix + count, dtype=torch.int64)
+        common.positions = common.positions_cpu.to(self.device)
+        common.decode_token_per_req = count
+        # Draft KV has only the primary backbone, not all target-tree nodes.
+        # Its first pass reconstructs the accepted path from target hidden
+        # states and shifted accepted IDs, overwriting stale draft scratch.
+        target_positions = self._get_positions(path)
+        next_ids = torch.tensor([context.emitted_token_ids[-1]], dtype=torch.int32, device=self.device)
+        valid_counts = torch.tensor([count], dtype=torch.int32, device=self.device)
+        self._copy_valid_sampled_token_count(next_ids, valid_counts)
+        return self.drafter._propose(
+            num_speculative_tokens=scheduler_output.num_spec_tokens_to_schedule,
+            target_token_ids=self.input_ids.gpu.index_select(0, path),
+            target_positions=target_positions,
+            target_hidden_states=hidden_states.index_select(0, path),
+            next_token_ids=next_ids,
+            token_indices_to_sample=torch.tensor([count - 1], dtype=torch.int64, device=self.device),
+            common_attn_metadata=common,
+            target_model_batch_desc=target_model_batch_desc,
+            sampling_metadata=sampling_metadata,
+            req_scheduled_tokens={context.request_id: count},
+            scheduler_output=scheduler_output,
+            num_scheduled_tokens=count,
+            num_rejected_tokens_gpu=None,
         )
 
     @torch.inference_mode()

@@ -256,6 +256,7 @@ class AscendConfig:
             "enable_kv_nz": false,
             "enable_mc2_hierarchy_comm": false,
             "enable_reduce_sample": false,
+            "tree_mtp": null,
             "enable_dsa_cp": false,
             "draft_window_size": null,
             "mix_placement": false,
@@ -390,6 +391,9 @@ class AscendConfig:
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_reduce_sample: bool = False
+    # Experimental 310P batch-one eager comb-tree MTP. The 310P runner validates
+    # the opt-in contract and rejects unsupported topology/sampling settings.
+    tree_mtp: dict[str, Any] | None = None
     enable_dsa_cp: bool = False
     draft_window_size: int | None = None
     mix_placement: bool = False
@@ -472,6 +476,11 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        if self.tree_mtp and self.tree_mtp.get("enabled", False):
+            from vllm_ascend.utils import is_310p
+
+            if not is_310p():
+                raise ValueError("tree_mtp is implemented only for Ascend 310P")
         self._check_mooncake_c8_kv_cache_quant(vc)
 
         # profiling_chunk vs min_chunk clamp
