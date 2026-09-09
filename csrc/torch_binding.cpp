@@ -30,6 +30,7 @@
 #include "utils.h"
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "moe/add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
+#include "moe/apply_top_k_top_p_custom/apply_top_k_top_p_custom_torch_adpt.h"
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 #include "batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "mla_preprocess/mla_preprocess_torch_adpt.h"
@@ -1985,6 +1986,9 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "chunk_gated_delta_rule_compute_wy(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, int? chunk_size=None) -> (Tensor q_kernel, Tensor k_kernel, Tensor w_kernel, Tensor u_kernel, Tensor g_kernel)"
     );
     ops.impl("chunk_gated_delta_rule_compute_wy", torch::kPrivateUse1, &vllm_ascend::chunk_gated_delta_rule_compute_wy);
+
+    ops.def("npu_apply_top_k_top_p(Tensor logits, Tensor? p=None, Tensor? k=None) -> Tensor");
+    ops.impl("npu_apply_top_k_top_p", torch::kPrivateUse1, &vllm_ascend::npu_apply_top_k_top_p);
 
     ops.def(
         "quant_batch_matmul_v3_x(Tensor x1, "
