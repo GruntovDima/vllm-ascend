@@ -32,6 +32,10 @@ def main():
     parser.add_argument("--input-tokens", type=int)
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--safetensors-load-strategy", choices=("lazy", "eager"))
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-k", type=int, default=-1)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=0, help="Request seed; -1 uses unseeded sampling")
     args = parser.parse_args()
     if os.environ.get("ASCEND_RT_VISIBLE_DEVICES") != str(args.device):
         raise RuntimeError("Probe device and ASCEND_RT_VISIBLE_DEVICES must match.")
@@ -51,6 +55,10 @@ def main():
               "mtp_tokens": args.mtp, "physical_npu": args.device,
               "pid": os.getpid(), "status": "started", "runs": []}
     report["requested_input_tokens"] = args.input_tokens
+    report["sampling_params"] = {
+        "temperature": args.temperature, "top_k": args.top_k, "top_p": args.top_p,
+        "seed": None if args.seed == -1 else args.seed,
+    }
     report["process_env"] = {
         key: os.environ.get(key)
         for key in ("ASCEND_RT_VISIBLE_DEVICES", "VLLM_WORKER_MULTIPROC_METHOD")
@@ -151,8 +159,8 @@ def main():
         else:
             cases.append(("measured", args.max_tokens, prompt, True))
         for label, max_tokens, case_prompt, ignore_eos in cases:
-            params = SamplingParams(temperature=0, max_tokens=max_tokens,
-                                    min_tokens=0, ignore_eos=ignore_eos, seed=0)
+            params = SamplingParams(**report["sampling_params"], max_tokens=max_tokens,
+                                    min_tokens=0, ignore_eos=ignore_eos)
             counters_before = spec_counters()
             torch.npu.synchronize()
             begin = time.perf_counter()
