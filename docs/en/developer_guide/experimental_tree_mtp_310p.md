@@ -50,7 +50,9 @@ not overwritten.
 5. `c6add8c7`: MTP proposer, runner and opt-in configuration.
 6. `8b9e7503`: this guide and a standalone model probe.
 7. `ece179a7`: stochastic target verification, RNG handling and distribution tests.
-8. The stochastic benchmark/documentation commit: sampling controls and validation results.
+8. `c0622f7e`: sampling controls and stochastic validation results.
+9. `ca664cff`: shared per-step attention inputs and cache-lifetime checks.
+10. `94cbc178`: deterministic rank-key draft top-k and CPU/NPU selector tests.
 
 Tests live with the implementation they cover. Generated libraries, tensors,
 profiler dumps, private server configuration and local operator-porting
@@ -78,9 +80,13 @@ There are at most 65 nodes, and one verification emits at most `depth + 1`
 tokens, regardless of width.
 
 All nodes enter one target-model forward. Full attention uses one NPU legacy
-splitfuse call per layer with an ancestor-only additive mask. Attention does
-not run on CPU; mask/topology construction and part of candidate selection
-still involve CPU work. A dedicated device-side mask builder is not included.
+splitfuse call per layer with an ancestor-only additive mask. The prepared
+FP16/NZ mask and physical lengths are shared across attention layers within
+one `TreeStepContext`, keyed by device, prefix length and topology. They are
+released at commit, never shared across requests; layer-local KV tensors and
+block tables are not cached here. Attention and numerical draft selection run
+on NPU. Building topology and the initial mask still involves CPU work; a
+dedicated device-side mask builder is not included.
 
 Verification follows the sampled target token through direct children. For an
 accepted path such as `[0, 1, 4]`, the target KV entries are gathered before
@@ -227,6 +233,82 @@ The sampling extension did not alter native kernels, `compute_wy`, model
 weights or dependencies. The previous native timing-repeatability limitation
 below remains open. Full-model distributional equivalence to AR has not been
 established by these runs.
+
+## Runtime top-k and shared-mask optimization, 2026-09-09
+
+Draft widths greater than one use two selections and score ranking instead of
+one full-vocabulary reduction loop per sibling. The first top-k supplies score
+boundaries; `searchsorted(right=True)` assigns equal scores equal ranks. A
+second top-k selects the unique keys `rank * vocab_size - token_id`. Distinct
+selected score groups have ranks at least one apart, and a vocabulary-wide
+token-ID difference cannot reverse that ordering. This also repairs ties that
+cross the selection boundary, without adding an epsilon to logits or consuming
+RNG. The fast path checks that `(width + 1) * vocab_size <= 2**24`, keeping all
+FP32 key arithmetic exact; unusual dtypes/sizes retain the reference algorithm.
+There is no new per-level host/device synchronization.
+
+NaN detection uses IEEE magnitude bits: the pinned 310P floating `isnan` and
+self-inequality paths also classified infinities as NaNs in the probe.
+`nan_to_num` was unsupported. Widths greater than one sort NaNs before +inf
+and break ties by token ID. Width one deliberately keeps native `argmax`;
+its existing nonfinite behavior is not CPU-argmax-equivalent. The NPU test
+records those differences explicitly, separately from the stable-sort golden
+for the new algorithm. CANN and torch_npu were not modified.
+
+Same-device component times, milliseconds per draft level, vocabulary 248320,
+FP32, median of three groups of 15 calls after warmup:
+
+| Width | Previous reductions | Ranked top-k |
+| --- | ---: | ---: |
+| 1 | 0.0514 | 0.0508 |
+| 2 | 1.6394 | 1.9376 |
+| 4 | 3.1717 | 1.9600 |
+| 8 | 6.2240 | 2.0084 |
+| 16 | 12.5341 | 2.0238 |
+
+Width two regresses in this composition; this is not an improvement at every
+width. FP16 was also tested: width four changed from 3.1056 to 2.1358 ms.
+Two exact int64-key alternatives were screened but were slower than the
+ranked approach. These are compositions of existing device operations, not a
+new fused AscendC top-k kernel.
+
+For a synthetic eight-attention-call step at width/depth 4 and prefix 2048,
+rebuilding inputs before every call took 9.0670 ms; one build plus seven shared
+uses took 2.1135 ms, with bit-identical outputs. This reuses the same synthetic
+KV tensors across the eight calls and is a component comparison, not a model
+layer-time decomposition. Wall timings include dispatch and device completion;
+isolated savings cannot simply be added to predict end-to-end TPOT.
+
+Full-model screen: batch one, input 1024/output 2048, eager, temperature 1,
+top-k 50/top-p 0.9/seed 42, same physical NPU and prompt, eight-token warmup,
+one measured request per mode. The tree configuration is depth 4/width 4.
+
+| Mode | TPOT (ms) | Tokens/verification | Verification steps |
+| --- | ---: | ---: | ---: |
+| No MTP | 105.9421 | 1 | n/a |
+| Tree before | 82.8759 | 3.10152 | 660 |
+| Tree after top-k + shared inputs | 81.0306 | 3.09682 | 661 |
+
+TPOT decreased 2.23% in this pair; the counter-derived mean cycle changed
+from 257.04 to 250.94 ms. The new tree run was 23.51% below the no-MTP control.
+Generated sequences differ, despite the same seed; these single requests do
+not establish a stable speedup or lossless full-model equivalence. Do not mix
+this comparison with the older stochastic linear-MTP pair or greedy grid.
+Neither the sampler nor GDN/`compute_wy`, dependencies or weights changed.
+
+Validation: 117 CPU tests; 94 NPU top-k cases with three repetitions (74 use
+CPU stable-sort golden, 20 preserve native argmax); 33 attention cases covering
+shared-input identity, unchanged output, sibling poison and next decode after
+KV commit; 13 additional mask-reuse equivalence checks. `git diff --check`
+passed. Full `format.sh ci` was unavailable because `pre-commit` is not
+installed; dependencies were not installed to bypass that limitation.
+
+The standalone NPU selector check is
+`tests/e2e/nightly/single_node/ops/singlecard_ops/test_tree_topk_310.py`.
+It accepts `--device`, a new `--output` JSON path, and optionally
+`--baseline-source` pointing to the previous proposer file for paired timings.
+Raw reports remain in the test workspace under
+`runtime_opt_stage1_20260909/{before_tree,no_mtp,after_tree,topk_v2,attention_v2,attention_perf}.json`.
 
 ## Latest historical model measurements
 
