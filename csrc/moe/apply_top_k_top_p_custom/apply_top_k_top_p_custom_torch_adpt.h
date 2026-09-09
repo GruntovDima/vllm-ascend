@@ -35,6 +35,6 @@ at::Tensor npu_apply_top_k_top_p(
         out);
 
     return out;
-}    
+}
 }
 #endif

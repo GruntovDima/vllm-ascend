@@ -16,8 +16,11 @@
 #define APPLY_TOP_P_CUSTOM_H_KERNEL
 
 #include "kernel_operator.h"
+#include "compat_310p.h"
 
 using namespace AscendC;
+using ApplyTopKTopPCompat310P::DataCopyPadCustom;
+using ApplyTopKTopPCompat310P::DataCopyCustom;
 namespace ApplyTopPCustomOp {
 constexpr uint16_t FLOAT16_NEG_INF = 0xFC00; // -inf 64512
 constexpr uint16_t BF16_NEG_INF = 0xFF80; // -inf 65408
@@ -274,37 +277,36 @@ __aicore__ inline void ApplyTopPCustom<inputT, calT, outputT>::ProcessPreSingleB
 
 template <typename inputT, typename calT, typename outputT>
 __aicore__ inline void ApplyTopPCustom<inputT, calT, outputT>::ProcessTopP() {
+    // Each core computes AND scatters ONLY its own batches. The original design
+    // split PRE (all batches) -> SyncAll -> scatter with cross-core task routing
+    // (task % blockNum), so a core scattered a softMaxGm region another core wrote.
+    // Cross-core GM visibility after SyncAll on 310P is racy -> intermittent UB.
+    // Interleaving compute+scatter per own batch removes all cross-core reads.
     for (uint32_t loopBatch = 0; loopBatch < loopBatch_; loopBatch++) {
-        baseGmIdx_ = batchOffset_ * vocabSize_ + loopBatch * vocabSize_;
+        uint32_t bCntIndex = batchOffset_ + loopBatch;
+        baseGmIdx_ = static_cast<int64_t>(bCntIndex) * vocabSize_;
         GetMaxValue(baseGmIdx_); // Get max value in softmax.
-        ProcessPreSingleBatch(loopBatch); // Softmax and cumsum.
-    }
-    SyncAll();
-    for (uint32_t taskIndex = 0; taskIndex < bCnt * vCnt; taskIndex++) {
-        ScatterSingleTask(taskIndex);
+        ProcessPreSingleBatch(loopBatch); // Softmax and cumsum into softMaxGm[bCntIndex].
+        ScatterSingleTask(bCntIndex); // Scatter this core's own batch.
     }
 }
 
 template <typename inputT, typename calT, typename outputT>
-__aicore__ inline void ApplyTopPCustom<inputT, calT, outputT>::ScatterSingleTask(uint32_t taskIndex) {
-    if (GetBlockIdx() == taskIndex % blockNum_) {
-        uint32_t bCntIndex = taskIndex / vCnt;
-        uint32_t vCntIndex = taskIndex % vCnt;
-        uint32_t vCurSingleCore = vCntIndex < singleCoreVTail ? (singleCoreV + 1) : singleCoreV;
+__aicore__ inline void ApplyTopPCustom<inputT, calT, outputT>::ScatterSingleTask(uint32_t bCntIndex) {
+    {
+        uint32_t vCurSingleCore = vocabSize_;
         uint32_t copyTimes = CeilDiv(vCurSingleCore, scatterLength);
         uint32_t copyLength = scatterLength;
         uint32_t copyLengthTail = vCurSingleCore - (copyTimes - 1) * scatterLength;
         GetPValue(bCntIndex); // Get maxPValue.
         for (uint32_t cpIndex = 0; cpIndex < copyTimes; cpIndex++) {
             uint32_t curCopyLength = cpIndex == (copyTimes - 1) ? copyLengthTail : copyLength;
-            int64_t gmOffset = vCntIndex < singleCoreVTail ?
-                bCntIndex * vocabSize_ + vCntIndex * (singleCoreV + 1) + cpIndex * copyLength :
-                bCntIndex * vocabSize_ + vCntIndex * singleCoreV + singleCoreVTail + cpIndex * copyLength;
-            DataCopyPad(cumsumLocal, softMaxGm[gmOffset],
+            int64_t gmOffset = static_cast<int64_t>(bCntIndex) * vocabSize_ + cpIndex * copyLength;
+            DataCopyPadCustom(cumsumLocal, softMaxGm[gmOffset],
                 {1, static_cast<uint32_t>(curCopyLength * sizeof(float)), 0, 0, 0}, {false, 0, 0, 0});
-            DataCopyPad(sortedIndicesLocal, mGmSortedIndices_[gmOffset],
-                {1, static_cast<uint32_t>(curCopyLength * sizeof(float)), 0, 0, 0}, {false, 0, 0, 0});
-            DataCopyPad(sortedValueLocal, mGmSortedValue_[gmOffset],
+            DataCopyPadCustom(sortedIndicesLocal, mGmSortedIndices_[gmOffset],
+                {1, static_cast<uint32_t>(curCopyLength * sizeof(int32_t)), 0, 0, 0}, {false, 0, 0, 0});
+            DataCopyPadCustom(sortedValueLocal, mGmSortedValue_[gmOffset],
                     {1, static_cast<uint32_t>(curCopyLength * sizeof(inputT)), 0, 0, 0}, {false, 0, 0, 0});
             MTE2ToSSync();
 
@@ -323,12 +325,12 @@ __aicore__ inline void ApplyTopPCustom<inputT, calT, outputT>::ScatterSingleTask
                     if (cumsumLocal.GetValue(scatterOffset) <= pValue) {
                         continue;
                     }
-                    scatterLocal.SetValue(0, sortedValueLocal.GetValue(scatterOffset));
+                    // 310P: a 1-element DataCopy over-writes 7 neighbor floats (32B min
+                    // transfer), corrupting the scattered output. Use a scalar GM store
+                    // which writes exactly one element.
                     int32_t lineIndex = sortedIndicesLocal.GetValue(scatterOffset);
-                    SToMTE3Sync();
-                    DataCopyPad(mGmOut_[bCntIndex * vocabSize_ + lineIndex], scatterLocal.template ReinterpretCast<outputT>(),
-                                {1, (uint32_t)(1 * sizeof(outputT)), 0, 0, 0});
-                    MTE3ToSSync();
+                    inputT val = sortedValueLocal.GetValue(scatterOffset);
+                    mGmOut_[bCntIndex * vocabSize_ + lineIndex].SetValue(0, static_cast<outputT>(val));
                 }
             }
         }
@@ -343,14 +345,14 @@ __aicore__ inline void ApplyTopPCustom<inputT, calT, outputT>::GetSoftMaxRes(uin
             loopDataNum = softmaxLengthTail;
         }
         if constexpr (!IsSameType<inputT, float>::value) {
-            DataCopyPad(softMaxLocal, mGmSortedValue_[currentGmIdx],
+            DataCopyPadCustom(softMaxLocal, mGmSortedValue_[currentGmIdx],
                     {1, static_cast<uint32_t>(loopDataNum * sizeof(inputT)), 0, 0, 0},
                     {false, 0, 0, 0});
             MTE2ToVSync();
             Cast(softMaxLocalFp32, softMaxLocal, RoundMode::CAST_NONE, loopDataNum);
             PipeBarrier<PIPE_V>();
         } else {
-            DataCopyPad(softMaxLocalFp32, mGmSortedValue_[currentGmIdx],
+            DataCopyPadCustom(softMaxLocalFp32, mGmSortedValue_[currentGmIdx],
                     {1, static_cast<uint32_t>(loopDataNum * sizeof(float)), 0, 0, 0},
                     {false, 0, 0, 0});
             MTE2ToVSync();
@@ -362,7 +364,7 @@ __aicore__ inline void ApplyTopPCustom<inputT, calT, outputT>::GetSoftMaxRes(uin
         PipeBarrier<PIPE_V>();
         Muls(softMaxResLocal, softMaxResLocal, reduceSumValueInvert, loopDataNum);
         VToMTE3Sync();
-        DataCopyPad(softMaxGm[currentGmIdx], softMaxResLocal,
+        DataCopyCustom<float, true>(softMaxGm[currentGmIdx], softMaxResLocal,
                     {1, static_cast<uint32_t>(loopDataNum * sizeof(float)), 0, 0, 0});
         MTE3ToMTE2Sync();
     }
@@ -383,27 +385,27 @@ __aicore__ inline void ApplyTopPCustom<inputT, calT, outputT>::CumsumKoggleStone
         for (uint32_t innerLoopIdx = 0; innerLoopIdx < innerLoopNum; innerLoopIdx++) {
              // Copy data from right
             int64_t loopInnerOffset = dataTail + (innerLoopNum - 1 - innerLoopIdx) * softmaxLength;
-            DataCopyPad(cumSumInput1Local, softMaxGm[baseGmIdx_ + loopInnerOffset],
+            DataCopyPadCustom(cumSumInput1Local, softMaxGm[baseGmIdx_ + loopInnerOffset],
                     {1, static_cast<uint32_t>(loopDataNum * sizeof(float)), 0, 0, 0}, {false, 0, 0, 0});
-            DataCopyPad(cumSumInput2Local, softMaxGm[baseGmIdx_ + loopInnerOffset + iteratOffset],
+            DataCopyPadCustom(cumSumInput2Local, softMaxGm[baseGmIdx_ + loopInnerOffset + iteratOffset],
                     {1, static_cast<uint32_t>(loopDataNum * sizeof(float)), 0, 0, 0}, {false, 0, 0, 0});
             MTE2ToVSync();
             Add(cumSumInput1Local, cumSumInput1Local, cumSumInput2Local, loopDataNum);
             VToMTE3Sync();
-            DataCopyPad(softMaxGm[baseGmIdx_ + loopInnerOffset + iteratOffset], cumSumInput1Local,
+            DataCopyCustom<float, true>(softMaxGm[baseGmIdx_ + loopInnerOffset + iteratOffset], cumSumInput1Local,
                     {1, static_cast<uint32_t>(loopDataNum * sizeof(float)), 0, 0, 0});
             MTE3ToMTE2Sync();
         }
         if (dataTail > 0) {
             loopDataNum = dataTail;
-            DataCopyPad(cumSumInput1Local, softMaxGm[baseGmIdx_],
+            DataCopyPadCustom(cumSumInput1Local, softMaxGm[baseGmIdx_],
                     {1, static_cast<uint32_t>(loopDataNum * sizeof(float)), 0, 0, 0}, {false, 0, 0, 0});
-            DataCopyPad(cumSumInput2Local, softMaxGm[baseGmIdx_ + iteratOffset],
+            DataCopyPadCustom(cumSumInput2Local, softMaxGm[baseGmIdx_ + iteratOffset],
                     {1, static_cast<uint32_t>(loopDataNum * sizeof(float)), 0, 0, 0}, {false, 0, 0, 0});
             MTE2ToVSync();
             Add(cumSumInput1Local, cumSumInput1Local, cumSumInput2Local, loopDataNum);
             VToMTE3Sync();
-            DataCopyPad(softMaxGm[baseGmIdx_ + iteratOffset], cumSumInput1Local,
+            DataCopyCustom<float, true>(softMaxGm[baseGmIdx_ + iteratOffset], cumSumInput1Local,
                     {1, static_cast<uint32_t>(loopDataNum * sizeof(float)), 0, 0, 0});
             MTE3ToMTE2Sync();
         }
@@ -437,18 +439,20 @@ __aicore__ inline void ApplyTopPCustom<inputT, calT, outputT>::GetSoftmaxSum(uin
             Duplicate(outInfLocal.template ReinterpretCast<uint16_t>(), BF16_NEG_INF, loopDataNum);
         }
         VToMTE3Sync();
-        DataCopyPad(mGmOut_[currentGmIdx], outInfLocal,
-                    {1, static_cast<uint32_t>(loopDataNum * sizeof(inputT)), 0, 0, 0});
+        // needBack: on unaligned vocab this write's tail would over-write the next
+        // batch's out[0..) and race cross-core with that batch's own -inf init (UB).
+        DataCopyCustom<outputT, true>(mGmOut_[currentGmIdx], outInfLocal.template ReinterpretCast<outputT>(),
+                    {1, static_cast<uint32_t>(loopDataNum * sizeof(outputT)), 0, 0, 0});
         MTE3ToMTE2Sync();
         if constexpr (!IsSameType<inputT, float>::value) {
-            DataCopyPad(softMaxLocal, mGmSortedValue_[currentGmIdx],
+            DataCopyPadCustom(softMaxLocal, mGmSortedValue_[currentGmIdx],
                     {1, static_cast<uint32_t>(loopDataNum * sizeof(inputT)), 0, 0, 0},
                     {false, 0, 0, 0});
             MTE2ToVSync();
             Cast(softMaxLocalFp32, softMaxLocal, RoundMode::CAST_NONE, loopDataNum);
             PipeBarrier<PIPE_V>();
         } else {
-            DataCopyPad(softMaxLocalFp32, mGmSortedValue_[currentGmIdx],
+            DataCopyPadCustom(softMaxLocalFp32, mGmSortedValue_[currentGmIdx],
                     {1, static_cast<uint32_t>(loopDataNum * sizeof(inputT)), 0, 0, 0},
                     {false, 0, 0, 0});
             MTE2ToVSync();

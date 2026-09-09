@@ -92,6 +92,7 @@ if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
         "adn_rms_norm"
         "rejection_sample_greedy_v310"
         "quant_batch_matmul_v3_x"
+        "apply_top_k_top_p_custom"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend310p"

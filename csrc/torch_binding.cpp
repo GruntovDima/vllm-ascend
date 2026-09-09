@@ -2339,6 +2339,9 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("chunk_gated_delta_rule_compute_wy", torch::kPrivateUse1, &vllm_ascend::chunk_gated_delta_rule_compute_wy);
 
+    ops.def("npu_apply_top_k_top_p(Tensor logits, Tensor? p=None, Tensor? k=None) -> Tensor");
+    ops.impl("npu_apply_top_k_top_p", torch::kPrivateUse1, &vllm_ascend::npu_apply_top_k_top_p);
+
     ops.def(
         "npu_copy_and_expand_dflash_inputs(Tensor next_token_ids, Tensor target_positions, "
         "Tensor context_slot_mapping, Tensor query_start_loc, Tensor seq_lens, "
