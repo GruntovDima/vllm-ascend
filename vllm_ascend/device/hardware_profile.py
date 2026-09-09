@@ -24,6 +24,7 @@ class HardwareCapability(Enum):
     CHUNKED_PREFILL_PHASE_SPLIT = auto()
     CLUSTER_CPU_TOPOLOGY = auto()
     COMPATIBILITY_OP_IMPLEMENTATIONS = auto()
+    CUSTOM_NPU_TOP_K_TOP_P = auto()
     DISTRIBUTED_COMMUNICATION_ADAPTATION = auto()
     DSA_C128_STATE_SMALL_BLOCK_SIZES = auto()
     DSV4_COMPRESSED_CACHE = auto()
@@ -198,6 +199,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
             capabilities=frozenset(
                 {
                     HardwareCapability.COMPATIBILITY_OP_IMPLEMENTATIONS,
+                    HardwareCapability.CUSTOM_NPU_TOP_K_TOP_P,
                     HardwareCapability.DISTRIBUTED_COMMUNICATION_ADAPTATION,
                     HardwareCapability.FUSED_MOE_COMPATIBILITY,
                     HardwareCapability.FUSED_SWIGLU_TUNING_ARGS,

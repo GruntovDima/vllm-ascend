@@ -268,8 +268,43 @@ def _apply_top_k_top_p_torch_npu(
     return _apply_top_k_top_p_pytorch(logits, k, p)
 
 
+def _apply_top_k_top_p_custom(
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+    top_k: int | None = None,
+) -> torch.Tensor:
+    """Apply the 310P-specific fused TopKTopP custom operator."""
+    if get_ascend_config().enable_reduce_sample:
+        tp_group = get_tp_group()
+        vocab_size_local = logits.shape[1]
+        rank = tp_group.rank_in_group
+
+        if top_k is None or (p is None and k is None):
+            k_for_topk = vocab_size_local
+        else:
+            k_for_topk = min(top_k, vocab_size_local)
+
+        local_vals, local_idx = torch.topk(logits, k=k_for_topk, dim=-1)
+        local_global_idx = local_idx + rank * vocab_size_local
+        gathered_vals = tp_group.all_gather(local_vals, dim=-1)
+        gathered_idx = tp_group.all_gather(local_global_idx, dim=-1)
+
+        if not (p is None and k is None):
+            gathered_vals = torch.ops._C_ascend.npu_apply_top_k_top_p(gathered_vals, k=k, p=p)
+        return gathered_vals, gathered_idx
+
+    if p is None and k is None:
+        return logits
+    return torch.ops._C_ascend.npu_apply_top_k_top_p(logits, k=k, p=p)
+
+
 apply_top_k_top_p = (
-    _apply_top_k_top_p_torch_npu
-    if get_current_hardware_profile().supports(HardwareCapability.NPU_TOP_K_TOP_P)
-    else _apply_top_k_top_p_pytorch
+    _apply_top_k_top_p_custom
+    if get_current_hardware_profile().supports(HardwareCapability.CUSTOM_NPU_TOP_K_TOP_P)
+    else (
+        _apply_top_k_top_p_torch_npu
+        if get_current_hardware_profile().supports(HardwareCapability.NPU_TOP_K_TOP_P)
+        else _apply_top_k_top_p_pytorch
+    )
 )
