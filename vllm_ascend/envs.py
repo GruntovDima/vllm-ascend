@@ -27,7 +27,21 @@ from typing import Any
 
 # begin-env-vars-definition
 
+
+def _tree_gdn_compact() -> bool:
+    value = os.getenv("VLLM_ASCEND_TREE_GDN_COMPACT", "0")
+    if value not in ("0", "1"):
+        raise ValueError("VLLM_ASCEND_TREE_GDN_COMPACT must be 0 or 1")
+    return value == "1"
+
 env_variables: dict[str, Callable[[], Any]] = {
+    # Experimental 310P tree GDN compact checkpoints + accepted-path NPU replay.
+    # Values: 0 (default, full snapshots/control) or 1 (guarded compact).
+    # Compact is selected for 32 value-heads and >=13 nodes; smaller forms use
+    # full snapshots because replay launch overhead outweighs saved writes.
+    # Not sensitive.
+    # Only affects eager tree-MTP; ordinary MTP and chunk/compute_wy are unchanged.
+    "VLLM_ASCEND_TREE_GDN_COMPACT": _tree_gdn_compact,
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
