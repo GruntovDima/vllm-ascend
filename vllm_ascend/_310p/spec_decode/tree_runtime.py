@@ -57,6 +57,8 @@ class TreeMTPConfig:
             raise ValueError("tree_mtp requires synchronous scheduling and disabled prefix caching")
         if config.lora_config is not None or getattr(config, "kv_transfer_config", None) is not None:
             raise ValueError("tree_mtp does not support LoRA or KV transfer")
+        if getattr(config.model_config, "logits_processors", None):
+            raise ValueError("tree_mtp does not support custom logits processors")
         model_type = getattr(config.model_config.hf_text_config, "model_type", "")
         if model_type not in ("qwen3_5_text", "qwen3_5"):
             raise ValueError("tree_mtp is currently validated only for Qwen3.5 dense models")
@@ -75,19 +77,23 @@ class TreeMTPConfig:
 
 def validate_tree_sampling(params: Any) -> None:
     """Reject processors whose histories would include flattened siblings."""
-    if params.temperature != 0 or params.n != 1:
-        raise ValueError("tree_mtp currently supports greedy sampling with n=1 only")
+    if params.n != 1:
+        raise ValueError("tree_mtp currently supports n=1 only")
     neutral = {"repetition_penalty": 1.0, "presence_penalty": 0.0, "frequency_penalty": 0.0}
     if any(getattr(params, name, value) != value for name, value in neutral.items()):
         raise ValueError("tree_mtp does not yet support sampling penalties")
     if params.logprobs is not None or params.prompt_logprobs is not None:
         raise ValueError("tree_mtp does not support logprobs")
     unsupported = ("structured_outputs", "allowed_token_ids",
-                   "logit_bias", "bad_words", "logits_processors")
+                   "logit_bias", "bad_words", "logits_processors", "logprob_token_ids")
     if any(getattr(params, name, None) for name in unsupported):
         raise ValueError("tree_mtp does not support constrained sampling or logprobs")
     if getattr(params, "min_tokens", 0):
         raise ValueError("tree_mtp currently requires min_tokens=0")
+    if getattr(params, "min_p", 0):
+        raise ValueError("tree_mtp currently requires min_p=0; use top_k/top_p")
+    if getattr(params, "thinking_token_budget", None) is not None:
+        raise ValueError("tree_mtp does not support a thinking-token budget")
 
 
 @dataclass

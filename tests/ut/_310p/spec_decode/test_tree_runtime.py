@@ -51,6 +51,7 @@ def make_sampling_params(**changes):
         frequency_penalty=0.0, logprobs=None, prompt_logprobs=None,
         structured_outputs=None, allowed_token_ids=None, logit_bias=None,
         bad_words=None, logits_processors=None, min_tokens=0, max_tokens=64,
+        top_k=-1, top_p=1.0, min_p=0.0, thinking_token_budget=None,
     )
     values.update(changes)
     return SimpleNamespace(**values)
@@ -107,6 +108,7 @@ class TestTreeMTPConfig(unittest.TestCase):
             ("speculative_config", "num_speculative_tokens", 2),
             ("speculative_config", "draft_sample_method", "probabilistic"),
             ("model_config", "enforce_eager", False),
+            ("model_config", "logits_processors", [object()]),
             ("scheduler_config", "max_num_seqs", 2),
             ("scheduler_config", "async_scheduling", True),
             ("parallel_config", "tensor_parallel_size", 2),
@@ -143,12 +145,19 @@ class TestTreeSamplingGuards(unittest.TestCase):
     def test_neutral_greedy_params(self):
         self.runtime.validate_tree_sampling(make_sampling_params())
 
+    def test_temperature_top_k_top_p_and_seed_are_supported(self):
+        for seed in (None, 0, 42):
+            self.runtime.validate_tree_sampling(make_sampling_params(
+                temperature=1.0, top_k=50, top_p=0.9, seed=seed,
+            ))
+
     def test_all_unsupported_processors_rejected(self):
         cases = dict(
-            temperature=0.1, n=2, repetition_penalty=1.1, presence_penalty=0.1,
+            n=2, repetition_penalty=1.1, presence_penalty=0.1,
             frequency_penalty=-0.1, logprobs=1, prompt_logprobs=1,
             structured_outputs=object(), allowed_token_ids=[1], logit_bias={1: 0.5},
             bad_words=["bad"], logits_processors=[object()], min_tokens=1,
+            min_p=0.1, thinking_token_budget=0, logprob_token_ids=[1],
         )
         for field, value in cases.items():
             with self.subTest(field=field):
