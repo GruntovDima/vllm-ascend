@@ -1,0 +1,29 @@
+/op_host/_build/
+/op_host/_install/
+/op_host/_san_build/
+/op_host/_san2_build/
+/op_host/_san2_install/
+/op_host/_icpu_build/
+/op_host/_torch_probe/
+/op_host/*.o
+/mindstudio_sanitizer_log/
+/tests/ut/dump_tree_tiling
+/workbench/build/
+/workbench/third_party_cache/
+/tests/ut/test_tree_plan
+/tests/workbench/data_*/
+/tests/workbench/run_tree_gated_delta_rule_v310_dump
+**/__pycache__/
+/.compact_build_sources/
+/op_host/_compact_build*/
+/op_host/_compact_install*/
+/op_host/_compact_torch/
+# Local experiment evidence and server-specific execution configuration.
+# Keep tests/workbench source harnesses versioned; ignore generated tensors.
+/workbench/
+/learnings/
+/migration_config.yaml
+/talk/
+/tests/workbench/data_*/
+/tests/workbench/output_*/
+/tests/workbench/*.bin

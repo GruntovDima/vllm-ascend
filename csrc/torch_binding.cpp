@@ -49,6 +49,8 @@
 #include "attention/kda_gate_cumsum/kda_gate_cumsum_torch_adpt.h"
 #include "attention/kda_layout_swap12/kda_layout_swap12_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
+#include "attention/tree_gated_delta_rule_v310/tree_gated_delta_rule_310_torch_adpt.h"
+#include "attention/tree_gated_delta_rule_v310/tree_gdn_compact_310_torch_adpt.h"
 #include "attention/k2q_csr/k2q_csr_torch_adpt.h"
 #include "attention/msa_index_score/msa_index_score_torch_adpt.h"
 #include "attention/sparse_attention_score/sparse_attention_score_torch_adpt.h"
@@ -1971,6 +1973,19 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                                   Tensor? num_accepted_tokens, "
         "                                   float scale_value=1.0) -> (Tensor output)");
     ops.impl("npu_recurrent_gated_delta_rule_310", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule_310);
+
+    ops.def("npu_tree_gated_delta_rule_310(Tensor query, Tensor key, Tensor value, Tensor beta, Tensor initial, Tensor g, int[] parents, float scale, int v_tile=0) -> (Tensor, Tensor)");
+    ops.def("npu_tree_gated_delta_rule_310.out(Tensor query, Tensor key, Tensor value, Tensor beta, Tensor initial, Tensor g, int[] parents, float scale, int v_tile=0, *, Tensor(a!) out, Tensor(b!) snapshots) -> (Tensor(a!), Tensor(b!))");
+    ops.impl("npu_tree_gated_delta_rule_310", torch::kPrivateUse1, &vllm_ascend::npu_tree_gated_delta_rule_310);
+    ops.impl("npu_tree_gated_delta_rule_310.out", torch::kPrivateUse1, &vllm_ascend::npu_tree_gated_delta_rule_310_out);
+    ops.def("npu_tree_gdn_compact_verify_310(Tensor query, Tensor key, Tensor value, Tensor beta, Tensor initial, Tensor g, int[] parents, float scale, int v_tile=0) -> (Tensor, Tensor)");
+    ops.def("npu_tree_gdn_compact_verify_310.out(Tensor query, Tensor key, Tensor value, Tensor beta, Tensor initial, Tensor g, int[] parents, float scale, int v_tile=0, *, Tensor(a!) out, Tensor(b!) records) -> (Tensor(a!), Tensor(b!))");
+    ops.def("npu_tree_gdn_compact_replay_310(Tensor key, Tensor initial, Tensor records, int[] parents, int[] path, int v_tile=0) -> Tensor");
+    ops.def("npu_tree_gdn_compact_replay_310.out(Tensor key, Tensor initial, Tensor records, int[] parents, int[] path, int v_tile=0, *, Tensor(a!) accepted) -> Tensor(a!)");
+    ops.impl("npu_tree_gdn_compact_verify_310", torch::kPrivateUse1, &vllm_ascend::npu_tree_gdn_compact_verify_310);
+    ops.impl("npu_tree_gdn_compact_verify_310.out", torch::kPrivateUse1, &vllm_ascend::npu_tree_gdn_compact_verify_310_out);
+    ops.impl("npu_tree_gdn_compact_replay_310", torch::kPrivateUse1, &vllm_ascend::npu_tree_gdn_compact_replay_310);
+    ops.impl("npu_tree_gdn_compact_replay_310.out", torch::kPrivateUse1, &vllm_ascend::npu_tree_gdn_compact_replay_310_out);
 
     ops.def(
         "chunk_gated_delta_rule_fwd_h(Tensor k, Tensor w, Tensor u, Tensor? g=None, *, Tensor? gk=None, Tensor? initial_state=None, bool? output_final_state=False, int? chunk_size=None, bool? save_new_value=True, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool? use_exp2=False, bool? transpose_state_layout=False) -> (Tensor h_out, Tensor v_new_out, Tensor final_state_out)"
