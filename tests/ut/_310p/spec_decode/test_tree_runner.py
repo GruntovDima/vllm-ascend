@@ -84,7 +84,7 @@ class TestTreeRunner(unittest.TestCase):
             num_prompt_tokens=[prompt_tokens], token_ids_cpu=tokens_cpu,
             sampling_metadata=SimpleNamespace(all_greedy=sampling_changes.get("temperature", 0) == 0),
         )
-        runner.sampler = SimpleNamespace(sample_tree=Mock(side_effect=lambda logits, metadata: logits.argmax(-1)))
+        runner.sampler = SimpleNamespace(sample_tree=Mock(side_effect=lambda logits, metadata, **kw: logits.argmax(-1)))
         runner.input_ids = SimpleNamespace(gpu=flat_tokens)
         runner.num_accepted_tokens = SimpleNamespace(gpu=torch.tensor([2], dtype=torch.int32))
         runner.requests = {"request": SimpleNamespace(
@@ -192,7 +192,10 @@ class TestTreeRunner(unittest.TestCase):
         output = runner._sample(logits, object())
         self.assertEqual(output.sampled_token_ids.tolist(), [[7, 10, 11, -1, -1]])
         callback.assert_called_once_with((0, 1, 4))
-        runner.sampler.sample_tree.assert_called_once_with(logits, runner.input_batch.sampling_metadata)
+        runner.sampler.sample_tree.assert_called_once_with(
+            logits, runner.input_batch.sampling_metadata,
+            top_k=runner.requests["request"].sampling_params.top_k,
+        )
 
     def test_random_draw_outside_children_is_emitted_without_resampling(self):
         runner = self.make_runner(temperature=1.0)

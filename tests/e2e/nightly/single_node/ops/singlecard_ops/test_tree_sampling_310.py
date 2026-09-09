@@ -21,6 +21,8 @@ def main():
     parser.add_argument("--device", type=int, required=True, help="Logical device after visibility selection")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.output.exists():
+        raise FileExistsError(args.output)
     if not os.environ.get("ASCEND_RT_VISIBLE_DEVICES"):
         raise RuntimeError("Select an authorized physical NPU explicitly")
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -68,7 +70,7 @@ def main():
                 logits = torch.randn(nodes, 97, generator=rng).to(device)
                 for temperature, top_k, top_p in ((0.0, None, None), (1.0, 50, 0.9),
                                                   (0.7, 1, None), (1.3, None, 0.8), (1.0, None, None)):
-                    actual = sampler.sample_tree(logits.clone(), metadata(temperature, top_k, top_p))
+                    actual = sampler.sample_tree(logits.clone(), metadata(temperature, top_k, top_p), top_k=top_k)
                     torch_npu.npu.synchronize()
                     serial_metadata = metadata(temperature, top_k, top_p)
                     expected = torch.cat([
@@ -77,7 +79,7 @@ def main():
                     ])
                     torch_npu.npu.synchronize()
                     assert torch.equal(actual.cpu(), expected.cpu()), (nodes, temperature, top_k, top_p)
-                    repeated = sampler.sample_tree(logits.clone(), metadata(temperature, top_k, top_p))
+                    repeated = sampler.sample_tree(logits.clone(), metadata(temperature, top_k, top_p), top_k=top_k)
                     assert torch.equal(actual.cpu(), repeated.cpu()), "seeded sampling is not repeatable"
                     report["cases"].append({"nodes": nodes, "temperature": temperature, "top_k": top_k,
                                             "top_p": top_p, "serial_match": True, "seed_repeatable": True})
@@ -96,6 +98,30 @@ def main():
                 assert abs(observed - expected) <= tolerance, (observed, expected, tolerance)
             report["distribution"] = {"trials": trials, "expected": probabilities.tolist(),
                                       "observed": frequencies.tolist(), "passed": True}
+            # Exercise compact sampling, not just its dense fallback, with an
+            # analytically known truncated target distribution.
+            actual = sampler.sample_tree(
+                logits.clone(), metadata(1.0, 2, 0.9, seed=91), top_k=2,
+            ).cpu()
+            frequencies = torch.bincount(actual.long(), minlength=4).double() / trials
+            compact_expected = torch.tensor([0., 0., 2 / 9, 7 / 9])
+            for observed, expected in zip(frequencies.tolist(), compact_expected.tolist()):
+                tolerance = 6 * math.sqrt(expected * (1 - expected) / trials) + 1 / trials
+                assert abs(observed - expected) <= tolerance, (observed, expected, tolerance)
+            assert frequencies[:2].sum() == 0
+            report["compact_distribution"] = dict(trials=trials, expected=compact_expected.tolist(),
+                                                  observed=frequencies.tolist(), passed=True)
+            # Mixed fast/fallback rows must consume exactly one draw each in
+            # original node order; falling back cannot advance the RNG again.
+            mixed = torch.randn(17, 997, generator=rng).half().float()
+            mixed[::3] = 0
+            mixed = mixed.to(device)
+            actual = sampler.sample_tree(mixed.clone(), metadata(1.0, 50, 0.9), top_k=50)
+            serial_md = metadata(1.0, 50, 0.9)
+            expected = torch.cat([sampler(row[None].clone(), serial_md).sampled_token_ids.flatten()
+                                  for row in mixed])
+            assert torch.equal(actual.cpu(), expected.cpu()), "mixed fallback RNG/order mismatch"
+            report["mixed_fallback_seeded_match"] = True
             unseeded = sampler.sample_tree(torch.zeros(65, 4, device=device), metadata(1.0, None, None, seed=None))
             assert unseeded.shape == (65,) and unseeded.cpu().unique().numel() > 1
             report["unseeded"] = "pass"

@@ -639,7 +639,8 @@ class NPUModelRunner310(NPUModelRunner):
         # One intentional host sync for the small traversal; this reference
         # path prioritizes explicit acceptance/rollback over graph execution.
         metadata = self.input_batch.sampling_metadata
-        predictions = self.sampler.sample_tree(logits, metadata).cpu().tolist()
+        top_k = self.requests[context.request_id].sampling_params.top_k
+        predictions = self.sampler.sample_tree(logits, metadata, top_k=top_k).cpu().tolist()
         result = verify_target_samples(context.tree, predictions, max_output_tokens=context.max_output_tokens)
         context.commit(result)
         sampled = torch.full((1, context.num_nodes), -1, dtype=torch.int32, device=logits.device)
