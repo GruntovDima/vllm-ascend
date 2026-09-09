@@ -23,6 +23,10 @@ AscendSpecDecodeBaseProposer.set_inputs_first_pass = (  # type: ignore[method-as
 AscendSpecDecodeBaseProposer._run_merged_draft = (  # type: ignore[method-assign]
     AscendSpecDecodeBaseProposer310._run_merged_draft
 )
+AscendSpecDecodeBaseProposer._propose = AscendSpecDecodeBaseProposer310._propose  # type: ignore[method-assign]
+AscendSpecDecodeBaseProposer._sample_draft_from_logits = (  # type: ignore[method-assign]
+    AscendSpecDecodeBaseProposer310._sample_draft_from_logits
+)
 
 # Patch _warmup_prefill_kernels to no-op on 310P: triton.next_power_of_2 does
 # not exist in the triton version used on 310P CI, and NPU does not use these

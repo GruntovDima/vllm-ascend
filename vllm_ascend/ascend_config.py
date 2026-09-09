@@ -35,6 +35,14 @@ class AscendConfig:
     def __init__(self, vllm_config: "VllmConfig"):
         self.vllm_config = vllm_config
         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
+        # Experimental batch-one eager comb-tree MTP; the 310P runner validates
+        # topology, scheduling and sampling before enabling the path.
+        self.tree_mtp = additional_config.get("tree_mtp")
+        if self.tree_mtp and self.tree_mtp.get("enabled", False):
+            from vllm_ascend.utils import is_310p
+
+            if not is_310p():
+                raise ValueError("tree_mtp is implemented only for Ascend 310P")
         self._check_mooncake_c8_kv_cache_quant(vllm_config)
 
         xlite_graph_config = additional_config.get("xlite_graph_config", {})
