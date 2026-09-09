@@ -157,6 +157,11 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
             num_tokens = int(sum(q_list))
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu
             if seq_lens_cpu is None:
+                # Async speculative decoding intentionally leaves the public
+                # field empty, but the runner keeps an authoritative host-side
+                # copy in the upstream-compatible private slot.
+                seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+            if seq_lens_cpu is None:
                 # Capture dummy_run path: build() runs before the captured region,
                 # so this D2H is legal; mask content is refreshed by real builds.
                 seq_lens_cpu = attn_metadata.seq_lens.cpu()
