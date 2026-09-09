@@ -310,6 +310,89 @@ It accepts `--device`, a new `--output` JSON path, and optionally
 Raw reports remain in the test workspace under
 `runtime_opt_stage1_20260909/{before_tree,no_mtp,after_tree,topk_v2,attention_v2,attention_perf}.json`.
 
+## Compact stochastic sampler (2026-09-09)
+
+Tree verification now passes its CPU request `top_k` to the 310P sampler.
+For FP32 logits and `1 <= top_k <= 128`, the sampler selects up to `2 * top_k`
+candidates plus an overflow sentinel instead of sorting the whole vocabulary.
+Extra capacity retains small groups of tied probabilities at the top-k cutoff.
+Top-p still uses the original full-vocabulary probability mass, independently
+of top-k; it is **not** applied to a renormalized top-k distribution.
+
+Only candidate logits are normalized and sampled by inverse CDF, in ascending
+token-ID order. Rows with an overflowing cutoff tie, non-finite probabilities,
+a mismatched top-k hint, or an ambiguous top-p boundary retain native filtering.
+The top-p summation-order guard is `1e-5`; it routes to the original filter,
+not a modified threshold. Unsupported top-k/dtypes, processed-logprob modes,
+batch-invariant mode and reduce-sample mode keep their existing paths.
+
+There is one batched host decision (up to 65 row flags for a production tree),
+not one synchronization per node. A fallback row no longer forces every other
+node through the full sort. Both paths consume the **same single uniform per
+node**, preserving RNG advancement even for mixed fast/fallback batches.
+This remains an eager optimization, not a graph-compatible sampler kernel.
+FP32 reduction grouping changes in compact softmax/CDF; bit-identical outputs
+for every possible uniform/logit boundary or full-model AR equivalence are
+not claimed.
+
+Standalone Ascend 310P3 measurements, vocabulary 248,320, top-k 50, top-p 0.9:
+
+| Verification rows | Native sampler ms | Compact sampler ms |
+| --- | ---: | ---: |
+| 5 | 7.256 | 3.253 |
+| 17 | 21.954 | 5.770 |
+| 33 | 38.360 | 10.056 |
+| 65 | 71.327 | 16.708 |
+| 17, mixed quantized/tied rows | 22.475 | 14.289 |
+
+Times are medians of three groups of 15 calls after warmup, including host
+dispatch and device completion. These are sampler-only timings, not TPOT.
+The guard's host synchronization and partial fallback are included.
+
+The full-model screen used the same physical NPU 3, prompt 1024/output 2048,
+batch one, depth 4/width 4, temperature 1, top-k 50, top-p 0.9 and seed 42.
+No GDN, attention, weights or dependency changes were made in this comparison.
+
+| Version | TPOT ms | Tokens per verification | Mean cycle ms |
+| --- | ---: | ---: | ---: |
+| Before sampler change | 76.679 | 3.2752 | 251.140 |
+| Prototype, whole-tree fallback | 79.410 | 3.1541 | 250.464 |
+| Prototype, row-local fallback | 76.506 | 3.1015 | 237.285 |
+| Final, tie capacity | 74.305 | 3.1835 | 236.552 |
+| Final, repeat | 77.269 | 3.1687 | 244.844 |
+
+The final two-run mean is 75.787 ms, only 1.16% below the single baseline;
+the spread exceeds that difference. **A stable TPOT improvement is not yet
+established**, despite the isolated sampler improvement. Texts and acceptance
+histories differ. Mean cycle is TPOT times emitted tokens per verification,
+not an individual kernel duration. Raw model/component reports are retained
+under `runtime_opt_stage2_20260909` in the test workspace. New fused GDN commit
+work is paused on the previously unresolved native per-pipe timing gate;
+that policy and all correctness/sanitizer requirements remain unchanged.
+
+Validation: 125 CPU tests (91 spec-decode, 22 attention, 12 sampler), 168 NPU
+filter cases, 20 native seeded/greedy sampler cases, mixed-fallback RNG ordering,
+and two 8,192-draw distribution checks. Retained logits/candidate sets match the
+native filter on tested fast rows; probability comparisons use FP32 tolerances.
+The compact empirical check for target `[0, 0, 2/9, 7/9]` passed, including never
+selecting either zero-mass token. Native GDN kernels and compute_wy are unchanged.
+
+```bash
+python3 -B -m unittest discover -s tests/ut/_310p/sample -p 'test*.py'
+python3 -P tests/e2e/nightly/single_node/ops/singlecard_ops/test_tree_compact_sampler_310.py \
+  --device 0 --output results/compact-sampler.json
+python3 -P tests/e2e/nightly/single_node/ops/singlecard_ops/test_tree_sampling_310.py \
+  --device 0 --output results/sampling.json
+```
+
+Select an authorized free physical NPU with `ASCEND_RT_VISIBLE_DEVICES` first.
+The NPU tests refuse existing output paths. Source deployment is hash-guarded,
+with original files retained in per-stage backups; no dependency reinstall
+or upgrade is required for this Python-only change.
+
+`git diff --check` passed. Full `format.sh ci` remains unavailable because
+`pre-commit` is not installed; no dependency installation was performed.
+
 ## Latest historical model measurements
 
 Batch one, input 1024, output 2048, eager, same checkpoint/prompt and dependency
