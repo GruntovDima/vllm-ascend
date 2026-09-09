@@ -10,7 +10,13 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.sample.penalties import apply_all_penalties
-from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, global_stream, npu_stream_switch
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    enable_custom_op,
+    get_ascend_device_type,
+    global_stream,
+    npu_stream_switch,
+)
 
 DEFAULT_LOGPROBS_MODE = "raw_logprobs"
 
@@ -271,6 +277,23 @@ def _apply_top_k_top_p_custom(
     top_k: int | None = None,
 ) -> torch.Tensor:
     """Apply the 310P-specific fused TopKTopP custom operator."""
+    if not (p is None and k is None):
+        try:
+            custom_op_available = enable_custom_op() and hasattr(
+                torch.ops._C_ascend, "npu_apply_top_k_top_p"
+            )
+        except (ImportError, RuntimeError, AttributeError) as exc:
+            logger.warning_once(
+                "310P TopKTopP custom op is unavailable (%s); falling back to the standard sampler.",
+                exc,
+            )
+            return _apply_top_k_top_p_pytorch(logits, k, p, top_k)
+        if not custom_op_available:
+            logger.warning_once(
+                "310P TopKTopP custom op is unavailable; falling back to the standard sampler."
+            )
+            return _apply_top_k_top_p_pytorch(logits, k, p, top_k)
+
     if get_ascend_config().enable_reduce_sample:
         tp_group = get_tp_group()
         vocab_size_local = logits.shape[1]

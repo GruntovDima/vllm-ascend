@@ -231,9 +231,24 @@ class TestAscendAttentionBackendImpl310(TestBase):
 
 
 class TestAscendAttentionMetadataBuilder310(TestBase):
+    def test_init_uses_configured_cudagraph_capture_sizes(self):
+        config = MagicMock()
+        config.model_config.max_model_len = 4096
+        config.compilation_config.cudagraph_capture_sizes = [1, 4, 128]
+        device = torch.device("cpu")
+
+        def mock_parent_init(builder, *args, **kwargs):
+            builder.device = device
+
+        with patch.object(AscendMetadataBuilder310Direct.__bases__[0], "__init__", new=mock_parent_init):
+            builder = AscendMetadataBuilder310Direct(MagicMock(), [], config, device)
+
+        self.assertEqual(builder._splitfuse_mask_capture_sizes, frozenset({1, 4, 128}))
+
     def test_splitfuse_mask_prefers_internal_cpu_seq_lens(self):
         builder = AscendMetadataBuilder310Direct.__new__(AscendMetadataBuilder310Direct)
         builder._query_lens_cpu_buffer = torch.zeros(4, dtype=torch.int32)
+        builder._splitfuse_mask_capture_sizes = frozenset({3})
         builder._splitfuse_mask_bufs = {}
         builder.device = torch.device("cpu")
 
@@ -268,6 +283,82 @@ class TestAscendAttentionMetadataBuilder310(TestBase):
 
         device_seq_lens.cpu.assert_not_called()
         build_mask.assert_called_once_with([1, 2], [5, 7], torch.device("cpu"))
+
+    def test_splitfuse_mask_reuses_buffer_for_configured_capture_size(self):
+        builder = AscendMetadataBuilder310Direct.__new__(AscendMetadataBuilder310Direct)
+        builder._query_lens_cpu_buffer = torch.zeros(1, dtype=torch.int32)
+        builder._splitfuse_mask_capture_sizes = frozenset({128})
+        builder._splitfuse_mask_bufs = {}
+        builder.device = torch.device("cpu")
+
+        common_attn_metadata = MagicMock()
+        common_attn_metadata.num_reqs = 1
+        common_attn_metadata.query_start_loc = torch.tensor([0, 128], dtype=torch.int32)
+        common_attn_metadata.query_start_loc_cpu = torch.tensor([0, 128], dtype=torch.int32)
+        common_attn_metadata.seq_lens = torch.tensor([128], dtype=torch.int32)
+        common_attn_metadata.seq_lens_cpu = torch.tensor([128], dtype=torch.int32)
+
+        first_metadata = MagicMock(attn_state=AscendAttentionState.SpecDecoding)
+        second_metadata = MagicMock(attn_state=AscendAttentionState.SpecDecoding)
+        first_mask = torch.zeros((2, 2), dtype=torch.float32)
+        refreshed_mask = torch.ones((2, 2), dtype=torch.float32)
+
+        with (
+            patch.object(
+                AscendMetadataBuilder310Direct.__bases__[0],
+                "build",
+                side_effect=[first_metadata, second_metadata],
+            ),
+            patch(
+                "vllm_ascend._310p.attention.metadata_builder.is_compressed_mask_supported",
+                return_value=False,
+            ),
+            patch(
+                "vllm_ascend._310p.attention.metadata_builder.AttentionMaskBuilder310."
+                "build_splitfuse_mask_nz_from_host",
+                side_effect=[first_mask, refreshed_mask],
+            ),
+        ):
+            builder.build(0, common_attn_metadata)
+            persistent_mask = getattr(first_metadata, "splitfuse_mask_nz")
+            builder.build(0, common_attn_metadata)
+
+        self.assertIs(persistent_mask, builder._splitfuse_mask_bufs[128])
+        self.assertIs(getattr(second_metadata, "splitfuse_mask_nz"), persistent_mask)
+        torch.testing.assert_close(persistent_mask, refreshed_mask)
+
+    def test_splitfuse_mask_does_not_persist_unconfigured_small_batch(self):
+        builder = AscendMetadataBuilder310Direct.__new__(AscendMetadataBuilder310Direct)
+        builder._query_lens_cpu_buffer = torch.zeros(1, dtype=torch.int32)
+        builder._splitfuse_mask_capture_sizes = frozenset({128})
+        builder._splitfuse_mask_bufs = {}
+        builder.device = torch.device("cpu")
+
+        common_attn_metadata = MagicMock()
+        common_attn_metadata.num_reqs = 1
+        common_attn_metadata.query_start_loc = torch.tensor([0, 3], dtype=torch.int32)
+        common_attn_metadata.query_start_loc_cpu = torch.tensor([0, 3], dtype=torch.int32)
+        common_attn_metadata.seq_lens = torch.tensor([3], dtype=torch.int32)
+        common_attn_metadata.seq_lens_cpu = torch.tensor([3], dtype=torch.int32)
+
+        attn_metadata = MagicMock(attn_state=AscendAttentionState.SpecDecoding)
+        mask = torch.ones((2, 2), dtype=torch.float32)
+        with (
+            patch.object(AscendMetadataBuilder310Direct.__bases__[0], "build", return_value=attn_metadata),
+            patch(
+                "vllm_ascend._310p.attention.metadata_builder.is_compressed_mask_supported",
+                return_value=False,
+            ),
+            patch(
+                "vllm_ascend._310p.attention.metadata_builder.AttentionMaskBuilder310."
+                "build_splitfuse_mask_nz_from_host",
+                return_value=mask,
+            ),
+        ):
+            builder.build(0, common_attn_metadata)
+
+        self.assertEqual(builder._splitfuse_mask_bufs, {})
+        self.assertIs(getattr(attn_metadata, "splitfuse_mask_nz"), mask)
 
     def test_fill_query_lens_cpu_without_buffer(self):
         builder = AscendMetadataBuilder310Direct.__new__(AscendMetadataBuilder310Direct)

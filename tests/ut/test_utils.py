@@ -121,6 +121,52 @@ class TestUtils(TestBase):
             mock_import_module.side_effect = ImportError("import error")
             self.assertFalse(utils.enable_custom_op())
 
+    def test_enable_custom_op_vendor_retry_loads_schema_before_meta(self):
+        real_import = __import__
+        import_order = []
+        extension_attempts = 0
+
+        def import_with_missing_vendor_library(
+            name,
+            globals=None,
+            locals=None,
+            fromlist=(),
+            level=0,
+        ):
+            nonlocal extension_attempts
+            if name == "vllm_ascend.vllm_ascend_C":
+                extension_attempts += 1
+                import_order.append("extension")
+                if extension_attempts == 1:
+                    raise ImportError("libcust_opapi.so: cannot open shared object file")
+                return mock.MagicMock()
+            if name == "vllm_ascend.meta_registration":
+                import_order.append("meta")
+                return mock.MagicMock()
+            return real_import(name, globals, locals, fromlist, level)
+
+        profile = mock.MagicMock()
+        profile.supports.return_value = True
+        previous_state = utils._CUSTOM_OP_ENABLED
+        utils._CUSTOM_OP_ENABLED = None
+        try:
+            with (
+                mock.patch("vllm_ascend.utils.get_current_hardware_profile", return_value=profile),
+                mock.patch("vllm_ascend.utils.torch.compiler.is_compiling", return_value=False),
+                mock.patch("vllm.envs.VLLM_BATCH_INVARIANT", False),
+                mock.patch("vllm_ascend.utils.bootstrap_custom_op_env") as bootstrap,
+                mock.patch("builtins.__import__", side_effect=import_with_missing_vendor_library),
+            ):
+                self.assertTrue(utils.enable_custom_op())
+        finally:
+            utils._CUSTOM_OP_ENABLED = previous_state
+
+        self.assertEqual(import_order, ["extension", "extension", "meta"])
+        self.assertEqual(
+            bootstrap.call_args_list,
+            [mock.call(), mock.call(include_vendor_lib=True)],
+        )
+
     def test_find_hccl_library(self):
         with mock.patch.dict(os.environ, {"HCCL_SO_PATH": "/path/to/hccl/libhccl.so"}):
             self.assertEqual(utils.find_hccl_library(), "/path/to/hccl/libhccl.so")

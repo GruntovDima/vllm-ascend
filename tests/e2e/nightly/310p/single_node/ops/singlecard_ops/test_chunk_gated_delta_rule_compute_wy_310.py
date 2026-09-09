@@ -109,10 +109,10 @@ def test_compute_wy_matches_torch_reference_grouped_heads():
     _assert_compute_wy_close(out, ref)
 
 
-def test_compute_wy_rejects_head_dim_over_ub_budget():
-    """K=V=128 is a legal model shape but overflows 310P UB; NPU WY must skip it."""
+def test_compute_wy_rejects_head_dim_above_kernel_limit():
+    """Head dimensions above 128 are unsupported by the 310P kernel."""
     enable_custom_op()
-    q, k, v, g, beta = _make_inputs(k_dim=128, v_dim=128)
+    q, k, v, g, beta = _make_inputs(k_dim=144, v_dim=144)
     assert not chunk_mod._can_use_npu_compute_wy(q, k, v, g, beta, CHUNK_SIZE)
 
 
@@ -307,12 +307,12 @@ def test_cgdr_310_colleague_shape_npu_wy_vs_torch_wy(monkeypatch):
 def test_cgdr_310_colleague_shape_vs_pytorch_reference():
     """Absolute accuracy vs torch reference for the production-like shape (incl. l2norm).
 
-    dim=128 exceeds 310P UB, so this path uses the torch WY fallback.
+    dim=128 exercises the custom kernel's two-pass solve.
     """
     enable_custom_op()
     q, k, v, g, beta, initial_state = _colleague_precision_inputs(dim=128)
     q_pad, k_pad, v_pad, g_pad, beta_pad, _, _ = chunk_mod._pad_bthd_to_chunk(q, k, v, g, beta, CHUNK_SIZE)
-    assert not chunk_mod._can_use_npu_compute_wy(q_pad, k_pad, v_pad, g_pad, beta_pad, CHUNK_SIZE)
+    assert chunk_mod._can_use_npu_compute_wy(q_pad, k_pad, v_pad, g_pad, beta_pad, CHUNK_SIZE)
 
     out_npu, _ = _run_cgdr_310(
         q,
