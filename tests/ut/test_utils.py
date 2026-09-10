@@ -145,13 +145,14 @@ class TestUtils(TestBase):
                 return mock.MagicMock()
             return real_import(name, globals, locals, fromlist, level)
 
-        profile = mock.MagicMock()
-        profile.supports.return_value = True
         previous_state = utils._CUSTOM_OP_ENABLED
         utils._CUSTOM_OP_ENABLED = None
         try:
             with (
-                mock.patch("vllm_ascend.utils.get_current_hardware_profile", return_value=profile),
+                mock.patch(
+                    "vllm_ascend.utils.get_ascend_device_type",
+                    return_value=utils.AscendDeviceType._310P,
+                ),
                 mock.patch("vllm_ascend.utils.torch.compiler.is_compiling", return_value=False),
                 mock.patch("vllm.envs.VLLM_BATCH_INVARIANT", False),
                 mock.patch("vllm_ascend.utils.bootstrap_custom_op_env") as bootstrap,
