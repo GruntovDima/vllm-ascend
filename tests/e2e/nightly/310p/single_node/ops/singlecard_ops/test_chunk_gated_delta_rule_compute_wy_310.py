@@ -148,11 +148,11 @@ def test_compute_wy_qwen35_production_shape_is_deterministic():
 @pytest.mark.parametrize(
     "batch,tokens,q_heads,v_heads,k_dim,v_dim",
     [
-        (1, 128, 2, 2, 64, 64),  # equal heads
-        (1, 128, 2, 4, 64, 64),  # grouped heads
-        (1, 64, 8, 16, 64, 64),  # qwen-like short
-        (1, 256, 8, 16, 64, 64),  # qwen-like medium
-        (2, 128, 4, 8, 64, 64),  # batch>1
+        (1, 128, 2, 2, 64, 128),  # equal heads
+        (1, 128, 2, 4, 64, 128),  # grouped heads
+        (1, 64, 8, 16, 64, 128),  # qwen-like short
+        (1, 256, 8, 16, 64, 128),  # qwen-like medium
+        (2, 128, 4, 8, 64, 128),  # batch>1
     ],
 )
 def test_cgdr_310_npu_wy_matches_torch_wy_e2e(monkeypatch, batch, tokens, q_heads, v_heads, k_dim, v_dim):
@@ -185,9 +185,9 @@ def test_chunk_gated_delta_rule_310_uses_npu_wy(monkeypatch):
 def _colleague_precision_inputs(seed=42, g_scale=1.0, dim=64):
     """Qwen3.5-2B-like GDN prefill, with head dim capped at 64 for NPU WY.
 
-    Production Qwen3.5-2B uses dim=128, but 310P UB cannot hold K=V=128
-    InitBuffers, so NPU compute_wy is limited to dim<=64. Default here
-    exercises the NPU path; pass dim=128 to cover torch fallback.
+    Production Qwen3.5-2B uses dim=128. The default dim=64 keeps the
+    compute_wy-only precision cases lightweight; full chunk-gdr tests pass
+    dim=128 because the legacy 310P fwd_h/fwd_o kernels require V>=128.
 
     token=111, q/k/v [1, 111, 16, dim] fp16, g [1, 111, 16] fp32,
     beta [1, 111, 16] fp16, initial_state [1, 16, dim, dim] fp16,
@@ -268,7 +268,7 @@ def test_compute_wy_correlated_qk_uses_stable_fp32_path():
 def test_cgdr_310_colleague_shape_npu_wy_vs_torch_wy(monkeypatch):
     """T=111 (pad to 128) + l2norm=True: NPU compute_wy vs torch WY fallback."""
     enable_custom_op()
-    q, k, v, g, beta, initial_state = _colleague_precision_inputs()
+    q, k, v, g, beta, initial_state = _colleague_precision_inputs(dim=128)
 
     # After pad_bthd, T becomes 128 and NPU compute_wy must be eligible.
     q_pad, k_pad, v_pad, g_pad, beta_pad, _, _ = chunk_mod._pad_bthd_to_chunk(q, k, v, g, beta, CHUNK_SIZE)
@@ -346,7 +346,7 @@ def test_cgdr_310_colleague_shape_vs_pytorch_reference():
 def test_cgdr_310_colleague_shape_with_cu_seqlens(monkeypatch):
     """Same shape via varlen path: cu_seqlens int32 [0, 111]."""
     enable_custom_op()
-    q, k, v, g, beta, initial_state = _colleague_precision_inputs()
+    q, k, v, g, beta, initial_state = _colleague_precision_inputs(dim=128)
     cu_seqlens = torch.tensor([0, 111], dtype=torch.int32, device=q.device)
 
     out_npu, _ = _run_cgdr_310(
