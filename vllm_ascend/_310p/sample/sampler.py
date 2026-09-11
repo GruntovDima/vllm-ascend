@@ -28,6 +28,7 @@ from vllm_ascend.sample.sampler import (
     DEFAULT_LOGPROBS_MODE,
     AscendSampler,
     AscendTopKTopPSampler,
+    _apply_top_k_top_p_pytorch,
 )
 from vllm_ascend.utils import global_stream, npu_stream_switch
 
@@ -40,6 +41,17 @@ _TREE_COMPACT_MAX_TOP_K = 128
 # Guard the change in FP32 summation order (ascending full CDF vs. head mass).
 # Ambiguous rows use the original filter, not an adjusted sampling threshold.
 _TREE_TOP_P_ROUNDING_GUARD = 1e-5
+
+
+def _compact_filter_compatible(filter_fn: object) -> bool:
+    """Return whether ``filter_fn`` has the compact helper's exact semantics.
+
+    The legacy PyTorch filter applies top-k and top-p independently to the
+    original full-vocabulary probabilities. Other filters are not assumed to
+    share that contract. In particular, the fused 310P TopKTopP operator first
+    applies top-k and then applies top-p to the renormalized retained logits.
+    """
+    return filter_fn is _apply_top_k_top_p_pytorch
 
 
 def _try_compact_top_k_310p(
@@ -245,7 +257,13 @@ class AscendTopKTopPSampler310(AscendTopKTopPSampler):
         else:
             # Only sample_tree installs a CPU top-k hint, scoped to this call.
             # Ordinary decode, graph execution and logprob outputs are unchanged.
-            if self.logprobs_mode not in ("processed_logits", "processed_logprobs"):
+            # The compact filter is valid only for the exact legacy PyTorch
+            # filtering contract. Preserve any other active implementation's
+            # semantics by taking its unchanged full-vocabulary path.
+            if (
+                _compact_filter_compatible(self.apply_top_k_top_p)
+                and self.logprobs_mode not in ("processed_logits", "processed_logprobs")
+            ):
                 compact = _try_compact_top_k_310p(logits, k, p, getattr(self, "tree_top_k", None))
                 if compact is not None:
                     candidate_logits, token_ids, fallback_rows = compact

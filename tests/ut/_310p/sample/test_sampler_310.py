@@ -3,7 +3,7 @@ import sys
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -24,6 +24,11 @@ def load_sampler_module():
     sample_sampler_module.AscendTopKTopPSampler = type(  # type: ignore[attr-defined]
         "AscendTopKTopPSampler", (), {}
     )
+
+    def legacy_top_k_top_p(*args, **kwargs):
+        raise NotImplementedError
+
+    sample_sampler_module._apply_top_k_top_p_pytorch = legacy_top_k_top_p  # type: ignore[attr-defined]
     utils_module = ModuleType("vllm_ascend.utils")
     utils_module.global_stream = lambda: MagicMock()  # type: ignore[attr-defined]
     utils_module.npu_stream_switch = lambda _: nullcontext()  # type: ignore[attr-defined]
@@ -198,6 +203,48 @@ class TestSampler310pStandalone(unittest.TestCase):
         )
         current_npu_stream.wait_stream.assert_called_once_with(global_npu_stream)
         global_npu_stream.wait_stream.assert_not_called()
+
+    def test_fused_filter_cannot_activate_legacy_compact_route(self):
+        sampler = sampler_310p.AscendTopKTopPSampler310.__new__(
+            sampler_310p.AscendTopKTopPSampler310
+        )
+        sampler.logprobs_mode = "raw_logprobs"
+        sampler.tree_top_k = 2
+        logits = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
+        filtered = torch.tensor([[4.0, -float("inf"), -float("inf"), -float("inf")]])
+        fused_filter = MagicMock(return_value=filtered)
+        sampler.apply_top_k_top_p = fused_filter
+        sampled = torch.tensor([0])
+
+        with (
+            patch.object(
+                sampler_310p,
+                "get_ascend_config",
+                return_value=SimpleNamespace(enable_reduce_sample=False),
+            ),
+            patch.object(
+                sampler_310p,
+                "_try_compact_top_k_310p",
+                side_effect=AssertionError("legacy compact route must stay disabled"),
+            ) as compact,
+            patch.object(
+                sampler_310p,
+                "_random_sample_310p",
+                return_value=sampled,
+            ) as random_sample,
+        ):
+            actual, returned_logits = sampler.forward_native(
+                logits,
+                {},
+                torch.tensor([2], dtype=torch.int32),
+                torch.tensor([0.9]),
+            )
+
+        self.assertIs(actual, sampled)
+        self.assertIsNone(returned_logits)
+        compact.assert_not_called()
+        fused_filter.assert_called_once()
+        random_sample.assert_called_once()
 
 
 if __name__ == "__main__":

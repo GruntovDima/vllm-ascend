@@ -67,6 +67,12 @@ class TestCompactTreeSampler(unittest.TestCase):
         compact = self.module._try_compact_top_k_310p(logits, torch.tensor([2]), torch.tensor([0.6]), 2)
         self.assertEqual(torch.isfinite(compact[0]).sum().item(), 2)
 
+    def test_route_requires_exact_legacy_filter_identity(self):
+        self.assertTrue(self.module._compact_filter_compatible(
+            self.module._apply_top_k_top_p_pytorch
+        ))
+        self.assertFalse(self.module._compact_filter_compatible(lambda *args: args))
+
     def test_cutoff_ties_fall_back_and_internal_ties_are_retained(self):
         self.check(torch.tensor([[4., 3., 3., 3., 1., 0.]]), 2, 0.9, expect_fast=True)
         self.check(torch.tensor([[4., 3., 3., 3., 3., 3., 1., 0.]]), 2, 0.9, expect_fast=False)
