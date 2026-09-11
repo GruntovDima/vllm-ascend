@@ -36,6 +36,12 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 QUERY_LENS_CPU_ATTR = "query_lens_cpu"
 SPLITFUSE_MASK_NZ_ATTR = "splitfuse_mask_nz"
 
+# Draft metadata reports the actual query-token count (for example, 1 or 2
+# requests), while ACL graph capture sizes include the K speculative slots
+# (for example, 4 or 8 when K=3). Keep every small decode mask at a stable
+# address instead of comparing these two different size domains.
+_MASK_PERSISTENT_MAX_TOKENS = 64
+
 
 def set_query_lens_cpu(attn_metadata: AscendMetadata, query_lens_cpu: torch.Tensor) -> None:
     """Attach host qLens for ATB splitfuse without extending upstream AscendMetadata."""
@@ -89,9 +95,7 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
         if device.type != "cpu":
             max_num_seqs = vllm_config.scheduler_config.max_num_seqs
             self._query_lens_cpu_buffer = torch.empty(max_num_seqs, dtype=torch.int32, device="cpu", pin_memory=True)
-        capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes or ()
-        self._splitfuse_mask_capture_sizes = frozenset(capture_sizes)
-        # Stable-address NZ mask buffers, one per configured capture size (see build()).
+        # Stable-address NZ mask buffers, keyed by the actual query-token count.
         self._splitfuse_mask_bufs: dict[int, torch.Tensor] = {}
 
     def _fill_query_lens_cpu(
@@ -148,8 +152,8 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
         else:
             # Build the per-step splitfuse mask here, outside the forward: the
             # forward-time get_splitfuse_mask does sync D2H/H2D copies that abort
-            # an ACL graph capture. For configured capture shapes the mask content
-            # is copied into a stable-address buffer so replays see fresh values.
+            # an ACL graph capture. Small decode masks are copied into stable-address
+            # buffers so replays see fresh values at the addresses captured earlier.
             q_list = get_query_lens_cpu(attn_metadata).tolist()
             num_tokens = int(sum(q_list))
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu
@@ -164,7 +168,7 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
                 seq_lens_cpu = attn_metadata.seq_lens.cpu()
             c_list = seq_lens_cpu[:num_reqs].tolist()
             mask_nz = AttentionMaskBuilder310.build_splitfuse_mask_nz_from_host(q_list, c_list, self.device)
-            if num_tokens in self._splitfuse_mask_capture_sizes:
+            if num_tokens <= _MASK_PERSISTENT_MAX_TOKENS:
                 buf = self._splitfuse_mask_bufs.get(num_tokens)
                 if buf is None:
                     buf = mask_nz
