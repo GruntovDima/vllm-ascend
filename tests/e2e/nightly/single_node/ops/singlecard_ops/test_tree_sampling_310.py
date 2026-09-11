@@ -98,21 +98,26 @@ def main():
                 assert abs(observed - expected) <= tolerance, (observed, expected, tolerance)
             report["distribution"] = {"trials": trials, "expected": probabilities.tolist(),
                                       "observed": frequencies.tolist(), "passed": True}
-            # Exercise compact sampling, not just its dense fallback, with an
-            # analytically known truncated target distribution.
+            # Exercise the fused top-k/top-p route through tree sampling with
+            # an analytically known truncated target distribution. The tree
+            # hint must not switch this filter to the legacy compact route.
             actual = sampler.sample_tree(
                 logits.clone(), metadata(1.0, 2, 0.9, seed=91), top_k=2,
             ).cpu()
             frequencies = torch.bincount(actual.long(), minlength=4).double() / trials
-            compact_expected = torch.tensor([0., 0., 2 / 9, 7 / 9])
-            for observed, expected in zip(frequencies.tolist(), compact_expected.tolist()):
+            truncated_expected = torch.tensor([0., 0., 2 / 9, 7 / 9])
+            for observed, expected in zip(frequencies.tolist(), truncated_expected.tolist()):
                 tolerance = 6 * math.sqrt(expected * (1 - expected) / trials) + 1 / trials
                 assert abs(observed - expected) <= tolerance, (observed, expected, tolerance)
             assert frequencies[:2].sum() == 0
-            report["compact_distribution"] = dict(trials=trials, expected=compact_expected.tolist(),
-                                                  observed=frequencies.tolist(), passed=True)
-            # Mixed fast/fallback rows must consume exactly one draw each in
-            # original node order; falling back cannot advance the RNG again.
+            report["fused_truncated_distribution"] = dict(
+                trials=trials,
+                expected=truncated_expected.tolist(),
+                observed=frequencies.tolist(),
+                passed=True,
+            )
+            # A tree hint under fused filtering must still consume exactly one
+            # draw per row in original node order.
             mixed = torch.randn(17, 997, generator=rng).half().float()
             mixed[::3] = 0
             mixed = mixed.to(device)
@@ -120,8 +125,8 @@ def main():
             serial_md = metadata(1.0, 50, 0.9)
             expected = torch.cat([sampler(row[None].clone(), serial_md).sampled_token_ids.flatten()
                                   for row in mixed])
-            assert torch.equal(actual.cpu(), expected.cpu()), "mixed fallback RNG/order mismatch"
-            report["mixed_fallback_seeded_match"] = True
+            assert torch.equal(actual.cpu(), expected.cpu()), "fused tree-hint RNG/order mismatch"
+            report["fused_tree_hint_seeded_match"] = True
             unseeded = sampler.sample_tree(torch.zeros(65, 4, device=device), metadata(1.0, None, None, seed=None))
             assert unseeded.shape == (65,) and unseeded.cpu().unique().numel() > 1
             report["unseeded"] = "pass"
