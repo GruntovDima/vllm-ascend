@@ -122,6 +122,7 @@ def test_patch_installs_static_slot_scaler_on_runtime_proposer():
         pass
 
     runtime_proposer = RuntimeMTPProposer()
+    assert RuntimeMTPProposer._sample_draft_from_logits is _Proposer310._sample_draft_from_logits
     assert runtime_proposer._scale_block_ids_for_slot_mapping("block_ids", 128) == (
         "310p",
         "block_ids",

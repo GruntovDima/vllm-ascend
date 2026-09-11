@@ -24,6 +24,15 @@ from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBasePropos
 
 
 class TestAscendSpecDecodeBaseProposer310(TestBase):
+    def test_integrated_base_exposes_greedy_draft_sampling_hook(self):
+        proposer = object.__new__(AscendSpecDecodeBaseProposer)
+        logits = torch.tensor([[1.0, 4.0, 3.0], [8.0, 2.0, 9.0]])
+
+        token_ids, draft_probs = proposer._sample_draft_from_logits(logits, None)
+
+        self.assertTrue(torch.equal(token_ids, torch.tensor([1, 2])))
+        self.assertIsNone(draft_probs)
+
     def test_slot_mapping_scales_without_mul(self):
         block_ids = torch.tensor([84, 162], dtype=torch.int32)
 
