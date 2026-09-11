@@ -122,6 +122,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
     @staticmethod
+    def _scale_block_ids_for_slot_mapping(
+        block_ids: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        return block_ids * block_size
+
+    @staticmethod
     def _get_multimodal_image_token_index(model_name: str, config: Any) -> int:
         if model_name in [
             "Qwen2_5_VLForConditionalGeneration",
@@ -1696,10 +1703,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 block_numbers = clamped_positions // block_size
             block_ids = block_table_for_slot.gather(dim=1, index=block_numbers.view(-1, 1))
             block_ids = block_ids.view(-1)
+            scaled_block_ids = self._scale_block_ids_for_slot_mapping(
+                block_ids,
+                block_size,
+            )
             if self.uses_mrope:
-                slot_mapping = block_ids * block_size + clamped_positions[0] % block_size
+                slot_mapping = scaled_block_ids + clamped_positions[0] % block_size
             else:
-                slot_mapping = block_ids * block_size + clamped_positions % block_size
+                slot_mapping = scaled_block_ids + clamped_positions % block_size
 
             # Mask out the slot mappings that exceed the max model length.
             # Otherwise, the KV cache will be inadvertently updated with the

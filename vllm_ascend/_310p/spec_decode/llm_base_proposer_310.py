@@ -29,6 +29,15 @@ _original_run_merged_draft = AscendSpecDecodeBaseProposer._run_merged_draft
 class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
     """310P proposer overrides for NPU-specific spec-decode workarounds."""
 
+    @staticmethod
+    def _scale_block_ids_for_slot_mapping(
+        block_ids: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Scale block ids without 310P's unstable tiny int32 Mul path."""
+        # add(x, x, alpha=n-1) is exactly n*x and lowers to AxpyV2.
+        return torch.add(block_ids, block_ids, alpha=block_size - 1)
+
     def _run_merged_draft(
         self,
         num_input_tokens,

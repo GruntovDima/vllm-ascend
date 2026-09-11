@@ -24,6 +24,30 @@ from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBasePropos
 
 
 class TestAscendSpecDecodeBaseProposer310(TestBase):
+    def test_slot_mapping_scales_without_mul(self):
+        block_ids = torch.tensor([84, 162], dtype=torch.int32)
+
+        with patch("vllm_ascend._310p.spec_decode.llm_base_proposer_310.torch.add", wraps=torch.add) as add:
+            scaled = AscendSpecDecodeBaseProposer310._scale_block_ids_for_slot_mapping(block_ids, 128)
+
+        self.assertTrue(torch.equal(scaled, torch.tensor([10752, 20736], dtype=torch.int32)))
+        self.assertIs(add.call_args.args[0], block_ids)
+        self.assertIs(add.call_args.args[1], block_ids)
+        self.assertEqual(add.call_args.kwargs, {"alpha": 127})
+
+    def test_slot_mapping_scaling_supports_non_power_of_two_block_size(self):
+        block_ids = torch.tensor([3, 5], dtype=torch.int32)
+        scaled = AscendSpecDecodeBaseProposer310._scale_block_ids_for_slot_mapping(block_ids, 96)
+
+        self.assertTrue(torch.equal(scaled, torch.tensor([288, 480], dtype=torch.int32)))
+
+    def test_slot_mapping_scaling_preserves_dtype_and_edge_values(self):
+        block_ids = torch.tensor([-1, 0, 7], dtype=torch.int32)
+        scaled = AscendSpecDecodeBaseProposer310._scale_block_ids_for_slot_mapping(block_ids, 1)
+
+        self.assertEqual(scaled.dtype, torch.int32)
+        self.assertTrue(torch.equal(scaled, block_ids))
+
     def test_run_merged_draft_sets_rope_flag_before_call(self):
         flag_states = []
 
