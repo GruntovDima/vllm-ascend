@@ -13,6 +13,7 @@ import dataclasses
 import enum
 import hashlib
 import json
+import math
 import numbers
 import os
 import platform
@@ -621,6 +622,7 @@ def snapshot_spec_metrics(llm: Any) -> dict[str, Any]:
                 "class": _class_name(metric),
                 "name": name,
                 "value": numeric_value if numeric_value is not None else _json_safe(value),
+                "values": _json_safe(getattr(metric, "values", None)),
                 "labels": _json_safe(getattr(metric, "labels", None)),
             }
         )
@@ -652,10 +654,25 @@ def derive_timing_and_acceptance(
     elapsed_s: float,
     delta: dict[str, int | float],
 ) -> dict[str, Any]:
-    arrival = _first_timestamp(metrics, ("arrival_time", "arrival_ts", "request_arrival_time"))
-    first = _first_timestamp(metrics, ("first_token_ts", "first_token_time"))
-    last = _first_timestamp(metrics, ("last_token_ts", "last_token_time"))
-    ttft_ms = (first - arrival) * 1000 if arrival is not None and first is not None else None
+    # New vLLM uses monotonic *_ts fields but wall-clock arrival_time. Never
+    # subtract timestamps from different clocks. Prefer its explicit latency.
+    latency = _first_timestamp(metrics, ("first_token_latency",))
+    ttft_ms = latency * 1000 if latency is not None else None
+    ttft_source = "first_token_latency" if latency is not None else None
+    if ttft_ms is None:
+        for first_name, arrival_name in (("first_token_time", "arrival_time"), ("first_token_ts", "arrival_ts")):
+            first_value = _first_timestamp(metrics, (first_name,))
+            arrival_value = _first_timestamp(metrics, (arrival_name,))
+            if first_value is not None and arrival_value is not None:
+                ttft_ms = (first_value - arrival_value) * 1000
+                ttft_source = f"{first_name}-{arrival_name}"
+                break
+    first = last = None
+    for first_name, last_name in (("first_token_ts", "last_token_ts"), ("first_token_time", "last_token_time")):
+        first = _first_timestamp(metrics, (first_name,))
+        last = _first_timestamp(metrics, (last_name,))
+        if first is not None and last is not None:
+            break
     decode_span_ms = (last - first) * 1000 if first is not None and last is not None else None
     tpot_ms = (
         decode_span_ms / (output_token_count - 1)
@@ -674,6 +691,7 @@ def derive_timing_and_acceptance(
     valid_accepted = accepted_tokens if isinstance(accepted_tokens, numbers.Real) else None
     return {
         "ttft_ms": ttft_ms,
+        "ttft_source": ttft_source,
         "decode_span_ms_excluding_prefill": decode_span_ms,
         "tpot_ms_excluding_prefill": tpot_ms,
         "generate_wall_s_including_prefill": elapsed_s,
@@ -686,7 +704,9 @@ def derive_timing_and_acceptance(
         "accepted_drafts_per_verification": (
             valid_accepted / valid_cycles if valid_accepted is not None and valid_cycles else None
         ),
-        "emitted_tokens_per_verification_actual": output_token_count / valid_cycles if valid_cycles else None,
+        "output_tokens_per_verification_counter_including_prefill": (
+            output_token_count / valid_cycles if valid_cycles else None
+        ),
         "emitted_tokens_per_verification_counter_derived": (
             1 + valid_accepted / valid_cycles if valid_accepted is not None and valid_cycles else None
         ),
@@ -744,6 +764,13 @@ def _request_row(
         "AVAILABLE" if not row["metrics_evidence"]["missing_required_counters"] else "INCOMPLETE"
     )
     row.update(derive_timing_and_acceptance(metrics, len(output_token_ids), elapsed_s, delta))
+    row["timing_contract"] = {
+        "status": "PASS" if all(
+            isinstance(row[key], numbers.Real) and math.isfinite(row[key]) and row[key] >= 0
+            for key in ("ttft_ms", "tpot_ms_excluding_prefill")
+        ) else "FAIL",
+        "note": "TTFT uses explicit latency or same-clock timestamps; TPOT uses the first-to-last decode span.",
+    }
     row["request_contract"]["status"] = (
         "PASS" if all(row["request_contract"].values()) else "FAIL"
     )
@@ -1045,6 +1072,8 @@ def run_worker(args: argparse.Namespace, plan: BenchmarkPlan, output: Path, argv
                     "Required speculative-decoding counters are missing: "
                     + repr(row["metrics_evidence"]["missing_required_counters"])
                 )
+            if row["timing_contract"]["status"] != "PASS":
+                raise RuntimeError("Missing or invalid same-clock timing evidence")
         report["status"] = "PASS"
         report["worker"]["status"] = "PASS"
         report["elapsed_s"] = time.perf_counter() - started

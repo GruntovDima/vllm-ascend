@@ -228,8 +228,22 @@ class TestEvidenceAndMetrics(unittest.TestCase):
         self.assertEqual(derived["proposed_draft_tokens"], 400)
         self.assertEqual(derived["accepted_draft_tokens"], 200)
         self.assertEqual(derived["accepted_drafts_per_verification"], 2.0)
-        self.assertEqual(derived["emitted_tokens_per_verification_actual"], 3.0)
+        self.assertEqual(derived["output_tokens_per_verification_counter_including_prefill"], 3.0)
         self.assertEqual(derived["emitted_tokens_per_verification_counter_derived"], 3.0)
+
+    def test_mixed_clock_vllm_metrics_use_explicit_latency(self):
+        metrics = SimpleNamespace(
+            arrival_time=1789123498.3662963,
+            first_token_ts=32406.80006627,
+            last_token_ts=32408.67815221,
+            first_token_latency=0.623751163482666,
+        )
+        derived = BENCHMARK.derive_timing_and_acceptance(metrics, 32, 2.46, {})
+        self.assertAlmostEqual(derived["ttft_ms"], 623.751163482666)
+        self.assertEqual(derived["ttft_source"], "first_token_latency")
+        self.assertAlmostEqual(derived["tpot_ms_excluding_prefill"], 60.583417419336676)
+        del metrics.first_token_latency
+        self.assertIsNone(BENCHMARK.derive_timing_and_acceptance(metrics, 32, 2.46, {})["ttft_ms"])
 
     def test_blocked_report_is_written_without_worker_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
