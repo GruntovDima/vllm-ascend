@@ -113,6 +113,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--safetensors-load-strategy", choices=("lazy", "eager"), default="eager")
     parser.add_argument("--tree-trace", action="store_true", help="Enable verbose tree trace records")
+    parser.add_argument(
+        "--practical-prune-report", type=Path,
+        help="CPU-verified prune-pack report; allowed only for a separately labeled linear-graph control",
+    )
     parser.add_argument("--expected-prompt-sha256", default=EXPECTED_PROMPT_SHA256)
     parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--_worker-output", type=Path, help=argparse.SUPPRESS)
@@ -130,6 +134,8 @@ def build_plan(args: argparse.Namespace) -> BenchmarkPlan:
         raise ValueError("physical and logical device indices must be non-negative")
     if not re.fullmatch(r"[0-9a-f]{64}", args.expected_prompt_sha256):
         raise ValueError("expected-prompt-sha256 must be 64 lowercase hexadecimal characters")
+    if getattr(args, "practical_prune_report", None) is not None and args.mode != "linear-graph":
+        raise ValueError("practical-prune-report is only allowed for a separate linear-graph control")
 
     blocked_reason = None
     if args.mode == "tree":
@@ -875,6 +881,69 @@ def source_hashes(repository: Path) -> dict[str, str | None]:
     return result
 
 
+def verified_practical_prune(args: argparse.Namespace) -> dict[str, Any]:
+    """Bind an explicitly requested practical control to the checked pack bytes."""
+    path = getattr(args, "practical_prune_report", None)
+    if path is None:
+        return {"status": "DISABLED"}
+    try:
+        raw = Path(path).read_bytes()
+        report = json.loads(raw)
+        if args.mode != "linear-graph" or report.get("tool") != "verify_tree_prune_pack.py":
+            raise ValueError("Wrong experiment mode or verification tool")
+        checks = report.get("checks", {})
+        required_checks = (
+            "values.weight_selected_rows_exact", "values.deq_scale_selected_rows_exact",
+            "values.quant_bias_selected_rows_exact", "checkpoint.head_quant_description_w8a8",
+            "pack.canonical_token_id_roundtrip", "pack.inv_map.omitted_ids_use_padding_column",
+        )
+        if (report.get("status") != "PASS" or not checks
+                or not all(check.get("passed") is True for check in checks.values())
+                or not all(checks.get(key, {}).get("passed") is True for key in required_checks)):
+            raise ValueError("Prune verification did not pass every required check")
+        if Path(report["inputs"]["checkpoint"]).resolve() != Path(args.model).resolve():
+            raise ValueError("Prune verification belongs to a different checkpoint")
+        pack = Path(report["inputs"]["pack"]).resolve(strict=True)
+        environment_path = os.environ.get("VLLM_LMHEAD_PRUNE_PACK", "")
+        if not environment_path or Path(environment_path).resolve(strict=True) != pack:
+            raise ValueError("Explicit prune environment does not match the checked pack")
+        digest = hashlib.sha256()
+        with pack.open("rb") as stream:
+            for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != report["pack"]["file_sha256"]:
+            raise ValueError("Prune pack changed after CPU verification")
+        return {
+            "status": "VERIFIED", "report_path": str(Path(path).resolve()),
+            "report_sha256": hashlib.sha256(raw).hexdigest(),
+            "pack_path": str(pack), "pack_sha256": digest.hexdigest(),
+            "original_vocab": report["pack"]["orig_vocab"],
+            "pruned_vocab": report["pack"]["pruned_vocab"],
+            "hidden_size": report["pack"]["hidden_size"],
+            "comparison": "PRACTICAL_PRUNED_CONTROL_NOT_FULL_VOCAB_MATCHED",
+        }
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        return {"status": "FAIL", "error": str(error)}
+
+
+def pruned_runtime_contract(evidence: dict[str, Any], verification: dict[str, Any]) -> dict[str, Any]:
+    if verification.get("status") == "DISABLED":
+        return {"status": "DISABLED"}
+    expected_shape = [verification.get("hidden_size"), verification.get("pruned_vocab")]
+    checks = {}
+    for role in ("target_head", "mtp_head"):
+        head = evidence.get(role, {})
+        weight = head.get("weight") or {}
+        checks[role] = (
+            head.get("status") == "AVAILABLE" and weight.get("dtype") == "torch.int8"
+            and weight.get("shape") == expected_shape
+            and (head.get("deq_scale") or {}).get("dtype") == "torch.int64"
+            and (head.get("quant_bias") or {}).get("dtype") == "torch.int32"
+        )
+    return {"status": "PASS" if all(checks.values()) else "FAIL", "checks": checks,
+            "expected_weight_shape": expected_shape}
+
+
 def environment_contract(args: argparse.Namespace, plan: BenchmarkPlan) -> dict[str, Any]:
     environment = {key: os.environ.get(key) for key in OPTIMIZATION_ENV_KEYS}
     all_vllm_environment = {
@@ -888,6 +957,10 @@ def environment_contract(args: argparse.Namespace, plan: BenchmarkPlan) -> dict[
         "compact_gdn_explicit": environment["VLLM_ASCEND_TREE_GDN_COMPACT"] == "1",
         "lmhead_prune_disabled": environment["VLLM_LMHEAD_PRUNE_PACK"] in (None, ""),
     }
+    verification = verified_practical_prune(args)
+    if getattr(args, "practical_prune_report", None) is not None:
+        checks.pop("lmhead_prune_disabled")
+        checks["practical_graph_prune_verified"] = verification["status"] == "VERIFIED"
     return {
         "values": environment,
         "all_vllm_environment": all_vllm_environment,
@@ -895,8 +968,9 @@ def environment_contract(args: argparse.Namespace, plan: BenchmarkPlan) -> dict[
             "ASCEND_RT_VISIBLE_DEVICES": str(args.device),
             "VLLM_CUSTOM_QBMM": "1",
             "VLLM_ASCEND_TREE_GDN_COMPACT": "1",
-            "VLLM_LMHEAD_PRUNE_PACK": "unset/empty",
+            "VLLM_LMHEAD_PRUNE_PACK": verification.get("pack_path", "unset/empty"),
         },
+        "practical_prune_verification": verification,
         "checks": checks,
         "status": "PASS" if all(checks.values()) else "FAIL",
         "semantics": {
@@ -904,7 +978,10 @@ def environment_contract(args: argparse.Namespace, plan: BenchmarkPlan) -> dict[
             "VLLM_ASCEND_TREE_GDN_COMPACT": (
                 "active for tree mode" if plan.mode == "tree" else "explicitly set but inert for this linear control"
             ),
-            "VLLM_LMHEAD_PRUNE_PACK": "kept off pending verified runtime target/MTP head compatibility",
+            "VLLM_LMHEAD_PRUNE_PACK": (
+                "separate practical pruned control; vocabulary differs from matched comparisons"
+                if verification["status"] == "VERIFIED" else "disabled for matched full-vocabulary comparisons"
+            ),
         },
     }
 
@@ -931,6 +1008,10 @@ def _base_report(args: argparse.Namespace, plan: BenchmarkPlan, argv: list[str])
             "batch_size": 1,
             "expected_prompt_sha256": args.expected_prompt_sha256,
             "performance_eligible": plan.performance_eligible,
+            "comparison_cohort": (
+                "PRACTICAL_PRUNED_NOT_MATCHED" if getattr(args, "practical_prune_report", None)
+                else "MATCHED_FULL_VOCABULARY"
+            ),
         },
         "device_mapping": {
             "physical_host_device": args.physical_device,
@@ -947,6 +1028,11 @@ def _base_report(args: argparse.Namespace, plan: BenchmarkPlan, argv: list[str])
             "engine_lifetime": "one worker engine shared by warmup and every recorded repetition",
             "independent_engine_initializations": 1,
             "statistical_independence": "not claimed",
+        },
+        "correctness_scope": {
+            "pass_means": "execution/configuration/length/timing/counter contracts only",
+            "full_model_ar_equivalence": "NOT_VERIFIED",
+            "cross_run_greedy_repeatability": "NOT_ESTABLISHED",
         },
         "runs": [],
     }
@@ -1008,6 +1094,10 @@ def run_worker(args: argparse.Namespace, plan: BenchmarkPlan, output: Path, argv
         llm = LLM(**report["engine_args"])
         report["initialization_s"] = time.perf_counter() - started
         report["runtime_model_evidence"] = collect_runtime_metadata(llm)
+        report["pruned_runtime_contract"] = pruned_runtime_contract(
+            report["runtime_model_evidence"],
+            report["environment_contract"]["practical_prune_verification"],
+        )
         report["effective_config_contract"] = effective_config_contract(report["runtime_model_evidence"], plan)
         _write_json(output, report)
         if report["runtime_model_evidence"]["status"] != "AVAILABLE":
@@ -1015,6 +1105,8 @@ def run_worker(args: argparse.Namespace, plan: BenchmarkPlan, output: Path, argv
                 "Required actual target/MTP lm_head dtype and quantization evidence is unavailable; "
                 "checkpoint metadata is not substituted"
             )
+        if report["pruned_runtime_contract"]["status"] == "FAIL":
+            raise RuntimeError("Both loaded lm_heads must match the verified pruned W8A8 dimensions")
         if report["effective_config_contract"]["status"] != "PASS":
             raise RuntimeError(
                 "Loaded runtime configuration does not match the requested MTP/cache/graph contract: "

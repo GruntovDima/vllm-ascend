@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -37,6 +39,7 @@ def make_args(**overrides):
         "gpu_memory_utilization": 0.85,
         "safetensors_load_strategy": "eager",
         "tree_trace": False,
+        "practical_prune_report": None,
         "expected_prompt_sha256": BENCHMARK.EXPECTED_PROMPT_SHA256,
         "_worker": False,
         "_worker_output": None,
@@ -80,6 +83,11 @@ class FakeModel:
 
 
 class TestPlan(unittest.TestCase):
+    def test_practical_prune_is_not_allowed_in_matched_eager_or_tree_runs(self):
+        for mode, width in (("tree", 2), ("linear-eager", None)):
+            with self.assertRaisesRegex(ValueError, "separate linear-graph"):
+                BENCHMARK.build_plan(make_args(mode=mode, width=width, practical_prune_report=Path("checked.json")))
+
     def test_tree_depth_five_and_six_are_blocked_without_clamping(self):
         for depth in (5, 6):
             with self.subTest(depth=depth):
@@ -157,6 +165,56 @@ class TestPlan(unittest.TestCase):
             contract = BENCHMARK.environment_contract(args, plan)
             self.assertEqual(contract["status"], "FAIL")
             self.assertFalse(contract["checks"]["lmhead_prune_disabled"])
+
+
+class TestPracticalPrune(unittest.TestCase):
+    def test_verified_report_is_bound_to_checkpoint_environment_and_pack_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pack = root / "pack.pt"
+            pack.write_bytes(b"unit-test-pack-not-a-real-checkpoint")
+            checked = root / "checked.json"
+            required = (
+                "values.weight_selected_rows_exact", "values.deq_scale_selected_rows_exact",
+                "values.quant_bias_selected_rows_exact", "checkpoint.head_quant_description_w8a8",
+                "pack.canonical_token_id_roundtrip", "pack.inv_map.omitted_ids_use_padding_column",
+            )
+            report = {
+                "tool": "verify_tree_prune_pack.py", "status": "PASS",
+                "inputs": {"pack": str(pack), "checkpoint": str(root / "model")},
+                "pack": {"file_sha256": hashlib.sha256(pack.read_bytes()).hexdigest(),
+                         "orig_vocab": 248320, "pruned_vocab": 98304, "hidden_size": 4096},
+                "checks": {key: {"passed": True} for key in required},
+            }
+            checked.write_text(json.dumps(report))
+            args = make_args(mode="linear-graph", width=None, model=str(root / "model"),
+                             practical_prune_report=checked)
+            with mock.patch.dict(os.environ, {"VLLM_LMHEAD_PRUNE_PACK": str(pack)}, clear=True):
+                evidence = BENCHMARK.verified_practical_prune(args)
+                self.assertEqual(evidence["status"], "VERIFIED")
+                self.assertEqual(evidence["comparison"], "PRACTICAL_PRUNED_CONTROL_NOT_FULL_VOCAB_MATCHED")
+                args.model = str(root / "different-model")
+                self.assertEqual(BENCHMARK.verified_practical_prune(args)["status"], "FAIL")
+                args.model = str(root / "model")
+                report["checks"][required[0]]["passed"] = False
+                checked.write_text(json.dumps(report))
+                self.assertEqual(BENCHMARK.verified_practical_prune(args)["status"], "FAIL")
+                report["checks"][required[0]]["passed"] = True
+                checked.write_text(json.dumps(report))
+                pack.write_bytes(b"changed after verification")
+                self.assertEqual(BENCHMARK.verified_practical_prune(args)["status"], "FAIL")
+
+    def test_both_actual_runtime_heads_must_match_pruned_w8a8_shape(self):
+        verification = {"status": "VERIFIED", "hidden_size": 4096, "pruned_vocab": 98304}
+        head = {"status": "AVAILABLE", "weight": {"dtype": "torch.int8", "shape": [4096, 98304]},
+                "deq_scale": {"dtype": "torch.int64"}, "quant_bias": {"dtype": "torch.int32"}}
+        evidence = {"target_head": copy.deepcopy(head), "mtp_head": copy.deepcopy(head)}
+        self.assertEqual(BENCHMARK.pruned_runtime_contract(evidence, verification)["status"], "PASS")
+        evidence["mtp_head"]["weight"]["shape"] = [4096, 248320]
+        self.assertEqual(BENCHMARK.pruned_runtime_contract(evidence, verification)["status"], "FAIL")
+        evidence["mtp_head"] = copy.deepcopy(head)
+        evidence["mtp_head"]["weight"]["dtype"] = "torch.float16"
+        self.assertEqual(BENCHMARK.pruned_runtime_contract(evidence, verification)["status"], "FAIL")
 
 
 class TestEvidenceAndMetrics(unittest.TestCase):
