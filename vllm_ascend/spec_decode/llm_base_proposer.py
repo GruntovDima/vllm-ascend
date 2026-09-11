@@ -1071,20 +1071,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             logits = self.model.compute_logits(hidden_states)
             return greedy_sample(logits)
 
-    def _sample_draft_from_logits(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Select a draft token while exposing full logits to 310P overrides.
-
-        This branch predates probabilistic draft sampling, so keep its existing
-        greedy behavior. ``sampling_metadata`` is accepted for compatibility
-        with the v0.27.1 proposer hook contract.
-        """
-        del sampling_metadata
-        return logits.argmax(dim=-1), None
-
     def _run_merged_draft(
         self,
         num_input_tokens,
@@ -1180,7 +1166,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         ori_token_indices_to_sample,
                         is_logits=True,
                     )
-                draft_token_ids, _ = self._sample_draft_from_logits(logits, None)
+                draft_token_ids = logits.argmax(dim=-1)
         else:
             if self.method == "dspark":
                 # Dspark speculation requires autoregressive applications of MarkovHead and ConfidenceHead.
@@ -1222,7 +1208,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         ori_token_indices_to_sample,
                         is_logits=True,
                     )
-                draft_token_ids, _ = self._sample_draft_from_logits(logits, None)
+                draft_token_ids = logits.argmax(dim=-1)
 
                 # Dynamic verify-length path for head-free DFlash only.
                 if hasattr(self, "dynamic_spec") and self.dynamic_spec is not None:
@@ -1367,13 +1353,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     if lmhead_tp_enable() and num_indices < logits.shape[0]:
                         logits = logits[:num_indices]
                         token_indices_to_sample = token_indices_to_sample[:num_indices]
-                    draft_token_ids, _ = self._sample_draft_from_logits(logits, None)
+                    draft_token_ids = logits.argmax(dim=-1)
             else:
                 logits = self.model.compute_logits(sample_hidden_states)
                 if lmhead_tp_enable() and num_indices < logits.shape[0]:
                     logits = logits[:num_indices]
                     token_indices_to_sample = token_indices_to_sample[:num_indices]
-                draft_token_ids, _ = self._sample_draft_from_logits(logits, None)
+                draft_token_ids = logits.argmax(dim=-1)
 
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]

@@ -18,7 +18,6 @@
 
 
 import torch
-from vllm_ascend import envs
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
@@ -28,7 +27,6 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import chunk_gated_delta_rule_310
 from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
-from vllm_ascend._310p.spec_decode.tree_gdn import forward_tree_gdn, use_compact_tree_gdn
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.utils import enable_sp
@@ -173,45 +171,6 @@ def npu_recurrent_gated_delta_rule_310(
     return out
 
 
-def npu_tree_gated_delta_rule_310(
-    *, q, k, v, g, beta, initial_state, parents, out, snapshots,
-) -> None:
-    """Normalize all nodes once; keep FP16 checkpoints on every tree edge."""
-    q = l2norm_310p(q)
-    k = l2norm_310p(k)
-    torch.ops._C_ascend.npu_tree_gated_delta_rule_310.out(
-        q.squeeze(0).to(torch.float16).contiguous(),
-        k.squeeze(0).to(torch.float16).contiguous(),
-        v.squeeze(0).to(torch.float16).contiguous(),
-        beta.squeeze(0).to(torch.float16).contiguous(),
-        initial_state.squeeze(0).contiguous(),
-        g.squeeze(0).to(torch.float32).contiguous(),
-        parents, k.shape[-1] ** -0.5,
-        out=out, snapshots=snapshots,
-    )
-
-
-def npu_tree_gdn_compact_310(*, q, k, v, g, beta, initial_state, parents, out):
-    """Return an NPU replay closure; native cache stays untouched until commit."""
-    q = l2norm_310p(q).squeeze(0).to(torch.float16).contiguous()
-    key = l2norm_310p(k).squeeze(0).to(torch.float16).contiguous()
-    value = v.squeeze(0).to(torch.float16).contiguous()
-    initial = initial_state.squeeze(0).contiguous()
-    records = torch.empty((value.shape[0], value.shape[1], 144), dtype=torch.float32, device=value.device)
-    torch.ops._C_ascend.npu_tree_gdn_compact_verify_310.out(
-        q, key, value, beta.squeeze(0).to(torch.float16).contiguous(), initial,
-        g.squeeze(0).to(torch.float32).contiguous(), parents, key.shape[-1] ** -0.5,
-        out=out, records=records,
-    )
-
-    def replay(path):
-        # Keep exact normalized keys, FP32 deltas and immutable FP16 initial
-        # checkpoint alive until the request-scoped verifier chooses a path.
-        return torch.ops._C_ascend.npu_tree_gdn_compact_replay_310(key, initial, records, parents, path)
-
-    return replay
-
-
 def _310p_get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
     conv_state_dtype, _ = _original_get_state_dtype(self)
     return conv_state_dtype, torch.float16
@@ -299,29 +258,6 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
             mixed_qkv = mixed_qkv[:num_actual_tokens]
             b = b[:num_actual_tokens]
             a = a[:num_actual_tokens]
-
-        tree_context = getattr(attn_metadata, "tree_mtp_context", None)
-        if tree_context is not None:
-            if enable_sp():
-                raise ValueError("Tree GDN does not support sequence parallelism")
-            compact = envs.VLLM_ASCEND_TREE_GDN_COMPACT and use_compact_tree_gdn(
-                tree_context.num_nodes, ssm_state.shape[-3]
-            )
-            forward_tree_gdn(
-                self,
-                attn_metadata,
-                tree_context,
-                mixed_qkv,
-                b,
-                a,
-                core_attn_out,
-                gating_fn=fused_gdn_gating_pytorch,
-                recurrent_fn=npu_recurrent_gated_delta_rule_310,
-                tree_recurrent_fn=None if compact else npu_tree_gated_delta_rule_310,
-                compact_recurrent_fn=npu_tree_gdn_compact_310 if compact else None,
-            )
-            maybe_save_kv_layer_to_connector("", [])
-            return
 
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2)).transpose(0, 1)

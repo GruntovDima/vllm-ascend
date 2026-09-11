@@ -19,64 +19,11 @@ from typing import Any
 
 import torch
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_ascend._310p.ops.rotary_embedding import AscendRotaryEmbedding310
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
 
 _original_run_merged_draft = AscendSpecDecodeBaseProposer._run_merged_draft
-_original_propose = AscendSpecDecodeBaseProposer._propose
-_original_sample_draft_from_logits = AscendSpecDecodeBaseProposer._sample_draft_from_logits
-
-
-def _tree_topk_token_ids(logits: torch.Tensor, width: int) -> torch.Tensor:
-    """Distinct siblings ordered by score, breaking ties by lowest token ID.
-
-    Rank scores against the top-k boundaries, then select unique integer-valued
-    FP32 keys: score rank first, inverse token ID second. This repairs ties
-    INCLUDING those at the selection boundary without width full-vocabulary
-    reduction loops, perturbing logits, consuming RNG, or a device/host sync.
-    NaNs sort before +inf. The width-one greedy path is unchanged.
-    """
-    if logits.ndim != 2 or not logits.is_floating_point():
-        raise ValueError("Tree MTP requires floating-point [batch, vocab] logits")
-    if width < 1 or width > logits.shape[-1]:
-        raise ValueError("Tree MTP width must be between 1 and vocabulary size")
-    if width == 1:
-        return logits.argmax(dim=-1, keepdim=True)
-
-    vocab_size = logits.shape[-1]
-    # Every intermediate integer must be exactly representable in FP32.
-    # Qwen3.5's 248320-token vocabulary and widths <=16 fit comfortably.
-    max_exact_key = 1 << 24
-    if logits.dtype in (torch.float16, torch.float32) and (width + 1) * vocab_size <= max_exact_key:
-        scores = logits.contiguous()
-        # On the pinned 310P runtime floating isnan/!= also classify infinities
-        # as NaNs. Inspect IEEE FP32 magnitude bits instead; FP16 -> FP32 is
-        # exact and does not change the score order. Avoid unsupported nan_to_num.
-        magnitude_bits = scores.float().view(torch.int32) & 0x7FFFFFFF
-        nan_mask = magnitude_bits > 0x7F800000
-        finite_or_inf = scores.masked_fill(nan_mask, torch.inf)
-        boundaries = finite_or_inf.topk(width, dim=-1).values.flip(-1).contiguous()
-        ranks = torch.searchsorted(boundaries, finite_or_inf, right=True, out_int32=True)
-        ranks = ranks.masked_fill(nan_mask, width + 1)
-        token_ids = torch.arange(vocab_size, dtype=torch.float32, device=logits.device)
-        keys = ranks.to(torch.float32) * vocab_size - token_ids
-        return keys.topk(width, dim=-1).indices
-
-    # Unusual dtypes or sizes outside the exact key bound retain the reference
-    # algorithm instead of silently losing low token-ID bits in a float key.
-    available = torch.ones_like(logits, dtype=torch.bool)
-    selected = []
-    for _ in range(width):
-        scores = logits.masked_fill(~available, -torch.inf)
-        maximum = scores.max(dim=-1, keepdim=True).values
-        # Preserve argmax's first-NaN behavior without selecting a used ID.
-        ties = (scores == maximum) | (scores.isnan() & maximum.isnan())
-        token_ids = (ties & available).to(torch.int32).argmax(dim=-1)
-        selected.append(token_ids)
-        available.scatter_(1, token_ids.unsqueeze(-1), False)
-    return torch.stack(selected, dim=-1)
 
 
 class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
@@ -90,73 +37,6 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
         """Scale block ids without 310P's unstable tiny int32 Mul path."""
         # add(x, x, alpha=n-1) is exactly n*x and lowers to AxpyV2.
         return torch.add(block_ids, block_ids, alpha=block_size - 1)
-
-    def _propose(self, num_speculative_tokens: int, *args: Any, **kwargs: Any) -> torch.Tensor:
-        """Draft a comb tree using the existing primary-token backbone.
-
-        The runner attaches ``tree_mtp_config`` only after validating the
-        eager tree path. Target sampling may be random; proposal construction
-        remains deterministic and must not consume the target request RNG.
-        The public budget counts candidate nodes;
-        the native proposer instead receives the number of backbone levels.
-        Its KV writes remain a linear backbone. The runner must rebuild the
-        next first-pass inputs from the accepted target path, not its prefix.
-        """
-        tree_config = getattr(self, "tree_mtp_config", None)
-        if tree_config is None or num_speculative_tokens == 0:
-            return _original_propose(self, num_speculative_tokens, *args, **kwargs)
-
-        width, depth = tree_config.width, tree_config.depth
-        if (
-            isinstance(width, bool)
-            or isinstance(depth, bool)
-            or not isinstance(width, int)
-            or not isinstance(depth, int)
-            or width < 1
-            or depth < 1
-        ):
-            raise ValueError("Tree MTP width and depth must be positive integers")
-        if num_speculative_tokens != width * depth:
-            raise ValueError("Tree MTP candidate budget must equal width * depth")
-        if getattr(self, "_enable_probabilistic_draft_probs", False):
-            raise ValueError("Tree MTP supports only greedy drafting")
-        if getattr(self, "_tree_mtp_sibling_ids", None) is not None:
-            raise RuntimeError("Nested tree MTP proposal is not supported")
-
-        previous_num_speculative_tokens = self.num_speculative_tokens
-        self._tree_mtp_sibling_ids: list[torch.Tensor] | None = []
-        self._tree_mtp_collect_width = width
-        try:
-            backbone = _original_propose(self, depth, *args, **kwargs)
-            siblings = self._tree_mtp_sibling_ids
-            if len(siblings) != depth:
-                raise RuntimeError(
-                    "Tree MTP needs one full-logits sampling call per backbone level; "
-                    "disable reduced-vocabulary/local-argmax and parallel drafting"
-                )
-            if any(row.shape != (backbone.shape[0], width) for row in siblings):
-                raise RuntimeError("Tree MTP sibling rows do not match the proposer batch")
-            # [batch, depth, width] -> [batch, candidate nodes]. Siblings at
-            # level d share the first sibling from level d-1 as their parent.
-            return torch.stack(siblings, dim=1).flatten(start_dim=1).contiguous()
-        finally:
-            self._tree_mtp_sibling_ids = None
-            self._tree_mtp_collect_width = 0
-            self._last_draft_probs = None
-            self.num_speculative_tokens = previous_num_speculative_tokens
-
-    def _sample_draft_from_logits(
-        self, logits: torch.Tensor, sampling_metadata: SamplingMetadata | None
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        siblings = getattr(self, "_tree_mtp_sibling_ids", None)
-        if siblings is None:
-            return _original_sample_draft_from_logits(self, logits, sampling_metadata)
-        # Target temperature/top-k/top-p do not turn the deterministic MTP
-        # proposals into samples. All randomness belongs to target verification.
-        token_ids = _tree_topk_token_ids(logits, self._tree_mtp_collect_width)
-        siblings.append(token_ids)
-        # Only this primary candidate enters the next native MTP iteration.
-        return token_ids[:, 0], None
 
     def _run_merged_draft(
         self,
