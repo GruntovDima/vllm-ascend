@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_ascend._310p.ops.rotary_embedding import AscendRotaryEmbedding310
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
