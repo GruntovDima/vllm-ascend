@@ -34,11 +34,13 @@ Enable with VLLM_LMHEAD_PRUNE_PACK=/path/pack.pt, a dict with
  pruned head, or K for pruned-out ids), "orig_vocab": int}.
 """
 
+import inspect
 import os
 import types
+from collections.abc import Callable
+from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 from vllm.logger import logger
 
@@ -47,21 +49,61 @@ from vllm_ascend.utils import maybe_trans_nz
 _ENV = "VLLM_LMHEAD_PRUNE_PACK"
 
 
-def _make_pruned_compute_logits(lm_head, inv_map: torch.Tensor, vocab_size: int):
-    pad_cache: dict[int, torch.Tensor] = {}
+def _compute_logits_accepts_spec_step_idx(compute_logits: Callable[..., torch.Tensor | None]) -> bool:
+    """Return whether ``compute_logits`` accepts Step3.5's step keyword."""
+    try:
+        parameters = inspect.signature(compute_logits).parameters
+    except (TypeError, ValueError):
+        return False
+    return "spec_step_idx" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        pruned = lm_head.quant_method.apply(lm_head, hidden_states)
+
+def _make_pruned_compute_logits(
+    original_compute_logits: Callable[..., torch.Tensor | None],
+    inv_map: torch.Tensor,
+    vocab_size: int,
+    pruned_vocab_size: int,
+):
+    pad_cache: dict[tuple[int, int, torch.device, torch.dtype], torch.Tensor] = {}
+    accepts_spec_step_idx = _compute_logits_accepts_spec_step_idx(original_compute_logits)
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        # Delegate projection to the model so MTP implementations retain their
+        # spec_step_idx-based head selection and any model-specific pre-head
+        # transforms. Ordinary model methods generally accept hidden_states
+        # only, so do not inject the Step3.5 keyword into those calls.
+        if accepts_spec_step_idx:
+            kwargs["spec_step_idx"] = spec_step_idx
+        pruned = original_compute_logits(hidden_states, **kwargs)
+        if pruned is None:
+            return None
+        if pruned.shape[-1] == vocab_size:
+            # A step-aware implementation may select another, unpruned head.
+            # Its canonical-vocabulary output is already correct.
+            return pruned
+        if pruned.shape[-1] != pruned_vocab_size:
+            raise RuntimeError(
+                "lm_head prune expected the original compute_logits to return "
+                f"{pruned_vocab_size} or {vocab_size} logits, got {pruned.shape[-1]}"
+            )
         # Expand to the canonical vocab with a single last-dim gather; column
         # K of the cached pad buffer stays -inf for pruned-out ids. Kept to
         # two device ops - eager dispatch overhead at M=1 otherwise eats the
         # pruned matmul's savings.
         pruned2d = pruned.reshape(-1, pruned.shape[-1])
         m, k = pruned2d.shape
-        pad = pad_cache.get(m)
+        cache_key = (m, k, pruned.device, pruned.dtype)
+        pad = pad_cache.get(cache_key)
         if pad is None:
             pad = torch.full((m, k + 1), torch.finfo(pruned.dtype).min, dtype=pruned.dtype, device=pruned.device)
-            pad_cache[m] = pad
+            pad_cache[cache_key] = pad
         pad[:, :k].copy_(pruned2d)
         full = pad.index_select(-1, inv_map)
         return full.reshape(*pruned.shape[:-1], vocab_size)
@@ -79,10 +121,15 @@ def maybe_prune_lm_head(*models: object) -> None:
     pack_path = os.environ.get(_ENV, "")
     if not pack_path:
         return
-    pack = torch.load(pack_path, map_location="cpu")
+    for model in models:
+        if model is not None and getattr(model, "draft_id_to_target_id", None) is not None:
+            raise NotImplementedError(
+                "Runtime lm_head pruning does not support a draft with its own d2t vocabulary."
+            )
+    pack = torch.load(pack_path, map_location="cpu", weights_only=True)
     if pack.get("mode") != "int8":
         raise NotImplementedError(f"unsupported prune pack mode {pack.get('mode')!r}")
-    inv_map = pack["inv_map"].npu()
+    inv_map_cpu = pack["inv_map"]
     pruned_heads: set[int] = set()
     for model in models:
         if model is None or not hasattr(model, "compute_logits"):
@@ -101,22 +148,36 @@ def maybe_prune_lm_head(*models: object) -> None:
         if lm_head is None:
             logger.warning("lm_head prune: no lm_head found on %s; skipped", type(model).__name__)
             continue
+        tp_size = getattr(lm_head, "tp_size", 1)
+        if tp_size != 1:
+            raise NotImplementedError(
+                f"{_ENV} supports only tensor-parallel size 1; "
+                f"{type(model).__name__} has lm_head.tp_size={tp_size}."
+            )
         proc = getattr(owner, "logits_processor", None)
         vocab_size = getattr(proc, "org_vocab_size", None) or pack["orig_vocab"]
         scale = getattr(proc, "scale", 1.0)
         if scale != 1.0 or getattr(proc, "soft_cap", None):
             raise NotImplementedError("lm_head pruning supports scale=1.0 / no soft cap only.")
+        dev = lm_head.weight.data.device
         if id(lm_head) not in pruned_heads:
             # Mirror AscendW8A8Static process_weights_after_loading's weight
             # treatment on the sliced rows; activation-quant tensors
             # (aclnn_input_*) depend only on the hidden dim and stay valid.
-            dev = lm_head.weight.data.device
             lm_head.weight.data = maybe_trans_nz(pack["weight"].to(dev)).transpose(0, 1)
             lm_head.deq_scale.data = pack["deq_scale"].to(dev)
             lm_head.quant_bias.data = pack["quant_bias"].to(dev)
             pruned_heads.add(id(lm_head))
-        fn = _make_pruned_compute_logits(lm_head, inv_map[:vocab_size], vocab_size)
+        inv_map = inv_map_cpu[:vocab_size].to(dev)
+        original_compute_logits = model.compute_logits
+        fn = _make_pruned_compute_logits(
+            original_compute_logits,
+            inv_map,
+            vocab_size,
+            pack["weight"].shape[0],
+        )
         model.compute_logits = types.MethodType(fn, model)
+        model._ascend_lm_head_pruned = True
         logger.info(
             "lm_head pruned: %s vocab %d -> %d rows (embedding-gather scatter)",
             type(model).__name__,

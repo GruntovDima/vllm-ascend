@@ -101,12 +101,15 @@ def _qbmm_v3x_fake(
 
 
 # Registration must run OUTSIDE any compiled region (direct_register_custom_op
-# runs torch.library schema inference, which dynamo refuses to trace), yet
-# AFTER the _C_ascend op library is loaded - which is later than this module's
-# import in the engine process. ensure_registered() is therefore called from
-# the schemes' process_weights_after_loading (eager, post-load, pre-compile);
-# the import-time attempt below is a best-effort fast path.
+# runs torch.library schema inference, which dynamo refuses to trace). The
+# schemes call ensure_registered() from process_weights_after_loading (eager,
+# post-load, pre-compile), where it is safe to load the extension and register
+# the opaque vLLM op.
 _ENABLED = False
+
+
+def _raw_qbmm_registered() -> bool:
+    return hasattr(torch.ops._C_ascend, "quant_batch_matmul_v3_x")
 
 
 def ensure_registered() -> bool:
@@ -115,8 +118,19 @@ def ensure_registered() -> bool:
         return True
     if os.environ.get(_ENV, "") != "1":
         return False
-    if not hasattr(torch.ops._C_ascend, "quant_batch_matmul_v3_x"):
-        return False
+    from vllm_ascend.utils import enable_custom_op
+
+    if not enable_custom_op():
+        raise RuntimeError(
+            f"{_ENV}=1 requested the 310P QuantBatchMatmulV3X kernel, "
+            "but the vllm-ascend custom-op extension could not be loaded."
+        )
+    if not _raw_qbmm_registered():
+        raise RuntimeError(
+            f"{_ENV}=1 requested the 310P QuantBatchMatmulV3X kernel, "
+            "but _C_ascend.quant_batch_matmul_v3_x is not registered. "
+            "Rebuild vllm-ascend with the 310P QBMM sources enabled."
+        )
     direct_register_custom_op(
         op_name="qbmm_v3x",
         op_func=_qbmm_v3x,
@@ -125,9 +139,6 @@ def ensure_registered() -> bool:
     )
     _ENABLED = True
     return True
-
-
-ensure_registered()
 
 
 def custom_qbmm_enabled() -> bool:
