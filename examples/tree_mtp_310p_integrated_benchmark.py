@@ -429,13 +429,35 @@ def _head_metadata(model: Any, role: str) -> dict[str, Any]:
             ("quant_type", "quantization", "input_dtype", "output_dtype", "is_monolithic"),
         ),
     }
-    for tensor_name in ("bias", "deq_scale", "quant_bias", "input_scale"):
+    for tensor_name in ("weight_nz", "bias", "deq_scale", "quant_bias", "input_scale"):
         tensor = getattr(head, tensor_name, None)
         if tensor is not None:
             metadata[tensor_name] = _tensor_metadata(tensor)
     if weight is None:
         metadata["reason"] = "runtime lm_head exists but exposes no weight tensor"
     return metadata
+
+
+def _draft_weight_metadata(model: Any) -> list[dict[str, Any]]:
+    """Distinguish the MTP network's linears from its possibly shared lm_head."""
+    if model is None or not callable(getattr(model, "named_modules", None)):
+        return []
+    result = []
+    for name, module in model.named_modules():
+        weight = getattr(module, "weight", None)
+        if weight is None or len(getattr(weight, "shape", ())) < 2:
+            continue
+        quant_method = getattr(module, "quant_method", None)
+        result.append({
+            "name": name,
+            "module_class": _class_name(module),
+            "weight": _tensor_metadata(weight),
+            "weight_nz": (
+                _tensor_metadata(module.weight_nz) if getattr(module, "weight_nz", None) is not None else None
+            ),
+            "quant_method_class": _class_name(quant_method) if quant_method is not None else None,
+        })
+    return result
 
 
 def _effective_config_metadata(worker: Any, runner: Any) -> dict[str, Any]:
@@ -487,6 +509,7 @@ def _worker_runtime_metadata(worker: Any) -> dict[str, Any]:
         "drafter_class": _class_name(drafter) if drafter is not None else None,
         "target_head": target,
         "mtp_head": mtp,
+        "mtp_weight_modules": _draft_weight_metadata(mtp_model),
         "target_and_mtp_head_same_object": (
             target_model is not None
             and mtp_model is not None
