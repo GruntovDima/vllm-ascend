@@ -1049,6 +1049,14 @@ def rejection_greedy_sample_pytorch(
         output_token_ids[bonus_rows, bonus_cols] = bonus_token_ids[bonus_rows]
 
 
+def _make_rejection_token_indices(cu_start: torch.Tensor, pos_indices: torch.Tensor) -> torch.Tensor:
+    # cu_start is built by prepending zero to the cumulative draft counts.
+    # For one request, avoid a redundant tiny broadcast Add (unsafe on 310P).
+    if cu_start.numel() == 1:
+        return pos_indices
+    return cu_start[:, None] + pos_indices
+
+
 def rejection_random_sample_pytorch(
     output_token_ids,  # [batch_size, max_spec_len + 1]
     cu_num_draft_tokens,  # [batch_size]
@@ -1108,7 +1116,7 @@ def rejection_random_sample_pytorch(
     pos_indices = pos_indices_cpu.to(device, non_blocking=True)[None, :]
 
     valid_mask = pos_indices < num_draft_per_batch[:, None]
-    global_token_indices = cu_start[:, None] + pos_indices
+    global_token_indices = _make_rejection_token_indices(cu_start, pos_indices)
     global_token_indices = global_token_indices.clamp(0, draft_token_ids.shape[0] - 1)
     draft_tokens = draft_token_ids[global_token_indices]  # [batch_size, max_draft_len]
     placeholder_mask = draft_tokens == PLACEHOLDER_TOKEN_ID
@@ -1209,10 +1217,11 @@ def rejection_random_sample_pytorch(
 
     batch_bonus_positions = bonus_positions[:, None]  # [batch_size, 1]
 
-    max_spec_len_cpu = torch.tensor([max_spec_len], pin_memory=True)
-    max_spec_len_device = max_spec_len_cpu.to(device, non_blocking=True)
+    # This bound is static: compute it before H2D, avoiding another tiny Add.
+    max_output_len_cpu = torch.tensor([max_spec_len + 1], pin_memory=True)
+    max_output_len_device = max_output_len_cpu.to(device, non_blocking=True)
 
-    valid_bonus_pos = bonus_positions < (max_spec_len_device + 1)
+    valid_bonus_pos = bonus_positions < max_output_len_device
     final_bonus_mask = should_add_bonus & valid_bonus_pos
 
     bonus_pos_match = all_positions == batch_bonus_positions
@@ -1426,7 +1435,7 @@ def rejection_random_sample_block_verify_pytorch(
     pos_indices_cpu = torch.arange(max_spec_len, pin_memory=True)
     pos_indices = pos_indices_cpu.to(device, non_blocking=True)[None, :]
     valid_mask = pos_indices < num_draft_per_batch
-    global_token_indices = cu_start[:, None] + pos_indices
+    global_token_indices = _make_rejection_token_indices(cu_start, pos_indices)
     global_token_indices = global_token_indices.clamp(0, draft_token_ids.shape[0] - 1)
     draft_tokens = draft_token_ids[global_token_indices]
     placeholder_mask = draft_tokens == PLACEHOLDER_TOKEN_ID
