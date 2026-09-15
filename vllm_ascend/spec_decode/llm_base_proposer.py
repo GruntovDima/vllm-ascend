@@ -1391,6 +1391,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         return {layer_name: attn_metadata for layer_name in self.attn_layer_names}
 
     def compute_draft_token_ids(self, hidden_states: torch.Tensor):
+        if self.method == "dflash" and hasattr(self.model, "compute_pruned_greedy_ids"):
+            return self.model.compute_pruned_greedy_ids(hidden_states)
         if self.method == "dflash" and getattr(self.model, "_ascend_lm_head_pruned", False):
             # The shared head now has compact rows. Restore canonical token IDs
             # through the pruning wrapper before sampling, including reduce-sample.
@@ -1560,6 +1562,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     logits_bias = self.model.markov_bias(markov_emb)
                     logits[:, idx].add_(logits_bias)
                     draft_token_ids[:, idx + 1].copy_(logits[:, idx].argmax(dim=-1))
+            elif self.method == "dflash" and hasattr(self.model, "compute_pruned_greedy_ids"):
+                draft_token_ids = self.model.compute_pruned_greedy_ids(sample_hidden_states)
             else:
                 logits = self.model.compute_logits(sample_hidden_states)
                 if lmhead_tp_enable():

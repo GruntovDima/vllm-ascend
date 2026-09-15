@@ -44,9 +44,18 @@ import torch
 
 from vllm.logger import logger
 
+from vllm_ascend import envs
+from vllm_ascend._310p.compact_greedy import compact_greedy_ids, make_compact_mapping
 from vllm_ascend.utils import maybe_trans_nz
 
 _ENV = "VLLM_LMHEAD_PRUNE_PACK"
+
+
+def _make_compact_greedy(projection, mapping, floor_index):
+    def compute_greedy(hidden_states):
+        return compact_greedy_ids(projection(hidden_states), mapping, floor_index)
+
+    return compute_greedy
 
 
 def _compute_logits_accepts_spec_step_idx(compute_logits: Callable[..., torch.Tensor | None]) -> bool:
@@ -170,6 +179,11 @@ def maybe_prune_lm_head(*models: object) -> None:
             pruned_heads.add(id(lm_head))
         inv_map = inv_map_cpu[:vocab_size].to(dev)
         original_compute_logits = model.compute_logits
+        if envs.VLLM_ASCEND_DFLASH_COMPACT_GREEDY:
+            mapping_cpu, insertion = make_compact_mapping(inv_map_cpu[:vocab_size], pack["weight"].shape[0])
+            model.compute_pruned_greedy_ids = _make_compact_greedy(
+                original_compute_logits, mapping_cpu.to(dev), insertion
+            )
         fn = _make_pruned_compute_logits(
             original_compute_logits,
             inv_map,

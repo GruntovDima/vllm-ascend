@@ -134,6 +134,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Maximum artifact bytes written by one probe. Minimum: 1024.
     # Default: 128 MiB.
     FDO_PROBE_MAX_BYTES_ENV: lambda: os.getenv(FDO_PROBE_MAX_BYTES_ENV, str(128 * 1024 * 1024)),
+    # Opt-in DFlash compact greedy selection; 0/1, default 0, not sensitive.
+    "VLLM_ASCEND_DFLASH_COMPACT_GREEDY": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DFLASH_COMPACT_GREEDY", "0"))
+    ),
 }
 
 # end-env-vars-definition
