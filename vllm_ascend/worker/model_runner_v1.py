@@ -3314,6 +3314,17 @@ class NPUModelRunner(GPUModelRunner):
                     and isinstance(builder, GDNAttentionMetadataBuilder) and attn_metadata_i.num_prefills == 0:
                     if attn_metadata_i.num_decodes == 0 and attn_metadata_i.num_spec_decodes > 0:
                         attn_metadata_i.spec_state_indices_tensor[attn_metadata_i.num_spec_decodes:].fill_(0)
+            host_slot_builder = getattr(builder, "get_prefill_host_state_slot", None)
+            if host_slot_builder is not None:
+                attn_metadata_i.prefill_host_state_slot = None
+                if ascend_envs.VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT:
+                    attn_metadata_i.prefill_host_state_slot = host_slot_builder(
+                        attn_metadata_i,
+                        self.input_batch.block_table[kv_cache_gid].get_cpu_tensor(),
+                        num_reqs=num_reqs, num_reqs_padded=num_reqs_padded,
+                        for_capture=for_cudagraph_capture,
+                        pcp_size=self.pcp_size, dcp_size=self.dcp_size,
+                    )
             if isinstance(builder, AscendDSAMetadataBuilder):
                 prefill_ratio_to_sas_metadata = builder.prefill_ratio_to_sas_metadata  # type: ignore[assignment]
                 decode_ratio_to_sas_metadata = builder.decode_ratio_to_sas_metadata  # type: ignore[assignment]
