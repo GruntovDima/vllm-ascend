@@ -293,34 +293,17 @@ class AscendDflashProposer(AscendEagleProposer):
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
                 self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
 
-    def _run_merged_draft(
-        self,
-        num_input_tokens,
-        batch_size,
-        token_indices_to_sample,
-        target_positions,
-        inputs_embeds,
-        multi_steps_attn_metadata,
-        num_tokens,
-        is_prefill=None,
-    ):
-        if (
+    def skip_query_for_incomplete_prefill(self, batch_size):
+        # Draft attention metadata can describe decode queries during target
+        # prefill. The runner's host discard mask identifies incomplete target
+        # requests; the draft is_prefill flag does not.
+        return (
             self._context_only_prefill
-            and is_prefill
             and batch_size == 1
             and self.runner.input_batch.num_reqs == 1
             and self.runner.num_discarded_requests == 1
             and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
             and not _EXTRA_CTX.capturing
-        ):
-            # Scheduler.update_draft_token_ids discards proposals while the
-            # request is_prefill_chunk. Context K/V must still be committed.
-            self.build_model_inputs_first_pass(num_input_tokens)
-            self.context_only_prefill_count += 1
-            return torch.zeros((1, self.num_speculative_tokens), dtype=torch.int64, device=self.device)
-        return super()._run_merged_draft(
-            num_input_tokens, batch_size, token_indices_to_sample, target_positions,
-            inputs_embeds, multi_steps_attn_metadata, num_tokens, is_prefill=is_prefill,
         )
 
     def build_model_inputs_first_pass(

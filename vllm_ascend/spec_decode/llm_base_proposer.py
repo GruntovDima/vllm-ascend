@@ -1450,6 +1450,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         if self.method == "dflash" or self.method == "dspark":
             model_kwargs = self.build_model_inputs_first_pass(num_input_tokens)
+            if (
+                self.method == "dflash"
+                and getattr(self, "_context_only_prefill", False)
+                and self.skip_query_for_incomplete_prefill(batch_size)
+            ):
+                # Context K/V above executes within the 310P drafting RoPE
+                # scope. Only query/head work is skipped; the scheduler
+                # discards these proposals for the incomplete target request.
+                self.context_only_prefill_count += 1
+                return torch.zeros((1, self.num_speculative_tokens), dtype=torch.int64, device=self.device)
         else:
             model_kwargs = {
                 "input_ids": model_input_ids,
