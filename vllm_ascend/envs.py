@@ -138,6 +138,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DFLASH_COMPACT_GREEDY": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DFLASH_COMPACT_GREEDY", "0"))
     ),
+    # Cache-only drafting for incomplete BS1 prefill; 0/1, default 0, not sensitive.
+    "VLLM_ASCEND_DFLASH_CONTEXT_ONLY_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DFLASH_CONTEXT_ONLY_PREFILL", "0"))
+    ),
 }
 
 # end-env-vars-definition
