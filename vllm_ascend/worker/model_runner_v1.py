@@ -101,6 +101,7 @@ from vllm.v1.worker.ubatch_utils import (
 )
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend._310p.dflash_fdo_numerical_probe import (
     create_rejection_loop_probe,
     create_target_boundary_probe,
@@ -2738,6 +2739,46 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        model_runner_output = ModelRunnerOutput(
+            req_ids=req_ids_output_copy,
+            req_id_to_index=req_id_to_index_output_copy,
+            sampled_token_ids=valid_sampled_token_ids,
+            spec_token_ids=output_spec_token_ids,
+            logprobs=logprobs_lists,
+            prompt_logprobs_dict=prompt_logprobs_dict,
+            kv_connector_output=kv_connector_output,
+            pooler_output=[],
+            ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+            cudagraph_stats=cudagraph_stats,
+            routed_experts=None,
+        )
+        async_output = None
+        if (
+            ascend_envs.VLLM_ASCEND_DFLASH_EARLY_PREFILL_COPY
+            and self.use_async_scheduling
+            and pp.world_size == 1
+            and getattr(self.speculative_config, "method", None) == "dflash"
+            and spec_decode_metadata is None
+            and self.input_batch.num_reqs == 1
+            and self.num_discarded_requests == 0
+            and not self.routed_experts_initialized
+            and sampler_output.sampled_token_ids.shape[-1] == 1
+            and sampler_output.logprobs_tensors is None
+        ):
+            # Enqueue output D2H after sampling, before draft KV/query work.
+            # Use a private snapshot: draft or the next graph must not mutate
+            # the copy stream's source. The output object is not returned until
+            # all usual bookkeeping and draft submission below have completed.
+            async_output = AsyncGPUModelRunnerOutput(
+                model_runner_output=model_runner_output,
+                sampled_token_ids=sampler_output.sampled_token_ids.clone(),
+                logprobs_tensors=None,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+                routed_experts=None,
+            )
+            self.early_prefill_copy_count = getattr(self, "early_prefill_copy_count", 0) + 1
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
                 if not early_pp_padded_drafter:
@@ -2774,19 +2815,7 @@ class NPUModelRunner(GPUModelRunner):
                         for req_id in req_ids_output_copy
                     ]
 
-        model_runner_output = ModelRunnerOutput(
-            req_ids=req_ids_output_copy,
-            req_id_to_index=req_id_to_index_output_copy,
-            sampled_token_ids=valid_sampled_token_ids,
-            spec_token_ids=output_spec_token_ids,
-            logprobs=logprobs_lists,
-            prompt_logprobs_dict=prompt_logprobs_dict,
-            kv_connector_output=kv_connector_output,
-            pooler_output=[],
-            ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
-            cudagraph_stats=cudagraph_stats,
-            routed_experts=None,
-        )
+        model_runner_output.spec_token_ids = output_spec_token_ids
         if self.ascend_config.scheduler_config.profiling_chunk_config.need_timing and hasattr(
             self, "_execution_start_time"
         ):
@@ -2841,15 +2870,16 @@ class NPUModelRunner(GPUModelRunner):
                     :total
                 ].clone(),
             )
-        async_output = AsyncGPUModelRunnerOutput(
-            model_runner_output=model_runner_output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            logprobs_tensors=sampler_output.logprobs_tensors,
-            invalid_req_indices=invalid_req_indices,
-            async_output_copy_stream=self.async_output_copy_stream,
-            vocab_size=self.input_batch.vocab_size,
-            routed_experts=routed_experts_snapshot,
-        )
+        if async_output is None:
+            async_output = AsyncGPUModelRunnerOutput(
+                model_runner_output=model_runner_output,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+                routed_experts=routed_experts_snapshot,
+            )
         self.input_batch.set_async_sampled_token_ids(
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,

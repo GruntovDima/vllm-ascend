@@ -141,6 +141,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Experimental 310P Gemma Q/K prefill routing to existing ADN RMSNorm.
     # Boolean 0/1, default off; non-sensitive. Short decode stays unchanged.
     "VLLM_ASCEND_GEMMA_PREFILL_ADN": lambda: bool(int(os.getenv("VLLM_ASCEND_GEMMA_PREFILL_ADN", "0"))),
+    # BS1 DFlash first-token D2H before drafting. 0/1, default 0, non-sensitive.
+    "VLLM_ASCEND_DFLASH_EARLY_PREFILL_COPY": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DFLASH_EARLY_PREFILL_COPY", "0"))
+    ),
     # Cache-only drafting for incomplete BS1 prefill; 0/1, default 0, not sensitive.
     "VLLM_ASCEND_DFLASH_CONTEXT_ONLY_PREFILL": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DFLASH_CONTEXT_ONLY_PREFILL", "0"))
