@@ -154,6 +154,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DFLASH_CONTEXT_ONLY_PREFILL": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DFLASH_CONTEXT_ONLY_PREFILL", "0"))
     ),
+    # 310P BS1 prefill GDN state commit using a scheduler host slot. Boolean
+    # 0/1, default off, non-sensitive. Decode and graph capture are unchanged.
+    "VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT", "0"))
+    ),
 }
 
 # end-env-vars-definition

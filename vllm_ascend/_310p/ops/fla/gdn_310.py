@@ -27,6 +27,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import chunk_gated_delta_rule_310
 from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
+from vllm_ascend._310p.ops.fla.prefill_state_commit import copy_single_prefill_state
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.utils import enable_sp
@@ -413,7 +414,14 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                 )
 
                 # Init cache
-                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(ssm_state.dtype)
+                state_to_commit = last_recurrent_state.to(ssm_state.dtype)
+                if copy_single_prefill_state(
+                    ssm_state, state_to_commit,
+                    getattr(attn_metadata, "prefill_host_state_slot", None),
+                ):
+                    self.prefill_host_commit_count = getattr(self, "prefill_host_commit_count", 0) + 1
+                else:
+                    ssm_state[non_spec_state_indices_tensor] = state_to_commit
             elif attn_metadata.num_decodes > 0:
                 core_attn_out_non_spec = npu_recurrent_gated_delta_rule_310(
                     q=query_non_spec,

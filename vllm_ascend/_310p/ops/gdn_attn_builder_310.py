@@ -35,6 +35,7 @@ from vllm_ascend._310p.dflash_full_decode_only import (
 from vllm_ascend._310p.ops.fla.cumpute_causal_conv1d_metadata_310 import (
     compute_causal_conv1d_metadata,
 )
+from vllm_ascend._310p.ops.fla.prefill_state_commit import prefill_host_state_slot
 from vllm_ascend.ops.gdn_attn_builder import (
     AscendGDNAttentionBackend,
     AscendGDNAttentionMetadataBuilder,
@@ -61,6 +62,14 @@ class GDNAttentionMetadataBuilder310(AscendGDNAttentionMetadataBuilder):
     """
 
     use_full_cuda_graph: bool
+
+    def get_prefill_host_state_slot(self, metadata, block_table_cpu, **kwargs):
+        return prefill_host_state_slot(
+            metadata, block_table_cpu,
+            cache_mode=self.vllm_config.cache_config.mamba_cache_mode,
+            prefix_caching=self.vllm_config.cache_config.enable_prefix_caching,
+            **kwargs,
+        )
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
