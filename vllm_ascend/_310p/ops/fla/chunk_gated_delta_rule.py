@@ -20,6 +20,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from vllm_ascend import envs
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
 from vllm_ascend.utils import enable_custom_op
 
@@ -300,7 +301,12 @@ def _pad_varlen_to_chunk(
         out_cursor += seq_len
         padded_cu.append(padded_cu[-1] + padded_len)
 
-    if q_parts:
+    if envs.VLLM_ASCEND_GDN_SINGLE_SEQUENCE_PACKING and len(q_parts) == 1:
+        # cat([tensor]) would copy an already assembled sequence a second time.
+        # Native consumers read these tensors; none owns or mutates the inputs.
+        q_padded, k_padded, v_padded = q_parts[0], k_parts[0], v_parts[0]
+        g_padded, beta_padded = g_parts[0], beta_parts[0]
+    elif q_parts:
         q_padded = torch.cat(q_parts, dim=1)
         k_padded = torch.cat(k_parts, dim=1)
         v_padded = torch.cat(v_parts, dim=1)
@@ -529,6 +535,17 @@ def _unpad_chunk_output(
     is_varlen: bool,
 ) -> torch.Tensor:
     if is_varlen:
+        if (
+            envs.VLLM_ASCEND_GDN_SINGLE_SEQUENCE_PACKING
+            and out.shape[0] == 1
+            and seq_ranges == [(0, 0, total_tokens)]
+            and 0 <= total_tokens <= out.shape[1]
+        ):
+            # Output is a fresh per-call allocation, not a cache/workspace.
+            # A single sequence occupies its prefix; retain the owning tensor
+            # through the view instead of allocating and copying it again.
+            unpadded = out[:, :total_tokens]
+            return unpadded[0] if input_was_tnd else unpadded
         unpadded = out.new_empty((1, total_tokens, *out.shape[2:]))
         padded_cursor = 0
         for _, start, end in seq_ranges:
