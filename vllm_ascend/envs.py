@@ -159,6 +159,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT", "0"))
     ),
+    # FP16 H4096 Gemma hidden-state AddRmsNorm for eager prefill only.
+    # 0/1, default off, non-sensitive. Set before startup/torch.compile;
+    # numerical rounding differs from split add + RMSNorm. Graph stays split.
+    "VLLM_ASCEND_GEMMA_PREFILL_ADD_RMS_NORM": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_GEMMA_PREFILL_ADD_RMS_NORM", "0"))
+    ),
 }
 
 # end-env-vars-definition

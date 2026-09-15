@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 import torch_npu
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.layernorm import RMSNormGated
 
 from vllm_ascend import envs
@@ -8,6 +10,25 @@ from vllm_ascend._310p.ops.adn_rms_norm import adn_rms_norm_or_fallback
 from vllm_ascend.ops.layernorm import AscendGemmaRMSNorm, AscendRMSNorm
 
 _GEMMA_ADN_MIN_PREFILL_TOKENS = 128
+_GEMMA_ADD_RMS_MIN_PREFILL_TOKENS = 128
+_GEMMA_ADD_RMS_HIDDEN_SIZE = 4096
+
+
+def use_gemma_prefill_add_rms_norm(x, residual, weight):
+    # Startup-only experimental route. Keep graph/decode and Q/K norms on
+    # their existing paths. The fused normalization is not bitwise identical.
+    return (
+        envs.VLLM_ASCEND_GEMMA_PREFILL_ADD_RMS_NORM
+        and residual is not None
+        and x.dim() == 2
+        and x.shape[0] >= _GEMMA_ADD_RMS_MIN_PREFILL_TOKENS
+        and x.shape[-1] == _GEMMA_ADD_RMS_HIDDEN_SIZE
+        and residual.shape == x.shape
+        and weight.shape == (x.shape[-1],)
+        and x.dtype == residual.dtype == weight.dtype == torch.float16
+        and is_forward_context_available()
+        and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
+    )
 
 
 def gemma_rms_norm_310(x: torch.Tensor, gamma: torch.Tensor, epsilon: float) -> torch.Tensor:
@@ -51,6 +72,11 @@ class AscendGemmaRMSNorm310(AscendGemmaRMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if use_gemma_prefill_add_rms_norm(x, residual, self.weight):
+            x, _, residual = torch_npu.npu_add_rms_norm(
+                x, residual, 1.0 + self.weight, self.variance_epsilon
+            )
+            return x, residual
         if residual is not None:
             orig_dtype = residual.dtype
             x = x + residual.to(x.dtype)
