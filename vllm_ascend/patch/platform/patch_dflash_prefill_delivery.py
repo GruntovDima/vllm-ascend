@@ -76,6 +76,7 @@ def _delivery_stats(self, enabled=None):
     return {
         "enabled": getattr(self, "_dflash_prefill_delivery_enabled", True),
         "count": getattr(self, "_dflash_prefill_delivery_count", 0),
+        "queue_depth": len(self.batch_queue) if self.batch_queue is not None else 0,
         "step_fn_patched": bool(getattr(self.step_fn, "_ascend_dflash_prefill_delivery", False)),
     }
 

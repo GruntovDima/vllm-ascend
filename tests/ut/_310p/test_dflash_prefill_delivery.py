@@ -134,7 +134,7 @@ class PrefillDeliveryTests(unittest.TestCase):
     def test_delivery_utility_reports_binding_and_rejects_inflight_switch(self):
         core = NS(batch_queue=deque(), step_fn=Mock(_ascend_dflash_prefill_delivery=True))
         stats = self.scope["_delivery_stats"]
-        self.assertEqual(stats(core), {"enabled": True, "count": 0, "step_fn_patched": True})
+        self.assertEqual(stats(core), {"enabled": True, "count": 0, "queue_depth": 0, "step_fn_patched": True})
         self.assertFalse(stats(core, False)["enabled"])
         core.batch_queue.append(object())
         with self.assertRaises(RuntimeError):
