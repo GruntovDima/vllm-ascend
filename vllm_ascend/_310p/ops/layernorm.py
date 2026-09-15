@@ -3,8 +3,24 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.model_executor.layers.layernorm import RMSNormGated
 
+from vllm_ascend import envs
 from vllm_ascend._310p.ops.adn_rms_norm import adn_rms_norm_or_fallback
 from vllm_ascend.ops.layernorm import AscendGemmaRMSNorm, AscendRMSNorm
+
+_GEMMA_ADN_MIN_PREFILL_TOKENS = 128
+
+
+def gemma_rms_norm_310(x: torch.Tensor, gamma: torch.Tensor, epsilon: float) -> torch.Tensor:
+    # Q/K Gemma norms have [tokens, heads, head_dim] input. Keep short
+    # decode/verification shapes and hidden-state norms on their original path.
+    if (
+        envs.VLLM_ASCEND_GEMMA_PREFILL_ADN
+        and x.dim() == 3
+        and x.shape[0] >= _GEMMA_ADN_MIN_PREFILL_TOKENS
+        and x.shape[-1] == 256
+    ):
+        return adn_rms_norm_or_fallback(x.contiguous(), gamma, epsilon)
+    return torch_npu.npu_rms_norm(x, gamma, epsilon)[0]
 
 
 class AscendRMSNorm310(AscendRMSNorm):
@@ -39,10 +55,10 @@ class AscendGemmaRMSNorm310(AscendGemmaRMSNorm):
             orig_dtype = residual.dtype
             x = x + residual.to(x.dtype)
             residual = x.to(orig_dtype)
-            x, _ = torch_npu.npu_rms_norm(x, 1.0 + self.weight, self.variance_epsilon)
+            x = gemma_rms_norm_310(x, 1.0 + self.weight, self.variance_epsilon)
             return x, residual
 
-        x, _ = torch_npu.npu_rms_norm(x, 1.0 + self.weight, self.variance_epsilon)
+        x = gemma_rms_norm_310(x, 1.0 + self.weight, self.variance_epsilon)
         return x
 
 
