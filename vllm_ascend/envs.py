@@ -159,6 +159,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT", "0"))
     ),
+    # Skip redundant singleton cat / unpad copies in 310P GDN prefill packing.
+    # 0/1, default off, non-sensitive. Native arithmetic and compute_wy unchanged.
+    "VLLM_ASCEND_GDN_SINGLE_SEQUENCE_PACKING": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_GDN_SINGLE_SEQUENCE_PACKING", "0"))
+    ),
     # FP16 H4096 Gemma hidden-state AddRmsNorm for eager prefill only.
     # 0/1, default off, non-sensitive. Set before startup/torch.compile;
     # numerical rounding differs from split add + RMSNorm. Graph stays split.
