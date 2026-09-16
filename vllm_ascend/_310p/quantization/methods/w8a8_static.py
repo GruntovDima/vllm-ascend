@@ -21,6 +21,7 @@ import torch
 import torch_npu
 
 from vllm_ascend._310p.ops.prefill_mlp_norm_quant import prepare_mlp_norm_quant_params
+from vllm_ascend._310p.ops.static_scalar_quant import prepare_scalar_quant_params, static_quant_params
 from vllm_ascend.utils import maybe_trans_nz
 
 from .qbmm_custom import custom_qbmm_enabled, ensure_registered, qbmm
@@ -52,11 +53,12 @@ class AscendW8A8LinearMethod310(AscendW8A8Linear310pScheme):
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
         if x.dtype != torch.int8:
+            input_scale, input_reciprocal, input_offset = static_quant_params(layer, x)
             x = torch.ops.vllm.quantize(
                 x,
-                layer.aclnn_input_scale,
-                layer.aclnn_input_scale_reciprocal,
-                layer.aclnn_input_offset,
+                input_scale,
+                input_reciprocal,
+                input_offset,
             )
 
         quant_bias = layer.quant_bias if tp_rank == 0 else None
@@ -102,6 +104,7 @@ class AscendW8A8LinearMethod310(AscendW8A8Linear310pScheme):
         ).to(layer.aclnn_input_scale.dtype)
 
         prepare_mlp_norm_quant_params(layer)
+        prepare_scalar_quant_params(layer)
 
         # ---- matmul stage tensor ----
         layer.weight.data = maybe_trans_nz(layer.weight.data).transpose(0, 1)

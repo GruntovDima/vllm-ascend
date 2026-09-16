@@ -170,6 +170,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_GDN_SHARED_INPUT_QUANT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_GDN_SHARED_INPUT_QUANT", "0"))
     ),
+    # Startup-only, non-sensitive bool (0/1), default off: broadcast verified
+    # scalar FP16 static-quant parameters on measured 310P linear widths.
+    "VLLM_ASCEND_STATIC_SCALAR_QUANT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_STATIC_SCALAR_QUANT", "0"))
+    ),
     # Skip redundant singleton cat / unpad copies in 310P GDN prefill packing.
     # 0/1, default off, non-sensitive. Native arithmetic and compute_wy unchanged.
     "VLLM_ASCEND_GDN_SINGLE_SEQUENCE_PACKING": lambda: bool(
