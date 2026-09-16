@@ -37,6 +37,10 @@ def prepare_last_prefill_mlp(model):
         decoder._last_prefill_mlp_backbone = weakref.ref(backbone)
         decoder.last_prefill_mlp_calls = 0
         decoder.last_prefill_mlp_skipped_rows = 0
+        if envs.VLLM_ASCEND_LAST_PREFILL_ATTN_OUTPUT:
+            decoder.self_attn._last_prefill_mlp_backbone = weakref.ref(backbone)
+            decoder.self_attn.last_prefill_attn_output_calls = 0
+            decoder.self_attn.last_prefill_attn_output_skipped_rows = 0
         if envs.VLLM_ASCEND_LAST_PREFILL_NORMS:
             for role, norm in (("post_attention", decoder.post_attention_layernorm), ("final", backbone.norm)):
                 if type(norm).__name__ != "AscendGemmaRMSNorm310":
@@ -97,6 +101,30 @@ def maybe_last_prefill_mlp(decoder, x):
     output = selected_mlp_output(decoder.mlp, x)
     decoder.last_prefill_mlp_calls += 1
     decoder.last_prefill_mlp_skipped_rows += x.shape[0] - 1
+    return output
+
+
+def selected_attention_output(attention, x, gate):
+    """Keep full QKV/attention/cache work; shorten only the pure output tail."""
+    last = x[-1:]
+    if gate is not None:
+        last = last * torch.sigmoid(gate[-1:])
+    last, _ = attention.o_proj(last)
+    output = last.new_zeros((x.shape[0], last.shape[-1]))
+    output[-1:] = last
+    return output
+
+
+def maybe_last_prefill_attention_output(attention, x, gate):
+    if torch.compiler.is_compiling() or not envs.VLLM_ASCEND_LAST_PREFILL_ATTN_OUTPUT:
+        return None
+    if gate is not None and (gate.shape != x.shape or gate.dtype != x.dtype or gate.device != x.device):
+        return None
+    if last_prefill_backbone(attention, x) is None:
+        return None
+    output = selected_attention_output(attention, x, gate)
+    attention.last_prefill_attn_output_calls += 1
+    attention.last_prefill_attn_output_skipped_rows += x.shape[0] - 1
     return output
 
 

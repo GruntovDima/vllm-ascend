@@ -171,6 +171,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LAST_PREFILL_NORMS": lambda: bool(
         int(os.getenv("VLLM_ASCEND_LAST_PREFILL_NORMS", "0"))
     ),
+    # Startup-only last-layer prefill gate/O-projection row selection on 310P.
+    # Requires LAST_PREFILL_MLP=1 and its runtime/consumer guards. Full QKV,
+    # attention and cache construction remain unchanged. Boolean 0/1,
+    # default 0 (experimental, non-sensitive); compiled verification unchanged.
+    "VLLM_ASCEND_LAST_PREFILL_ATTN_OUTPUT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_LAST_PREFILL_ATTN_OUTPUT", "0"))
+    ),
     # Experimental model-side padding for two measured static-W8A8 prefill
     # projection shapes. 0 (default) or 1; non-sensitive. Decode is unchanged.
     "VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING": lambda: bool(
