@@ -31,6 +31,7 @@ except ImportError:
     IntermediateTensors = None
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.utils import is_310p, vllm_version_is
@@ -148,7 +149,16 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
                 hidden_states = hidden_states * (self.attn_layer_scale.to(hidden_states.dtype) + 1)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        fused_norm = None
+        if envs.VLLM_ASCEND_PREFILL_MLP_NORM_QUANT and is_310p():
+            # Keep the lazy 310P-only import outside all default paths.
+            from vllm_ascend._310p.ops.prefill_mlp_norm_quant import maybe_fused_mlp_norm_quant
+
+            fused_norm = maybe_fused_mlp_norm_quant(self, hidden_states, residual)
+        if fused_norm is None:
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        else:
+            hidden_states, residual = fused_norm
         hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:

@@ -154,6 +154,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT", "0"))
     ),
+    # Experimental existing-CANN AddRmsNormQuant before Qwen3.5 W8A8 MLP.
+    # 0/1, default off, non-sensitive, startup-only. Changes rounding in prefill;
+    # graph/decode and attention input normalization retain their original path.
+    "VLLM_ASCEND_PREFILL_MLP_NORM_QUANT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_PREFILL_MLP_NORM_QUANT", "0"))
+    ),
     # Experimental model-side padding for two measured static-W8A8 prefill
     # projection shapes. 0 (default) or 1; non-sensitive. Decode is unchanged.
     "VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING": lambda: bool(

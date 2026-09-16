@@ -20,6 +20,7 @@ from typing import Any
 import torch
 import torch_npu
 
+from vllm_ascend._310p.ops.prefill_mlp_norm_quant import prepare_mlp_norm_quant_params
 from vllm_ascend.utils import maybe_trans_nz
 
 from .qbmm_custom import custom_qbmm_enabled, ensure_registered, qbmm
@@ -99,6 +100,8 @@ class AscendW8A8LinearMethod310(AscendW8A8Linear310pScheme):
             layer.input_offset.data.repeat(expanding_factor),
             requires_grad=False,
         ).to(layer.aclnn_input_scale.dtype)
+
+        prepare_mlp_norm_quant_params(layer)
 
         # ---- matmul stage tensor ----
         layer.weight.data = maybe_trans_nz(layer.weight.data).transpose(0, 1)
