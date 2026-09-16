@@ -45,7 +45,9 @@ def maybe_fused_mlp_norm_quant(decoder, x, residual):
         type(norm).__name__ not in ("GemmaRMSNorm", "AscendGemmaRMSNorm310")
         or type(mlp).__name__ != "Qwen2MoeMLP"
         or getattr(mlp, "expert_gate", None) is not None
-        or type(linear).__name__ != "MergedColumnParallelLinear"
+        or type(linear).__name__ not in ("MergedColumnParallelLinear", "AscendMergedColumnParallelLinear")
+        or getattr(linear, "custom_op", None) is not None
+        or getattr(linear, "tp_size", 1) != 1
         or type(scheme).__name__ != "AscendW8A8LinearMethod310"
         or getattr(norm, "bias", None) is not None
         or getattr(linear, "bias", None) is not None

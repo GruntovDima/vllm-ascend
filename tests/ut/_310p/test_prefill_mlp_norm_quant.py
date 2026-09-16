@@ -59,6 +59,16 @@ class PrefillMlpNormQuantTests(unittest.TestCase):
         self.assertIs(args[4], self.linear._prefill_norm_quant_offset)
         self.assertEqual(kwargs, {"epsilon": 1e-6, "div_mode": False})
 
+    def test_ascend_linear_wrapper_without_custom_parallel_op(self):
+        linear = named("AscendMergedColumnParallelLinear", **vars(self.linear), tp_size=1, custom_op=None)
+        self.mlp.gate_up_proj = linear
+        self.assertEqual(self.call(), ("int8", "residual"))
+        linear.custom_op = object()
+        self.assertIsNone(self.call())
+        linear.custom_op = None
+        linear.tp_size = 2
+        self.assertIsNone(self.call())
+
     def test_decode_graph_and_configuration_guards(self):
         for target, field, value in (
             (self.env, "VLLM_ASCEND_PREFILL_MLP_NORM_QUANT", False),
