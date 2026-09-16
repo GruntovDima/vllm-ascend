@@ -154,6 +154,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT", "0"))
     ),
+    # Experimental model-side padding for two measured static-W8A8 prefill
+    # projection shapes. 0 (default) or 1; non-sensitive. Decode is unchanged.
+    "VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING", "0"))
+    ),
     # Skip redundant singleton cat / unpad copies in 310P GDN prefill packing.
     # 0/1, default off, non-sensitive. Native arithmetic and compute_wy unchanged.
     "VLLM_ASCEND_GDN_SINGLE_SEQUENCE_PACKING": lambda: bool(
