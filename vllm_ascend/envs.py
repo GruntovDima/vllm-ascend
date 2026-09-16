@@ -108,6 +108,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT", "0"))
     ),
+    # Shared GDN input quantization; startup-only 0/1, default off, non-sensitive.
+    "VLLM_ASCEND_GDN_SHARED_INPUT_QUANT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_GDN_SHARED_INPUT_QUANT", "0"))
+    ),
     # Optional GDN_SINGLE_SEQUENCE_PACKING; 0/1, default off, non-sensitive.
     "VLLM_ASCEND_GDN_SINGLE_SEQUENCE_PACKING": lambda: bool(
         int(os.getenv("VLLM_ASCEND_GDN_SINGLE_SEQUENCE_PACKING", "0"))
