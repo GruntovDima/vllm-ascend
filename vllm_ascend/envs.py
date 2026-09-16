@@ -165,6 +165,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING": lambda: bool(
         int(os.getenv("VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING", "0"))
     ),
+    # Startup-only, non-sensitive bool (0/1), default off: share the input
+    # quantization of matched static-W8A8 Qwen3.5 GDN projections on 310P/TP1.
+    "VLLM_ASCEND_GDN_SHARED_INPUT_QUANT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_GDN_SHARED_INPUT_QUANT", "0"))
+    ),
     # Skip redundant singleton cat / unpad copies in 310P GDN prefill packing.
     # 0/1, default off, non-sensitive. Native arithmetic and compute_wy unchanged.
     "VLLM_ASCEND_GDN_SINGLE_SEQUENCE_PACKING": lambda: bool(

@@ -15,6 +15,9 @@ from vllm.model_executor.model_loader import base_loader, utils
 from vllm.model_executor.model_loader.reload import set_torchao_reload_attrs
 from vllm.model_executor.model_loader.utils import device_loading_context
 
+from vllm_ascend import envs
+from vllm_ascend.utils import is_310p
+
 
 def _is_dsa_attention(module: nn.Module) -> bool:
     module_cls = type(module)
@@ -34,6 +37,11 @@ def ascend_process_weights_after_loading(
             # parameters onto device for processing and back off after.
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
+
+    if is_310p() and envs.VLLM_ASCEND_GDN_SHARED_INPUT_QUANT:
+        from vllm_ascend.patch.worker.patch_gdn_shared_quant_310p import prepare_shared_gdn_quant
+
+        prepare_shared_gdn_quant(model)
 
     # Initialize post-load attention weights for Attention, MLA, and MM encoder.
     # NOTE: Happens after other modules so we can easily decompress weights.
