@@ -145,11 +145,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DFLASH_EARLY_PREFILL_COPY": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DFLASH_EARLY_PREFILL_COPY", "0"))
     ),
-    # BS1 DFlash final-prefill queue delivery priority. 0/1, default 0,
-    # non-sensitive. Read at engine import; normal decode overlap is retained.
-    "VLLM_ASCEND_DFLASH_PREFILL_DELIVERY": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DFLASH_PREFILL_DELIVERY", "0"))
-    ),
     # Cache-only drafting for incomplete BS1 prefill; 0/1, default 0, not sensitive.
     "VLLM_ASCEND_DFLASH_CONTEXT_ONLY_PREFILL": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DFLASH_CONTEXT_ONLY_PREFILL", "0"))
