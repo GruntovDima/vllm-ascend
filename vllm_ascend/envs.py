@@ -165,6 +165,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LAST_PREFILL_MLP": lambda: bool(
         int(os.getenv("VLLM_ASCEND_LAST_PREFILL_MLP", "0"))
     ),
+    # Startup-only experimental extension of LAST_PREFILL_MLP: select one row
+    # in its post-attention and final Gemma norms. Requires LAST_PREFILL_MLP=1.
+    # 0/1, default off, non-sensitive; preserves original split arithmetic.
+    "VLLM_ASCEND_LAST_PREFILL_NORMS": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_LAST_PREFILL_NORMS", "0"))
+    ),
     # Experimental model-side padding for two measured static-W8A8 prefill
     # projection shapes. 0 (default) or 1; non-sensitive. Decode is unchanged.
     "VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING": lambda: bool(

@@ -6,6 +6,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.layers.layernorm import RMSNormGated
 
 from vllm_ascend import envs
+from vllm_ascend._310p.ops.last_prefill_mlp import maybe_last_prefill_norm
 from vllm_ascend._310p.ops.adn_rms_norm import adn_rms_norm_or_fallback
 from vllm_ascend.ops.layernorm import AscendGemmaRMSNorm, AscendRMSNorm
 
@@ -66,26 +67,32 @@ class AscendRMSNorm310(AscendRMSNorm):
         return x
 
 
+def gemma_residual_rms_norm_310(x, residual, weight, epsilon):
+    """The original split arithmetic, shared by full-row and selected-row paths."""
+    if residual is not None:
+        orig_dtype = residual.dtype
+        x = x + residual.to(x.dtype)
+        residual = x.to(orig_dtype)
+        x = gemma_rms_norm_310(x, 1.0 + weight, epsilon)
+        return x, residual
+    return gemma_rms_norm_310(x, 1.0 + weight, epsilon)
+
+
 class AscendGemmaRMSNorm310(AscendGemmaRMSNorm):
     def forward_oot(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        selected = maybe_last_prefill_norm(self, gemma_residual_rms_norm_310, x, residual)
+        if selected is not None:
+            return selected
         if use_gemma_prefill_add_rms_norm(x, residual, self.weight):
             x, _, residual = torch_npu.npu_add_rms_norm(
                 x, residual, 1.0 + self.weight, self.variance_epsilon
             )
             return x, residual
-        if residual is not None:
-            orig_dtype = residual.dtype
-            x = x + residual.to(x.dtype)
-            residual = x.to(orig_dtype)
-            x = gemma_rms_norm_310(x, 1.0 + self.weight, self.variance_epsilon)
-            return x, residual
-
-        x = gemma_rms_norm_310(x, 1.0 + self.weight, self.variance_epsilon)
-        return x
+        return gemma_residual_rms_norm_310(x, residual, self.weight, self.variance_epsilon)
 
 
 class AscendRMSNormGated310(RMSNormGated):

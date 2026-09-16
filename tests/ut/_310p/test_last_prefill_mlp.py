@@ -15,6 +15,7 @@ exec(compile(ast.Module(body=[n for n in TREE.body if isinstance(n, (ast.Functio
                         type_ignores=[]), str(SOURCE), "exec"), NAMESPACE)
 eligible = NAMESPACE["last_prefill_mlp_eligible"]
 selected = NAMESPACE["selected_mlp_output"]
+selected_norm = NAMESPACE["selected_norm_output"]
 
 
 def context(**kwargs):
@@ -56,6 +57,32 @@ class LastPrefillMLPTests(unittest.TestCase):
             self.assertEqual(torch.count_nonzero(output[:-1]), 0)
             self.assertTrue(torch.equal(x, before))
             self.assertNotEqual(x.data_ptr(), output.data_ptr())
+
+    def test_selected_norm_residual_and_poisoned_unused_rows(self):
+        norm = SimpleNamespace(weight=torch.ones(8), variance_epsilon=1e-6)
+        for rows in (782, 1266):
+            x = torch.full((rows, 8), float("nan"))
+            residual = torch.full_like(x, float("inf"))
+            x[-1] = torch.arange(8)
+            residual[-1] = torch.arange(8) * 2
+            calls = []
+
+            def norm_fn(value, residual, weight, eps):
+                calls.append(value.shape)
+                summed = value + residual
+                return summed * torch.rsqrt(summed.square().mean(-1, keepdim=True) + eps) * weight, summed
+
+            output, summed = selected_norm(norm, norm_fn, x, residual)
+            self.assertEqual(calls, [torch.Size((1, 8))])
+            expected, expected_sum = norm_fn(x[-1:], residual[-1:], norm.weight, norm.variance_epsilon)
+            self.assertTrue(torch.equal(output[-1:], expected))
+            self.assertTrue(torch.equal(summed[-1:], expected_sum))
+            self.assertEqual(torch.count_nonzero(output[:-1]), 0)
+            self.assertEqual(torch.count_nonzero(summed[:-1]), 0)
+            self.assertTrue(torch.isnan(x[:-1]).all())
+            self.assertTrue(torch.isinf(residual[:-1]).all())
+            self.assertTrue(torch.equal(x[-1], torch.arange(8)))
+            self.assertTrue(torch.equal(residual[-1], torch.arange(8) * 2))
 
 
 if __name__ == "__main__":
