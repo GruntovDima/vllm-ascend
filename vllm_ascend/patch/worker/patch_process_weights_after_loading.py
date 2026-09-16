@@ -43,6 +43,11 @@ def ascend_process_weights_after_loading(
 
         prepare_shared_gdn_quant(model)
 
+    if is_310p() and envs.VLLM_ASCEND_LAST_PREFILL_MLP:
+        from vllm_ascend._310p.ops.last_prefill_mlp import prepare_last_prefill_mlp
+
+        prepare_last_prefill_mlp(model)
+
     # Initialize post-load attention weights for Attention, MLA, and MM encoder.
     # NOTE: Happens after other modules so we can easily decompress weights.
     for _, module in model.named_modules():

@@ -160,6 +160,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_PREFILL_MLP_NORM_QUANT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_PREFILL_MLP_NORM_QUANT", "0"))
     ),
+    # Experimental Qwen3.5 last-layer MLP row selection for BS1 DFlash FDO
+    # prefill. 0/1, default off, startup-only, non-sensitive. Decode unchanged.
+    "VLLM_ASCEND_LAST_PREFILL_MLP": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_LAST_PREFILL_MLP", "0"))
+    ),
     # Experimental model-side padding for two measured static-W8A8 prefill
     # projection shapes. 0 (default) or 1; non-sensitive. Decode is unchanged.
     "VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING": lambda: bool(

@@ -9,6 +9,7 @@ import torch
 from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
 
 from vllm_ascend import envs
+from vllm_ascend._310p.ops.last_prefill_mlp import maybe_last_prefill_mlp
 from vllm_ascend._310p.ops.prefill_mlp_norm_quant import maybe_fused_mlp_norm_quant
 from vllm_ascend.utils import vllm_version_is
 
@@ -40,7 +41,8 @@ def mlp_norm_quant_decoder_forward(self, hidden_states, residual, positions=None
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
     else:
         hidden_states, residual = fused_norm
-    hidden_states = self.mlp(hidden_states)
+    selected_output = maybe_last_prefill_mlp(self, hidden_states)
+    hidden_states = self.mlp(hidden_states) if selected_output is None else selected_output
 
     if self.layer_scale:
         if len(hidden_states.shape) == 2:
@@ -53,7 +55,7 @@ def mlp_norm_quant_decoder_forward(self, hidden_states, residual, positions=None
     return hidden_states, residual
 
 
-if envs.VLLM_ASCEND_PREFILL_MLP_NORM_QUANT:
+if envs.VLLM_ASCEND_PREFILL_MLP_NORM_QUANT or envs.VLLM_ASCEND_LAST_PREFILL_MLP:
     if not vllm_version_is("0.24.0"):
         raise RuntimeError("Prefill MLP norm-quant integration is verified only with the vLLM 0.24 forward API")
     Qwen3_5DecoderLayer.forward = mlp_norm_quant_decoder_forward
