@@ -104,6 +104,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Opt-in measured QBM prefill row padding; 0/1, default off, non-sensitive.
+    "VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING", "0"))
+    ),
 }
 
 # end-env-vars-definition

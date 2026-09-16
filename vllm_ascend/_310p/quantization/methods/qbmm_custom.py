@@ -44,6 +44,8 @@ import torch_npu
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend import envs
+
 _ENV = "VLLM_CUSTOM_QBMM"
 
 # The custom kernel's tiling is validated for the model's projection shapes
@@ -51,6 +53,28 @@ _ENV = "VLLM_CUSTOM_QBMM"
 # past this bound fall back to the builtin inside the opaque op, where the
 # branch is invisible to dynamo.
 _MAX_DIM = 32768
+# (logical M, K, N, padded M), from the row-padding checkpoint screen.
+_PREFILL_PADDING_TARGETS = ((782, 4096, 24576, 800), (782, 4096, 12288, 832))
+
+
+def _prefill_padded_rows(x: torch.Tensor, weight_t: torch.Tensor, pertoken_scale: torch.Tensor | None) -> int:
+    # Model-side padding only: unchanged native kernel and unchanged scheduler
+    # chunks. These two measured static-W8A8 shapes benefit; blanket alignment
+    # regresses other projections. Never pad decode or dynamic quantization.
+    if (
+        not envs.VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING
+        or x.ndim != 2
+        or x.dtype != torch.int8
+        or not x.is_contiguous()
+        or weight_t.ndim != 2
+        or weight_t.shape[0] != x.shape[1]
+        or pertoken_scale is not None
+    ):
+        return 0
+    for rows, k, n, padded in _PREFILL_PADDING_TARGETS:
+        if (x.shape[0], x.shape[1], weight_t.shape[1]) == (rows, k, n):
+            return padded
+    return 0
 
 
 def _kernel_supports(weight_t: torch.Tensor) -> bool:
@@ -80,7 +104,13 @@ def _qbmm_v3x(
             bias=bias,
             output_dtype=torch.float16,
         )
-    return torch.ops._C_ascend.quant_batch_matmul_v3_x(
+    padded_rows = _prefill_padded_rows(x, weight_t, pertoken_scale)
+    original_rows = x.shape[0]
+    if padded_rows:
+        padded_x = x.new_zeros((padded_rows, x.shape[1]))
+        padded_x[:original_rows].copy_(x)
+        x = padded_x
+    out = torch.ops._C_ascend.quant_batch_matmul_v3_x(
         x,
         weight_t.transpose(0, 1),
         scale,
@@ -88,6 +118,7 @@ def _qbmm_v3x(
         bias=bias,
         transpose_x2=True,
     )
+    return out[:original_rows] if padded_rows else out
 
 
 def _qbmm_v3x_fake(
