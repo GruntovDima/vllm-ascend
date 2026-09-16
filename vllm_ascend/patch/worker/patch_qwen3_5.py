@@ -149,16 +149,7 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
                 hidden_states = hidden_states * (self.attn_layer_scale.to(hidden_states.dtype) + 1)
 
         # Fully Connected
-        fused_norm = None
-        if envs.VLLM_ASCEND_PREFILL_MLP_NORM_QUANT and is_310p():
-            # Keep the lazy 310P-only import outside all default paths.
-            from vllm_ascend._310p.ops.prefill_mlp_norm_quant import maybe_fused_mlp_norm_quant
-
-            fused_norm = maybe_fused_mlp_norm_quant(self, hidden_states, residual)
-        if fused_norm is None:
-            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        else:
-            hidden_states, residual = fused_norm
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
