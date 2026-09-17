@@ -47,6 +47,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm_ascend import envs
 
 _ENV = "VLLM_CUSTOM_QBMM"
+_ENABLE_K_PIPELINE = envs.VLLM_ASCEND_QBMM_K_PIPELINE
 
 # The custom kernel's tiling is validated for the model's projection shapes
 # (K/N up to 24576); the 248k-row vocab head fails tiling (ret -1). Shapes
@@ -117,6 +118,7 @@ def _qbmm_v3x(
         pertoken_scale=pertoken_scale,
         bias=bias,
         transpose_x2=True,
+        enable_k_pipeline=_ENABLE_K_PIPELINE,
     )
     return out[:original_rows] if padded_rows else out
 

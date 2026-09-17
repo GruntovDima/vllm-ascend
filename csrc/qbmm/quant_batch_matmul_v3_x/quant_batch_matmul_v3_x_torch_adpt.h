@@ -26,7 +26,8 @@ at::Tensor quant_batch_matmul_v3_x(
     const c10::optional<at::Tensor> &bias,
     bool transpose_x1,
     bool transpose_x2,
-    int64_t group_size)
+    int64_t group_size,
+    bool enable_k_pipeline)
 {
     TORCH_CHECK(x1.dim() >= 2 && x2.dim() >= 2,
                 "quant_batch_matmul_v3_x: x1 and x2 must have rank >= 2");
@@ -55,6 +56,7 @@ at::Tensor quant_batch_matmul_v3_x(
                  transpose_x1,
                  transpose_x2,
                  group_size,
+                 enable_k_pipeline,
                  out);
     return out;
 }

@@ -183,6 +183,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING": lambda: bool(
         int(os.getenv("VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING", "0"))
     ),
+    # Experimental 310P QBMM single-K-pass weight prefetch overlap. Boolean
+    # 0/1, default off, non-sensitive. The native tiler additionally limits
+    # this to static encoded-scale, no-per-token, multi-pass configurations.
+    "VLLM_ASCEND_QBMM_K_PIPELINE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_QBMM_K_PIPELINE", "0"))
+    ),
     # Startup-only, non-sensitive bool (0/1), default off: share the input
     # quantization of matched static-W8A8 Qwen3.5 GDN projections on 310P/TP1.
     "VLLM_ASCEND_GDN_SHARED_INPUT_QUANT": lambda: bool(

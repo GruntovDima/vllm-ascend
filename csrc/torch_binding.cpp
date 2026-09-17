@@ -2372,7 +2372,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                       Tensor? bias=None, "
         "                       bool transpose_x1=False, "
         "                       bool transpose_x2=False, "
-        "                       int group_size=0) -> Tensor");
+        "                       int group_size=0, "
+        "                       bool enable_k_pipeline=False) -> Tensor");
     ops.impl("quant_batch_matmul_v3_x", torch::kPrivateUse1, &vllm_ascend::quant_batch_matmul_v3_x);
 }
 #else

@@ -87,6 +87,7 @@ def quant_batch_matmul_v3_x_meta(
     transpose_x1: bool = False,
     transpose_x2: bool = False,
     group_size: int = 0,
+    enable_k_pipeline: bool = False,
 ) -> torch.Tensor:
     m = x1.size(-1) if transpose_x1 else x1.size(-2)
     n = x2.size(-2) if transpose_x2 else x2.size(-1)

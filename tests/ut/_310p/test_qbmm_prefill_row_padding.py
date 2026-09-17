@@ -16,8 +16,16 @@ class RowPaddingTests(unittest.TestCase):
         tree = ast.parse(source.read_text())
         nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
         self.assertEqual(len(nodes), len(names))
-        self.env = SimpleNamespace(VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING=True)
-        self.scope = {"torch": torch, "envs": self.env, "_MAX_DIM": 32768}
+        self.env = SimpleNamespace(
+            VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING=True,
+            VLLM_ASCEND_QBMM_K_PIPELINE=False,
+        )
+        self.scope = {
+            "torch": torch,
+            "envs": self.env,
+            "_MAX_DIM": 32768,
+            "_ENABLE_K_PIPELINE": False,
+        }
         self.scope["_PREFILL_PADDING_TARGETS"] = next(
             ast.literal_eval(n.value) for n in tree.body
             if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_PREFILL_PADDING_TARGETS"
@@ -59,6 +67,7 @@ class RowPaddingTests(unittest.TestCase):
                 self.assertIs(passed_scale, scale)
                 self.assertIs(kwargs["bias"], bias)
                 self.assertTrue(kwargs["transpose_x2"])
+                self.assertEqual(kwargs["enable_k_pipeline"], False)
                 return torch.ones((expected_rows, 24576), dtype=torch.float16)
             op = Mock(side_effect=native)
             # Mock only the native namespace, retaining real torch tensors.
