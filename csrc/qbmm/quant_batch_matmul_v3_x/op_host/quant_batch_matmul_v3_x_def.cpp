@@ -82,6 +82,7 @@ public:
         this->Attr("transpose_x1").AttrType(OPTIONAL).Bool(false);
         this->Attr("transpose_x2").AttrType(OPTIONAL).Bool(false);
         this->Attr("group_size").AttrType(OPTIONAL).Int(0);
+        this->Attr("enable_k_pipeline").AttrType(OPTIONAL).Bool(false);
 
         OpAICoreConfig config_310p;
         config_310p.Input("x1").ParamType(REQUIRED)

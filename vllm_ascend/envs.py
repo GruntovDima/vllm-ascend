@@ -108,6 +108,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING": lambda: bool(
         int(os.getenv("VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING", "0"))
     ),
+    # Optional QBMM_K_PIPELINE; 0/1, default off, non-sensitive.
+    "VLLM_ASCEND_QBMM_K_PIPELINE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_QBMM_K_PIPELINE", "0"))
+    ),
 }
 
 # end-env-vars-definition

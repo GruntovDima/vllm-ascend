@@ -17,20 +17,24 @@
  * cores. Picker prefers smaller baseN when a larger choice leaves
  * cores idle, then refines with the cycle cost model.
  */
-#include "quant_batch_matmul_v3_x_tiling.h"
-
 #include <algorithm>
 #include <vector>
+#ifndef QBM_HOST_PICKER_TEST
+#include "quant_batch_matmul_v3_x_tiling.h"
 #include "register/op_impl_registry.h"
 #include "../op_kernel/quant_batch_matmul_v3_x_tiling_key.h"
+#endif
 #include "../op_kernel/quant_batch_matmul_v3_x_config.h"
 #include "tiling_cost_model.h"
+#include "qbmm_k_pipeline_policy.h"
 
+#ifndef QBM_HOST_PICKER_TEST
 #ifndef ASCENDC_EXTERN_C
 #define ASCENDC_EXTERN_C extern "C"
 #endif
 
 using namespace ge;
+#endif
 
 namespace optiling {
 
@@ -128,7 +132,7 @@ static Int8TilingResult ComputeInt8Tiling(
 
     std::vector<uint32_t> kbCands;
     BuildKbCandidates(Kq, kbCands);
-    if (kbCands.empty()) return {0, 0, 0, 0};
+    if (kbCands.empty()) return {0, 0, 0, 0, 0};
 
     // L0 ping/pong: each L0 buffer holds two K-passes, so per-pass budget
     // is half the physical L0 size. Halved here; kernel alternates offsets.
@@ -508,6 +512,7 @@ static void BuildKbCandidates(uint32_t K, std::vector<uint32_t> &out)
     out.erase(std::unique(out.begin(), out.end()), out.end());
 }
 
+#ifndef QBM_HOST_PICKER_TEST
 ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     if (context == nullptr) return ge::GRAPH_FAILED;
 
@@ -548,10 +553,13 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
 
     // Get transpose_x2 attr (index 2 in attr list)
     bool transposeX2 = false;
+    bool requestKPipeline = false;
     auto attrs = context->GetAttrs();
     if (attrs != nullptr) {
         auto tx2 = attrs->GetAttrPointer<bool>(2);
         if (tx2 != nullptr) transposeX2 = *tx2;
+        auto kPipeline = attrs->GetAttrPointer<bool>(4);
+        if (kPipeline != nullptr) requestKPipeline = *kPipeline;
     }
 
     // Get N from x2 (FRACTAL_NZ or ND, respecting transpose_x2)
@@ -793,6 +801,19 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     // single-shot Phase D drain over the full mAligned range.
     tilingData.set_ubCalcM(0U);
 
+    // Default-off, deliberately narrow specialization. This changes only
+    // the enqueue point for the already-existing next-weight prefetch; it
+    // does not alter tile sizes, core ownership, arithmetic, or buffers.
+    // Static W8A8 uses encoded INT64/UINT64 scale, no per-token scale, and
+    // Q == 1. The one-pass L1 chunk is the only baseline case whose next
+    // weight DMA is currently deferred until after the MMAD loop.
+    const uint32_t kPasses =
+        (K_padded + baseK - 1U) / baseK;
+    const uint32_t enableKPipeline = SelectQbmKPipeline(
+        requestKPipeline, quantGroupNum, scaleType, isPerTensor,
+        hasPertoken, kTail, N, t.wChunkKPasses, kPasses);
+    tilingData.set_enableKPipeline(enableKPipeline);
+
     context->SetBlockDim(usedCoreNum);
 
     // 310P uses BASIC + NOT_PERTOKEN: unified vector dequant for all paths.
@@ -822,5 +843,6 @@ ASCENDC_EXTERN_C ge::graphStatus TilingPrepareForQBM(gert::TilingParseContext* c
 IMPL_OP_OPTILING(QuantBatchMatmulV3X)
 .Tiling(TilingQBM)
 .TilingParse<QBMCompileInfo>(TilingPrepareForQBM);
+#endif
 
 }  // namespace optiling

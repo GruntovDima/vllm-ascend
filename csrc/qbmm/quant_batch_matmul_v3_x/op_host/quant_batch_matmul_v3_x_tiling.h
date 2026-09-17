@@ -65,6 +65,9 @@ TILING_DATA_FIELD_DEF(uint32_t, kTail);            // K % 32; non-zero requires 
 //                                partial VDEQ16 does not race with the
 //                                still-in-flight MTE3 CopyOut.
 TILING_DATA_FIELD_DEF(uint32_t, ubCalcM);
+// Opt-in specialization: with one K-pass per weight-L1 buffer, enqueue the
+// next buffer's MTE2 before the current MMAD. Zero preserves old ordering.
+TILING_DATA_FIELD_DEF(uint32_t, enableKPipeline);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(QuantBatchMatmulV3X, QBMTilingData)

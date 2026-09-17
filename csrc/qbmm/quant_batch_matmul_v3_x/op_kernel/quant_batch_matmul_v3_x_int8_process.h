@@ -557,9 +557,14 @@ __aicore__ inline void QBMInt8Compute<SCALE_TYPE>::Process()
 
                         // Pre-loop next-chunk MTE2 (overlaps with Cube/MTE1).
                         // Order: next chunk -> next ch -> next cb. Only when
-                        // wChunkKPasses_ > 1; post-loop emit covers the rest.
+                        // wChunkKPasses_ > 1 in the established path. The
+                        // guarded experiment extends this enqueue point to
+                        // wChunkKPasses_ == 1: ping/pong keeps the destination
+                        // disjoint from curWL1, so the next weight MTE2 can run
+                        // while this pass's L0 loads and MMAD consume current
+                        // data. The old post-loop ordering remains the fallback.
                         bool nxPrefetchFired = false;
-                        if (wChunkKPasses_ > 1) {
+                        if (wChunkKPasses_ > 1 || enableKPipeline_) {
                             uint32_t nxChunkStartKpPre = chunkStartKp + chunkKps;
                             bool hasNextPre = false;
                             uint32_t nxChPre = 0, nxCbPre = 0;

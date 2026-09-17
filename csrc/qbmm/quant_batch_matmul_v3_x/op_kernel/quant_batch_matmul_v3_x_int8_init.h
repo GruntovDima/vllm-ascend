@@ -106,6 +106,11 @@ __aicore__ inline void QBMInt8Compute<SCALE_TYPE>::Init(
         // dequantizes (bias + X@W) * scale in one fp16 truncation.
         hasBias_ = p->hasBias;
 
+        // The host has already applied all specialization guards. Keeping
+        // this as tiling data (rather than a device-side shape heuristic)
+        // makes the default and fallback paths explicit and deterministic.
+        enableKPipeline_ = p->enableKPipeline;
+
         // Inner-tile Phase D: rows per mu slice in the cb-loop tail (0 = disabled).
         ubCalcM_ = p->ubCalcM;
 
