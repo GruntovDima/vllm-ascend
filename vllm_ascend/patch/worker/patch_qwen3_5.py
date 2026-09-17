@@ -32,7 +32,6 @@ except ImportError:
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
 from vllm_ascend import envs
-from vllm_ascend._310p.ops.last_prefill_mlp import maybe_last_prefill_attention_output
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.utils import is_310p, vllm_version_is
@@ -81,15 +80,6 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
             q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
-
-        selected_output = maybe_last_prefill_attention_output(
-            self, attn_output, gate if self.attn_output_gate else None
-        )
-        if selected_output is not None:
-            if vllm_version_is("0.24.0"):
-                output[:] = selected_output
-                return
-            return selected_output
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)

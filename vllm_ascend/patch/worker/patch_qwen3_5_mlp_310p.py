@@ -7,9 +7,13 @@ Qwen3NextDecoderLayer.forward in the supported vLLM 0.24 checkout.
 
 import torch
 from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
+from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
 from vllm_ascend import envs
-from vllm_ascend._310p.ops.last_prefill_mlp import maybe_last_prefill_mlp
+from vllm_ascend._310p.ops.last_prefill_mlp import (
+    maybe_last_prefill_attention_output,
+    maybe_last_prefill_mlp,
+)
 from vllm_ascend._310p.ops.prefill_mlp_norm_quant import maybe_fused_mlp_norm_quant
 from vllm_ascend.utils import vllm_version_is
 
@@ -55,7 +59,27 @@ def mlp_norm_quant_decoder_forward(self, hidden_states, residual, positions=None
     return hidden_states, residual
 
 
+def last_prefill_attention_forward(self, positions, output, hidden_states):
+    """Upstream v0.24 attention forward with an opt-in output-tail dispatch."""
+    qkv, _ = self.qkv_proj(hidden_states)
+    q, k, v, gate = self._project_qkv_gate(qkv, positions)
+    attn_output = self.attn(q, k, v)
+    selected_output = maybe_last_prefill_attention_output(self, attn_output, gate)
+    if selected_output is None:
+        if gate is not None:
+            attn_output = attn_output * torch.sigmoid(gate)
+        selected_output, _ = self.o_proj(attn_output)
+    output[:] = selected_output
+
+
 if envs.VLLM_ASCEND_PREFILL_MLP_NORM_QUANT or envs.VLLM_ASCEND_LAST_PREFILL_MLP:
     if not vllm_version_is("0.24.0"):
         raise RuntimeError("Prefill MLP norm-quant integration is verified only with the vLLM 0.24 forward API")
     Qwen3_5DecoderLayer.forward = mlp_norm_quant_decoder_forward
+
+if envs.VLLM_ASCEND_LAST_PREFILL_ATTN_OUTPUT:
+    if not envs.VLLM_ASCEND_LAST_PREFILL_MLP:
+        raise RuntimeError("Selected prefill attention output requires VLLM_ASCEND_LAST_PREFILL_MLP=1")
+    if not vllm_version_is("0.24.0"):
+        raise RuntimeError("Prefill attention output selection is verified only with the vLLM 0.24 forward API")
+    Qwen3NextAttention.forward = last_prefill_attention_forward
