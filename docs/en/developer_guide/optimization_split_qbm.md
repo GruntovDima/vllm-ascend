@@ -50,6 +50,8 @@ Existing original tiling and the K-pipeline guard are intentionally retained.
 - 19 dependency-light Python CPU/contract tests pass.
 - Both C++ CPU tests pass: K-pipeline policy and production-picker reachability.
 - Python source syntax and diff whitespace checks pass.
+- The repository `format.sh ci` check was attempted but could not run because
+  `pre-commit` is not installed. No full-lint pass is claimed.
 - Registration tests are preserved, but require the plugin test environment;
   local vLLM/torch_npu/pytest dependencies are unavailable.
 - No new CANN build, NPU execution, sanitizer run or end-to-end benchmark was
