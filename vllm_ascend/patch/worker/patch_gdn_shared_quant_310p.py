@@ -1,4 +1,4 @@
-"""Share identical static input quantization for the two 310P GDN projections.
+"""Share identical static input quantization for compatible 310P GDN projections.
 
 Only loaded, equal quantization parameters authorize sharing. There is no
 activation cache, and the original hidden-state dtype remains available to
@@ -14,15 +14,14 @@ from vllm_ascend import envs
 from vllm_ascend.utils import vllm_version_is
 
 _ORIGINAL_FORWARD_CUDA = QwenGatedDeltaNetAttention.forward_cuda
-_INPUT_WIDTH = 4096
 _QUANT_FIELDS = ("aclnn_input_scale", "aclnn_input_scale_reciprocal", "aclnn_input_offset")
 
 
 def _projection_is_supported(linear):
     scheme = getattr(getattr(linear, "quant_method", None), "quant_method", None)
     return (
-        type(linear).__name__ in ("MergedColumnParallelLinear", "AscendMergedColumnParallelLinear")
-        and type(scheme).__name__ == "AscendW8A8LinearMethod310"
+        linear is not None
+        and getattr(scheme, "accepts_prequantized_input", False)
         and getattr(linear, "custom_op", None) is None
         and getattr(linear, "tp_size", None) == 1
         and getattr(linear, "bias", None) is None
@@ -42,10 +41,13 @@ def prepare_shared_gdn_quant(model):
         if (getattr(module, "gqa_interleaved_layout", True) or module.tp_size != 1
                 or not _projection_is_supported(qkvz) or not _projection_is_supported(ba)):
             continue
+        input_width = getattr(getattr(qkvz, "aclnn_input_scale", None), "numel", lambda: 0)()
+        if input_width <= 0:
+            continue
         valid = True
         for name in _QUANT_FIELDS:
             first, second = getattr(qkvz, name, None), getattr(ba, name, None)
-            if (first is None or second is None or first.shape != (_INPUT_WIDTH,)
+            if (first is None or second is None or first.shape != (input_width,)
                     or first.shape != second.shape or first.dtype != torch.float16
                     or first.dtype != second.dtype or first.device.type != "npu"
                     or first.device != second.device or not torch.equal(first, second)):

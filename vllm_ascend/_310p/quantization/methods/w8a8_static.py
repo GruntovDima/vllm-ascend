@@ -37,6 +37,11 @@ class AscendW8A8LinearMethod310(AscendW8A8Linear310pScheme):
       - This scheme is discovered via 310P local registry.
     """
 
+    # Consumers may pass an already-quantized INT8 activation.  Expose that
+    # as an explicit capability instead of making fusions identify this class
+    # by its Python name.
+    accepts_prequantized_input = True
+
     def get_perchannel_param(self, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
         params: dict[str, Any] = {}
         params["quant_bias"] = torch.empty(output_size, dtype=torch.int32)

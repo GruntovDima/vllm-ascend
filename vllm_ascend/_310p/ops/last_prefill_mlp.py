@@ -1,4 +1,4 @@
-"""Experimental last-layer MLP row selection, without touching attention/cache.
+"""Experimental final-token row selection, without touching attention/cache.
 
 Only the real uncompiled BS1 DFlash prefill route may discard rows. Compiled
 verification, prompt logprobs, auxiliary final-layer consumers and warmup keep
@@ -23,15 +23,20 @@ def prepare_last_prefill_mlp(model):
     ):
         raise ValueError("Selected prefill norms require the original split normalization, not experimental fusion")
     for backbone in model.modules():
-        if type(backbone).__name__ != "Qwen3_5Model":
+        layers = getattr(backbone, "layers", None)
+        config = getattr(backbone, "config", None)
+        count = getattr(config, "num_hidden_layers", None)
+        if layers is None or not isinstance(count, int) or count <= 0:
             continue
-        count = backbone.config.num_hidden_layers
-        if backbone.start_layer != 0 or backbone.end_layer != count:
+        if getattr(backbone, "start_layer", None) != 0 or getattr(backbone, "end_layer", None) != count:
             continue
-        decoder = backbone.layers[count - 1]
-        if decoder.layer_type != "full_attention" or decoder.layer_scale:
+        try:
+            decoder = layers[count - 1]
+        except (IndexError, KeyError, TypeError):
             continue
-        if type(decoder.mlp).__name__ != "Qwen2MoeMLP":
+        if getattr(decoder, "layer_type", None) != "full_attention" or getattr(decoder, "layer_scale", None):
+            continue
+        if any(getattr(decoder, name, None) is None for name in ("mlp", "self_attn", "post_attention_layernorm")):
             continue
         # A weak reference avoids adding a recursive module/state_dict edge.
         decoder._last_prefill_mlp_backbone = weakref.ref(backbone)
@@ -42,8 +47,10 @@ def prepare_last_prefill_mlp(model):
             decoder.self_attn.last_prefill_attn_output_calls = 0
             decoder.self_attn.last_prefill_attn_output_skipped_rows = 0
         if envs.VLLM_ASCEND_LAST_PREFILL_NORMS:
-            for role, norm in (("post_attention", decoder.post_attention_layernorm), ("final", backbone.norm)):
-                if type(norm).__name__ != "AscendGemmaRMSNorm310":
+            for role, norm in (("post_attention", decoder.post_attention_layernorm),
+                               ("final", getattr(backbone, "norm", None))):
+                if (norm is None or getattr(norm, "weight", None) is None
+                        or getattr(norm, "variance_epsilon", None) is None):
                     continue
                 norm._last_prefill_mlp_backbone = weakref.ref(backbone)
                 norm.last_prefill_norm_role = role

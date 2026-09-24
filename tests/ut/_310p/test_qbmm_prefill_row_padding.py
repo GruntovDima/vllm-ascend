@@ -12,12 +12,13 @@ import torch
 class RowPaddingTests(unittest.TestCase):
     def setUp(self):
         source = Path(__file__).resolve().parents[3] / "vllm_ascend/_310p/quantization/methods/qbmm_custom.py"
-        names = {"_kernel_supports", "_prefill_padded_rows", "_qbmm_v3x", "_qbmm_v3x_fake"}
+        names = {"_kernel_supports", "_prefill_row_alignment", "_prefill_padded_rows",
+                 "_qbmm_v3x", "_qbmm_v3x_fake"}
         tree = ast.parse(source.read_text())
         nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
         self.assertEqual(len(nodes), len(names))
         self.env = SimpleNamespace(
-            VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING=True,
+            VLLM_ASCEND_QBMM_PREFILL_ROW_ALIGNMENTS="24576:32,12288:64",
             VLLM_ASCEND_QBMM_K_PIPELINE=False,
         )
         self.scope = {
@@ -26,11 +27,6 @@ class RowPaddingTests(unittest.TestCase):
             "_MAX_DIM": 32768,
             "_ENABLE_K_PIPELINE": False,
         }
-        self.scope["_PREFILL_PADDING_TARGETS"] = next(
-            ast.literal_eval(n.value) for n in tree.body
-            if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_PREFILL_PADDING_TARGETS"
-                                                for t in n.targets)
-        )
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), self.scope)
 
     def weight(self, k=4096, n=24576):
@@ -41,28 +37,38 @@ class RowPaddingTests(unittest.TestCase):
         x = torch.zeros((782, 4096), dtype=torch.int8)
         self.assertEqual(route(x, self.weight(), None), 800)
         self.assertEqual(route(x, self.weight(n=12288), None), 832)
-        for rows in (0, 1, 16, 128, 781, 783, 1266, 1280, 2048):
+        for rows in (0, 1, 16, 128, 1280, 2048):
             self.assertEqual(route(torch.empty((rows, 4096), dtype=torch.int8), self.weight(), None), 0)
+        for rows, padded in ((781, 800), (783, 800), (1266, 1280)):
+            self.assertEqual(route(torch.empty((rows, 4096), dtype=torch.int8), self.weight(), None), padded)
         self.assertEqual(route(x, self.weight(n=64), None), 0)
-        self.assertEqual(route(x, self.weight(k=8192), None), 0)
+        self.assertEqual(route(torch.zeros((782, 8192), dtype=torch.int8),
+                               self.weight(k=8192), None), 800)
         self.assertEqual(route(x, self.weight(), torch.ones(782)), 0)
         self.assertEqual(route(x.float(), self.weight(), None), 0)
         self.assertEqual(route(x.unsqueeze(0), self.weight(), None), 0)
         strided = torch.empty((782, 8192), dtype=torch.int8)[:, ::2]
         self.assertEqual(route(strided, self.weight(), None), 0)
-        self.env.VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING = False
+        self.env.VLLM_ASCEND_QBMM_PREFILL_ROW_ALIGNMENTS = ""
         self.assertEqual(route(x, self.weight(), None), 0)
+
+    def test_policy_validation(self):
+        resolve = self.scope["_prefill_row_alignment"]
+        for policy in ("bad", "24576:3", "-1:32"):
+            self.env.VLLM_ASCEND_QBMM_PREFILL_ROW_ALIGNMENTS = policy
+            with self.assertRaises(ValueError):
+                resolve(24576)
 
     def test_routing_zero_tail_and_no_mutation(self):
         x = torch.randint(-128, 128, (782, 4096), dtype=torch.int8)
         before = x.clone()
         scale, bias = torch.ones(24576, dtype=torch.int64), torch.zeros(24576, dtype=torch.int32)
-        for enabled, expected_rows in ((False, 782), (True, 800)):
-            self.env.VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING = enabled
+        for policy, expected_rows in (("", 782), ("24576:32", 800)):
+            self.env.VLLM_ASCEND_QBMM_PREFILL_ROW_ALIGNMENTS = policy
             def native(value, weight, passed_scale, **kwargs):
                 self.assertEqual(tuple(value.shape), (expected_rows, 4096))
                 self.assertTrue(torch.equal(value[:782], before))
-                if enabled:
+                if policy:
                     self.assertEqual(torch.count_nonzero(value[782:]), 0)
                 self.assertIs(passed_scale, scale)
                 self.assertIs(kwargs["bias"], bias)

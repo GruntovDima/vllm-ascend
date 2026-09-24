@@ -49,22 +49,40 @@ from vllm_ascend import envs
 _ENV = "VLLM_CUSTOM_QBMM"
 _ENABLE_K_PIPELINE = envs.VLLM_ASCEND_QBMM_K_PIPELINE
 
-# The custom kernel's tiling is validated for the model's projection shapes
-# (K/N up to 24576); the 248k-row vocab head fails tiling (ret -1). Shapes
+# The custom kernel's tiling is validated for K/N up to 32768; larger shapes
+# such as common vocabulary heads fail tiling (ret -1). Shapes
 # past this bound fall back to the builtin inside the opaque op, where the
 # branch is invisible to dynamo.
 _MAX_DIM = 32768
-# (logical M, K, N, padded M), from the row-padding checkpoint screen.
-_PREFILL_PADDING_TARGETS = ((782, 4096, 24576, 800), (782, 4096, 12288, 832))
+def _prefill_row_alignment(output_width: int) -> int:
+    """Resolve a deployment-provided shape policy without model knowledge."""
+    raw_policy = envs.VLLM_ASCEND_QBMM_PREFILL_ROW_ALIGNMENTS
+    if not raw_policy:
+        return 0
+    for item in raw_policy.split(","):
+        try:
+            width_text, alignment_text = item.split(":", 1)
+            width, alignment = int(width_text), int(alignment_text)
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_ASCEND_QBMM_PREFILL_ROW_ALIGNMENTS must contain "
+                "comma-separated output_width:alignment pairs"
+            ) from exc
+        if width <= 0 or alignment <= 1 or alignment & (alignment - 1):
+            raise ValueError(
+                "QBMM row alignments require positive widths and power-of-two alignments"
+            )
+        if width == output_width:
+            return alignment
+    return 0
 
 
 def _prefill_padded_rows(x: torch.Tensor, weight_t: torch.Tensor, pertoken_scale: torch.Tensor | None) -> int:
-    # Model-side padding only: unchanged native kernel and unchanged scheduler
-    # chunks. These two measured static-W8A8 shapes benefit; blanket alignment
-    # regresses other projections. Never pad decode or dynamic quantization.
+    # Model-side padding only: unchanged native kernel and scheduler chunks.
+    # The deployment policy names runtime output widths measured to benefit;
+    # the implementation contains no model, layer, hidden size or prompt size.
     if (
-        not envs.VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING
-        or x.ndim != 2
+        x.ndim != 2
         or x.dtype != torch.int8
         or not x.is_contiguous()
         or weight_t.ndim != 2
@@ -72,10 +90,10 @@ def _prefill_padded_rows(x: torch.Tensor, weight_t: torch.Tensor, pertoken_scale
         or pertoken_scale is not None
     ):
         return 0
-    for rows, k, n, padded in _PREFILL_PADDING_TARGETS:
-        if (x.shape[0], x.shape[1], weight_t.shape[1]) == (rows, k, n):
-            return padded
-    return 0
+    alignment = _prefill_row_alignment(weight_t.shape[1])
+    if not alignment or x.shape[0] < 128 or x.shape[0] % alignment == 0:
+        return 0
+    return (x.shape[0] + alignment - 1) // alignment * alignment
 
 
 def _kernel_supports(weight_t: torch.Tensor) -> bool:

@@ -12,7 +12,6 @@ from vllm_ascend.ops.layernorm import AscendGemmaRMSNorm, AscendRMSNorm
 
 _GEMMA_ADN_MIN_PREFILL_TOKENS = 128
 _GEMMA_ADD_RMS_MIN_PREFILL_TOKENS = 128
-_GEMMA_ADD_RMS_HIDDEN_SIZE = 4096
 
 
 def use_gemma_prefill_add_rms_norm(x, residual, weight):
@@ -23,7 +22,6 @@ def use_gemma_prefill_add_rms_norm(x, residual, weight):
         and residual is not None
         and x.dim() == 2
         and x.shape[0] >= _GEMMA_ADD_RMS_MIN_PREFILL_TOKENS
-        and x.shape[-1] == _GEMMA_ADD_RMS_HIDDEN_SIZE
         and residual.shape == x.shape
         and weight.shape == (x.shape[-1],)
         and x.dtype == residual.dtype == weight.dtype == torch.float16

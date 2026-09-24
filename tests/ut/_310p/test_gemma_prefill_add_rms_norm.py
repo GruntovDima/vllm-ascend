@@ -25,7 +25,7 @@ class GemmaPrefillFusionTests(unittest.TestCase):
         self.context = NS(cudagraph_runtime_mode='NONE')
         self.available = True
         scope = dict(envs=self.env, torch=NS(float16='half'), CUDAGraphMode=NS(NONE='NONE'),
-                     _GEMMA_ADD_RMS_MIN_PREFILL_TOKENS=128, _GEMMA_ADD_RMS_HIDDEN_SIZE=4096,
+                     _GEMMA_ADD_RMS_MIN_PREFILL_TOKENS=128,
                      is_forward_context_available=lambda: self.available,
                      get_forward_context=lambda: self.context)
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), scope)
@@ -51,6 +51,7 @@ class GemmaPrefillFusionTests(unittest.TestCase):
         for shape in ((1, 4096), (16, 4096), (127, 4096), (1266, 16, 256), (1266, 2048)):
             self.assertFalse(self.guard(Tensor(shape), Tensor(shape), self.w))
         self.assertTrue(self.guard(Tensor((128, 4096)), Tensor((128, 4096)), self.w))
+        self.assertTrue(self.guard(Tensor((128, 2048)), Tensor((128, 2048)), Tensor((2048,))))
 
     def test_residual_and_weight_contract(self):
         self.assertFalse(self.guard(self.x, None, self.w))

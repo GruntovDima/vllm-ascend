@@ -154,13 +154,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT", "0"))
     ),
-    # Experimental existing-CANN AddRmsNormQuant before Qwen3.5 W8A8 MLP.
+    # Experimental existing-CANN AddRmsNormQuant before a compatible W8A8 MLP.
     # 0/1, default off, non-sensitive, startup-only. Changes rounding in prefill;
     # graph/decode and attention input normalization retain their original path.
     "VLLM_ASCEND_PREFILL_MLP_NORM_QUANT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_PREFILL_MLP_NORM_QUANT", "0"))
     ),
-    # Experimental Qwen3.5 last-layer MLP row selection for BS1 DFlash FDO
+    # Experimental final-layer MLP row selection for single-request DFlash FDO
     # prefill. 0/1, default off, startup-only, non-sensitive. Decode unchanged.
     "VLLM_ASCEND_LAST_PREFILL_MLP": lambda: bool(
         int(os.getenv("VLLM_ASCEND_LAST_PREFILL_MLP", "0"))
@@ -178,10 +178,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LAST_PREFILL_ATTN_OUTPUT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_LAST_PREFILL_ATTN_OUTPUT", "0"))
     ),
-    # Experimental model-side padding for two measured static-W8A8 prefill
-    # projection shapes. 0 (default) or 1; non-sensitive. Decode is unchanged.
-    "VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_QBMM_PREFILL_ROW_PADDING", "0"))
+    # Optional 310P QBMM prefill row-alignment policy. Comma-separated
+    # output-width:row-alignment pairs, e.g. ``12288:64,24576:32``.
+    # Empty means no model-side padding. Startup-only, non-sensitive.
+    "VLLM_ASCEND_QBMM_PREFILL_ROW_ALIGNMENTS": lambda: os.getenv(
+        "VLLM_ASCEND_QBMM_PREFILL_ROW_ALIGNMENTS", ""
     ),
     # Experimental 310P QBMM single-K-pass weight prefetch overlap. Boolean
     # 0/1, default off, non-sensitive. The native tiler additionally limits
@@ -190,7 +191,7 @@ env_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_ASCEND_QBMM_K_PIPELINE", "0"))
     ),
     # Startup-only, non-sensitive bool (0/1), default off: share the input
-    # quantization of matched static-W8A8 Qwen3.5 GDN projections on 310P/TP1.
+    # quantization of matched static-W8A8 GDN projections on 310P/TP1.
     "VLLM_ASCEND_GDN_SHARED_INPUT_QUANT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_GDN_SHARED_INPUT_QUANT", "0"))
     ),
@@ -204,7 +205,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_GDN_SINGLE_SEQUENCE_PACKING": lambda: bool(
         int(os.getenv("VLLM_ASCEND_GDN_SINGLE_SEQUENCE_PACKING", "0"))
     ),
-    # FP16 H4096 Gemma hidden-state AddRmsNorm for eager prefill only.
+    # Compatible FP16 Gemma hidden-state AddRmsNorm for eager prefill only.
     # 0/1, default off, non-sensitive. Set before startup/torch.compile;
     # numerical rounding differs from split add + RMSNorm. Graph stays split.
     "VLLM_ASCEND_GEMMA_PREFILL_ADD_RMS_NORM": lambda: bool(

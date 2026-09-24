@@ -7,6 +7,9 @@ import torch
 from vllm_ascend._310p.lmhead_prune import maybe_prune_lm_head
 
 
+PRUNE_PACK = "test-prune-pack.pt"
+
+
 class _FakeQuantMethod:
     def apply(self, lm_head, hidden_states):
         rows = hidden_states.reshape(-1, hidden_states.shape[-1]).shape[0]
@@ -46,13 +49,13 @@ def test_pruned_lm_head_uses_safe_load_and_head_device():
     pack = _make_pack()
 
     with (
-        patch.dict("os.environ", {"VLLM_LMHEAD_PRUNE_PACK": "/tmp/prune-pack.pt"}),
+        patch.dict("os.environ", {"VLLM_LMHEAD_PRUNE_PACK": PRUNE_PACK}),
         patch("vllm_ascend._310p.lmhead_prune.torch.load", return_value=pack) as load_pack,
         patch("vllm_ascend._310p.lmhead_prune.maybe_trans_nz", side_effect=lambda value: value),
     ):
         maybe_prune_lm_head(model)
 
-    load_pack.assert_called_once_with("/tmp/prune-pack.pt", map_location="cpu", weights_only=True)
+    load_pack.assert_called_once_with(PRUNE_PACK, map_location="cpu", weights_only=True)
     assert lm_head.weight.data.device.type == "cpu"
     assert lm_head.weight.data.shape == (4, 2)
 
@@ -75,7 +78,7 @@ def test_pruned_lm_head_uses_safe_load_and_head_device():
 def test_pruning_rejects_draft_vocab_mapping_before_loading_or_mutation():
     draft = SimpleNamespace(draft_id_to_target_id=torch.tensor([1, 3]))
     with (
-        patch.dict("os.environ", {"VLLM_LMHEAD_PRUNE_PACK": "/tmp/prune-pack.pt"}),
+        patch.dict("os.environ", {"VLLM_LMHEAD_PRUNE_PACK": PRUNE_PACK}),
         patch("vllm_ascend._310p.lmhead_prune.torch.load") as load_pack,
         pytest.raises(NotImplementedError, match="d2t vocabulary"),
     ):
@@ -111,7 +114,7 @@ def test_pruned_lm_head_preserves_step_aware_compute_logits():
     )
 
     with (
-        patch.dict("os.environ", {"VLLM_LMHEAD_PRUNE_PACK": "/tmp/prune-pack.pt"}),
+        patch.dict("os.environ", {"VLLM_LMHEAD_PRUNE_PACK": PRUNE_PACK}),
         patch("vllm_ascend._310p.lmhead_prune.torch.load", return_value=_make_pack()),
         patch("vllm_ascend._310p.lmhead_prune.maybe_trans_nz", side_effect=lambda value: value),
     ):
@@ -147,7 +150,7 @@ def test_pruned_lm_head_preserves_none_logits_on_non_last_rank():
     )
 
     with (
-        patch.dict("os.environ", {"VLLM_LMHEAD_PRUNE_PACK": "/tmp/prune-pack.pt"}),
+        patch.dict("os.environ", {"VLLM_LMHEAD_PRUNE_PACK": PRUNE_PACK}),
         patch("vllm_ascend._310p.lmhead_prune.torch.load", return_value=_make_pack()),
         patch("vllm_ascend._310p.lmhead_prune.maybe_trans_nz", side_effect=lambda value: value),
     ):
@@ -178,7 +181,7 @@ def test_pruned_lm_head_rejects_tensor_parallel_head_before_mutation():
     )
 
     with (
-        patch.dict("os.environ", {"VLLM_LMHEAD_PRUNE_PACK": "/tmp/prune-pack.pt"}),
+        patch.dict("os.environ", {"VLLM_LMHEAD_PRUNE_PACK": PRUNE_PACK}),
         patch("vllm_ascend._310p.lmhead_prune.torch.load", return_value=_make_pack()),
         patch("vllm_ascend._310p.lmhead_prune.maybe_trans_nz") as trans_nz,
         pytest.raises(NotImplementedError, match="supports only tensor-parallel size 1"),

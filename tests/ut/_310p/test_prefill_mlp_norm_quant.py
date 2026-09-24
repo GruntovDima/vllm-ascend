@@ -36,7 +36,7 @@ class PrefillMlpNormQuantTests(unittest.TestCase):
                                      ("Tensor", "float16", "float32", "int8", "int32", "qint8", "empty_like")})
         torch_proxy.ops = SimpleNamespace(vllm=SimpleNamespace(prefill_mlp_norm_quant=self.opaque))
         self.scope = {"torch": torch, "torch_npu": SimpleNamespace(npu_add_rms_norm_quant=self.fused),
-                      "envs": self.env, "PREFILL_MIN_TOKENS": 128, "HIDDEN_SIZE": 4096,
+                      "envs": self.env, "PREFILL_MIN_TOKENS": 128,
                       "CUDAGraphMode": SimpleNamespace(NONE="NONE"),
                       "get_forward_context": lambda: self.ctx,
                       "is_forward_context_available": lambda: self.available,
@@ -49,7 +49,8 @@ class PrefillMlpNormQuantTests(unittest.TestCase):
                             aclnn_input_offset=tensor((4096,)),
                             _prefill_norm_quant_scale=tensor((4096,), torch.float32),
                             _prefill_norm_quant_offset=tensor((4096,), torch.int32),
-                            quant_method=SimpleNamespace(quant_method=named("AscendW8A8LinearMethod310")))
+                            quant_method=SimpleNamespace(quant_method=SimpleNamespace(
+                                accepts_prequantized_input=True)))
         self.norm = named("AscendGemmaRMSNorm310", weight=tensor((4096,)), bias=None, variance_epsilon=1e-6)
         self.mlp = named("Qwen2MoeMLP", gate_up_proj=self.linear, expert_gate=None)
         self.decoder = SimpleNamespace(post_attention_layernorm=self.norm, mlp=self.mlp)
@@ -158,8 +159,11 @@ class PrefillMlpNormQuantTests(unittest.TestCase):
             (self.x, "shape", (782, 2048)),
             (self.linear._prefill_norm_quant_scale, "dtype", torch.float16),
             (self.linear._prefill_norm_quant_offset, "shape", (1,)),
-            (self.linear.quant_method, "quant_method", named("DynamicScheme")),
-            (self.mlp, "gate_up_proj", named("LoRAMergedLinear")),
+            (self.linear.quant_method, "quant_method", SimpleNamespace(
+                accepts_prequantized_input=False)),
+            (self.mlp, "gate_up_proj", named("IncompatibleLinear",
+                quant_method=SimpleNamespace(quant_method=SimpleNamespace(
+                    accepts_prequantized_input=False)))),
         ):
             old = getattr(target, field)
             setattr(target, field, value)
