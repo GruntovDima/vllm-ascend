@@ -1,15 +1,9 @@
-"""CPU tests for host-slot provenance/guards, without accelerator imports."""
-import importlib.util
-from pathlib import Path
+"""CPU tests for host-slot provenance and guards."""
 from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import Mock
 
-
-path = Path(__file__).resolve().parents[3] / "vllm_ascend/_310p/ops/fla/prefill_state_commit.py"
-spec = importlib.util.spec_from_file_location("prefill_state_commit", path)
-ops = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ops)
+from vllm_ascend._310p.ops.fla import prefill_state_commit as ops
 
 
 class HostTable:
