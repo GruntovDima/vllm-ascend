@@ -171,8 +171,8 @@ def _git_head(path: str) -> str | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="/home/models/Qwen3.5-9B-w8a8-lmhead-mtp")
-    parser.add_argument("--draft", default="/home/models/Qwen3.5-9B-DFlash")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--draft", required=True)
     parser.add_argument("--input-len", type=int, default=2048)
     parser.add_argument("--output-len", type=int, default=1024)
     parser.add_argument("--spec-tokens", type=int, default=15)
