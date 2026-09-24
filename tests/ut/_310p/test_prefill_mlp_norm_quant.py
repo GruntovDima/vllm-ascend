@@ -142,8 +142,13 @@ class PrefillMlpNormQuantTests(unittest.TestCase):
         original = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
         rewritten = []
         for statement in forward.body:
-            if isinstance(statement, ast.Assign) and ast.unparse(statement.targets[0]) == "fused_norm":
-                continue
+            if isinstance(statement, ast.Assign):
+                target = ast.unparse(statement.targets[0])
+                if target in ("fused_norm", "selected_output"):
+                    continue
+                if target == "hidden_states" and "selected_output" in ast.unparse(statement.value):
+                    rewritten.append(ast.parse("hidden_states = self.mlp(hidden_states)").body[0])
+                    continue
             if isinstance(statement, ast.If) and ast.unparse(statement.test) == "fused_norm is None":
                 rewritten.extend(statement.body)
             else:

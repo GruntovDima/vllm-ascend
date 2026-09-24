@@ -25,7 +25,7 @@ class SharedQuantTests(unittest.TestCase):
         self.fallback = Mock(return_value='original')
         self.fields = ('aclnn_input_scale', 'aclnn_input_scale_reciprocal', 'aclnn_input_offset')
         self.scope = {'torch': torch, 'QwenGatedDeltaNetAttention': GDN, 'envs': self.env,
-                      '_INPUT_WIDTH': 4096, '_QUANT_FIELDS': self.fields,
+                      '_QUANT_FIELDS': self.fields,
                       '_ORIGINAL_FORWARD_CUDA': self.fallback, '_encode_layer_name': lambda x: x}
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(self.path), 'exec'), self.scope)
         self.module = GDN()
@@ -34,10 +34,11 @@ class SharedQuantTests(unittest.TestCase):
         for attr in ('in_proj_qkvz', 'in_proj_ba'):
             layer = named('AscendMergedColumnParallelLinear', tp_size=1, custom_op=None, bias=None,
                           params_dtype=torch.float16,
-                          quant_method=SimpleNamespace(quant_method=named('AscendW8A8LinearMethod310')))
+                          quant_method=SimpleNamespace(quant_method=SimpleNamespace(
+                              accepts_prequantized_input=True)))
             for field in self.fields:
                 setattr(layer, field, SimpleNamespace(shape=(4096,), dtype=torch.float16,
-                        device=SimpleNamespace(type='npu'), value=1))
+                        device=SimpleNamespace(type='npu'), value=1, numel=lambda: 4096))
             setattr(self.module, attr, layer)
         self.model = SimpleNamespace(named_modules=lambda: [('gdn', self.module)])
         self.scope['torch'] = SimpleNamespace(float16=torch.float16,
@@ -68,7 +69,8 @@ class SharedQuantTests(unittest.TestCase):
             (self.module.in_proj_ba.aclnn_input_offset, 'dtype', torch.int8),
             (self.module.in_proj_qkvz.aclnn_input_scale, 'shape', (1,)),
             (self.module.in_proj_qkvz.aclnn_input_scale, 'device', SimpleNamespace(type='cpu')),
-            (self.module.in_proj_qkvz.quant_method, 'quant_method', named('DynamicScheme')),
+            (self.module.in_proj_qkvz.quant_method, 'quant_method', SimpleNamespace(
+                accepts_prequantized_input=False)),
             (self.module, 'in_proj_qkvz', named('LoRALinear')),
         ):
             old = getattr(target, field)

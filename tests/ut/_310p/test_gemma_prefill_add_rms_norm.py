@@ -69,6 +69,8 @@ class GemmaPrefillFusionTests(unittest.TestCase):
         future = ast.parse('from __future__ import annotations').body[0]
         fused = Mock(return_value=('normalized', 'rstd', 'residual_out'))
         scope = dict(use_gemma_prefill_add_rms_norm=lambda *args: True,
+                     maybe_last_prefill_norm=lambda *args: None,
+                     gemma_residual_rms_norm_310=lambda *args: None,
                      torch_npu=NS(npu_add_rms_norm=fused))
         exec(compile(ast.Module(body=[future, method], type_ignores=[]), str(path), 'exec'), scope)
         result = scope['forward_oot'](NS(weight=0.25, variance_epsilon=1e-6), 'x', 'residual')
