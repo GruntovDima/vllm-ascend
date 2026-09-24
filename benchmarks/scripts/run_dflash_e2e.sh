@@ -11,6 +11,9 @@ PROMPT_JSON="${PROMPT_JSON:-/work/dflash/prompt.json}"
 
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+# The benchmark image also contains a newer system vLLM.  Put the matching
+# integration checkout first so a manual run cannot silently benchmark 0.27.
+export PYTHONPATH="/workspace/vllm-024:/workspace/vllm-ascend:/work/dflash${PYTHONPATH:+:$PYTHONPATH}"
 export VLLM_CUSTOM_QBMM="${VLLM_CUSTOM_QBMM:-1}"
 export VLLM_LMHEAD_PRUNE_PACK="${VLLM_LMHEAD_PRUNE_PACK:-/home/models/lmhead_prune_v3_int8.pt}"
 export VLLM_ASCEND_DFLASH_COMPACT_GREEDY="${VLLM_ASCEND_DFLASH_COMPACT_GREEDY:-1}"
