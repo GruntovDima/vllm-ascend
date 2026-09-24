@@ -119,24 +119,17 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdH(gert::TilingContext *context)
     constexpr size_t WORKSPACE_RSV_BYTE = 16 * 1024 * 1024;
     constexpr size_t GM_ALIGN = 512;
     constexpr int64_t PING_PONG_STAGES = 2;
-    const bool skipResidentWorkspaces =
-        ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND310P;
-
     size_t workspaceOffset = ascendcPlatform.GetLibApiWorkSpaceSize();
     workspaceOffset += WORKSPACE_RSV_BYTE;
     
     tiling.set_vWorkspaceOffset(workspaceOffset);
-    if (!skipResidentWorkspaces) {
-        workspaceOffset += (aicCoreNum * chunkSize * vHeadDim * sizeof(float) * PING_PONG_STAGES + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
-    }
+    workspaceOffset += (aicCoreNum * chunkSize * vHeadDim * sizeof(float) * PING_PONG_STAGES + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
 
     tiling.set_vUpdateWorkspaceOffset(workspaceOffset);
     workspaceOffset += (aicCoreNum * chunkSize * vHeadDim * sizeof(float) * PING_PONG_STAGES + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
 
     tiling.set_hWorkspaceOffset(workspaceOffset);
-    if (!skipResidentWorkspaces) {
-        workspaceOffset += (aicCoreNum * kHeadDim * vHeadDim * sizeof(float) * PING_PONG_STAGES + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
-    }
+    workspaceOffset += (aicCoreNum * kHeadDim * vHeadDim * sizeof(float) * PING_PONG_STAGES + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
 
     tiling.set_numSeqWorkspaceOffset(workspaceOffset);
     workspaceOffset += ((tokenBatch + 1) * sizeof(int64_t) + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
