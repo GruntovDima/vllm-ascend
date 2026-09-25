@@ -20,6 +20,8 @@ def test_gsm8k_answer_extractors():
     assert MODULE._predicted_answer("work\n#### -2.50") == "-2.5"
     assert MODULE._predicted_answer("first 2, final 17") == "17"
     assert MODULE._predicted_answer("no numeric answer") is None
+    assert MODULE._strict_predicted_answer("work\n#### 1,234") == "1234"
+    assert MODULE._strict_predicted_answer("the answer is 1234") is None
 
 
 def test_gsm8k_prompt_has_fewshot_examples():

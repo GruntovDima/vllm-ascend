@@ -85,6 +85,11 @@ def _predicted_answer(text: str) -> str | None:
     return _canonical_number(candidates[-1] if candidates else None)
 
 
+def _strict_predicted_answer(text: str) -> str | None:
+    marker = re.search(r"####\s*([-+]?\d[\d,]*(?:\.\d+)?)", text)
+    return _canonical_number(marker.group(1) if marker else None)
+
+
 def _build_prompt(row: dict[str, str], fewshot_rows: list[dict[str, str]]) -> str:
     parts: list[str] = []
     for example in fewshot_rows:
@@ -144,6 +149,7 @@ def _run_request(
         seed=42,
         max_tokens=max_tokens,
         ignore_eos=False,
+        stop=["Question:", "</s>", "<|im_end|>"],
         output_kind=RequestOutputKind.CUMULATIVE,
     )
     before = _metrics(llm)
@@ -357,6 +363,7 @@ def main() -> None:
             )
             text = tokenizer.decode(result.pop("token_ids"), skip_special_tokens=True)
             predicted = _predicted_answer(text)
+            strict_predicted = _strict_predicted_answer(text)
             expected = _gold_answer(row["answer"])
             result.update(
                 {
@@ -364,7 +371,9 @@ def main() -> None:
                     "question": row["question"],
                     "expected_answer": expected,
                     "predicted_answer": predicted,
-                    "correct": predicted == expected,
+                    "strict_predicted_answer": strict_predicted,
+                    "strict_match": strict_predicted == expected,
+                    "flexible_extract": predicted == expected,
                     "output_text": text,
                 }
             )
@@ -378,7 +387,8 @@ def main() -> None:
                         key: result[key]
                         for key in (
                             "case_index",
-                            "correct",
+                            "strict_match",
+                            "flexible_extract",
                             "input_tokens",
                             "output_tokens",
                             "ttft_ms",
@@ -398,8 +408,10 @@ def main() -> None:
     decode_elapsed = sum(row["decode_elapsed_ms"] for row in results)
     summary = {
         "cases": len(results),
-        "correct": sum(row["correct"] for row in results),
-        "exact_match": sum(row["correct"] for row in results) / len(results),
+        "strict_match": sum(row["strict_match"] for row in results) / len(results),
+        "flexible_extract": (
+            sum(row["flexible_extract"] for row in results) / len(results)
+        ),
         "input_tokens": _stats([float(row["input_tokens"]) for row in results]),
         "output_tokens": _stats([float(row["output_tokens"]) for row in results]),
         "ttft_ms": _stats([row["ttft_ms"] for row in results]),
