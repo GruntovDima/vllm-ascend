@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ASCEND_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 RESULT_DIR="${RESULT_DIR:-${SCRIPT_DIR}/results/gsm8k-$(date +%Y%m%d-%H%M%S)}"
 : "${MODEL:?Set MODEL to the target model path or identifier}"
-: "${DRAFT_MODEL:?Set DRAFT_MODEL to the DFlash model path or identifier}"
 : "${GSM8K_DIR:?Set GSM8K_DIR to the downloaded GSM8K directory}"
+DRAFT_MODEL="${DRAFT_MODEL:-}"
 
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
@@ -36,7 +36,6 @@ export VLLM_ASCEND_DFLASH_PREFILL_DELIVERY="${VLLM_ASCEND_DFLASH_PREFILL_DELIVER
 
 args=(
   --model "$MODEL"
-  --draft "$DRAFT_MODEL"
   --train-jsonl "$GSM8K_DIR/train.jsonl"
   --test-jsonl "$GSM8K_DIR/test.jsonl"
   --result-dir "$RESULT_DIR"
@@ -53,6 +52,9 @@ args=(
   --graph "${GRAPH:-FULL_DECODE_ONLY}"
   --process-cpus "${PROCESS_CPUS:-}"
 )
+if [[ -n "$DRAFT_MODEL" ]]; then
+  args+=(--draft "$DRAFT_MODEL")
+fi
 
 echo "Result directory: $RESULT_DIR"
 python3 "$SCRIPT_DIR/benchmark_gsm8k_dflash.py" "${args[@]}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run GSM8K with DFlash and report accuracy, TTFT, TPOT and acceptance."""
+"""Run GSM8K and report accuracy, TTFT, TPOT and optional DFlash acceptance."""
 
 from __future__ import annotations
 
@@ -224,7 +224,7 @@ def _stats(values: list[float]) -> dict[str, float]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--draft", required=True)
+    parser.add_argument("--draft", default="")
     parser.add_argument("--train-jsonl", type=Path, required=True)
     parser.add_argument("--test-jsonl", type=Path, required=True)
     parser.add_argument("--result-dir", type=Path, required=True)
@@ -245,8 +245,12 @@ def main() -> None:
     args = parser.parse_args()
     if args.offset < 0 or args.limit < 0 or args.fewshot < 0:
         parser.error("offset, limit and fewshot must be non-negative")
-    if args.max_tokens < 2 or args.spec_tokens < 1 or args.warmup_output_len < 0:
-        parser.error("max-tokens must be >=2 and spec-tokens must be positive")
+    if args.max_tokens < 2 or args.warmup_output_len < 0:
+        parser.error("max-tokens must be >=2 and warmup-output-len non-negative")
+    if args.draft and args.spec_tokens < 1:
+        parser.error("spec-tokens must be positive when a draft model is configured")
+    if not args.draft:
+        args.spec_tokens = 0
 
     train_rows = _load_jsonl(args.train_jsonl)
     all_test_rows = _load_jsonl(args.test_jsonl)
@@ -293,16 +297,17 @@ def main() -> None:
             },
         },
         "compilation_config": {"cudagraph_mode": args.graph},
-        "speculative_config": {
+    }
+    if args.draft:
+        engine_kwargs["speculative_config"] = {
             "method": "dflash",
             "model": args.draft,
             "num_speculative_tokens": args.spec_tokens,
             "draft_tensor_parallel_size": 1,
-        },
-    }
+        }
     if args.graph != "NONE":
         engine_kwargs["compilation_config"]["cudagraph_capture_sizes"] = [
-            args.spec_tokens + 1
+            args.spec_tokens + 1 if args.draft else 1
         ]
 
     tracked_env = sorted(
