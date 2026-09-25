@@ -36,6 +36,7 @@ export VLLM_ASCEND_DFLASH_PREFILL_DELIVERY="${VLLM_ASCEND_DFLASH_PREFILL_DELIVER
 
 args=(
   --model "$MODEL"
+  --dtype "${DTYPE:-float16}"
   --train-jsonl "$GSM8K_DIR/train.jsonl"
   --test-jsonl "$GSM8K_DIR/test.jsonl"
   --result-dir "$RESULT_DIR"

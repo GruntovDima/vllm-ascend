@@ -225,6 +225,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--draft", default="")
+    parser.add_argument("--dtype", choices=("auto", "float16", "bfloat16"), default="float16")
     parser.add_argument("--train-jsonl", type=Path, required=True)
     parser.add_argument("--test-jsonl", type=Path, required=True)
     parser.add_argument("--result-dir", type=Path, required=True)
@@ -271,7 +272,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     engine_kwargs: dict[str, Any] = {
         "model": args.model,
-        "dtype": "float16",
+        "dtype": args.dtype,
         "tensor_parallel_size": 1,
         "max_num_seqs": 1,
         "max_model_len": args.max_model_len,
