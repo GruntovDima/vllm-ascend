@@ -27,28 +27,9 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import chunk_gated_delta_rule_310
 from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
-from vllm_ascend._310p.ops.fla.prefill_state_commit import copy_single_prefill_state
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.utils import enable_sp
-
-
-def _prefill_cu_seqlens_310(attn_metadata: GDNAttentionMetadata) -> torch.Tensor:
-    """Reuse the scheduler's host boundaries instead of D2H in every layer.
-
-    The chunk wrapper consumes these boundaries on the CPU. Its existing
-    device fallback remains necessary for older metadata and mixed ordinary
-    decode/prefill batches, whose host chunk metadata excludes decode rows.
-    Keep the original device tensor for causal-conv and recurrent kernels.
-    """
-    device_cu = attn_metadata.non_spec_query_start_loc
-    prefill = getattr(attn_metadata, "non_spec_prefill_metadata", None)
-    if attn_metadata.num_decodes or prefill is None:
-        return device_cu
-    host_cu = getattr(prefill.chunk, "cu_seqlens_host", None)
-    if host_cu is None or len(host_cu) != device_cu.numel():
-        return device_cu
-    return torch.tensor(host_cu, dtype=torch.int64, device="cpu")
 
 
 def _zero_padded_tokens(
@@ -72,31 +53,6 @@ def _zero_padded_tokens(
     mask_shape = [1] * tensor.ndim
     mask_shape[token_dim] = token_count
     return tensor * valid_mask.reshape(mask_shape).to(dtype=tensor.dtype)
-
-
-def _clear_states_without_initial(
-    states: torch.Tensor,
-    has_initial_state: torch.Tensor,
-) -> torch.Tensor:
-    """Zero the rows of ``states`` whose sequence has no initial state.
-
-    A boolean-mask ``index_put_`` (``states[~has_initial_state] = 0``) lowers to
-    an aicpu ``IndexPut`` kernel that fails on 310P (error 0x2a -> 507018). Use
-    an elementwise select instead, mirroring the Triton ``clear_ssm_states``
-    helper used on the non-310P path.
-
-    ``torch.where`` rather than a mask multiply: ``states * 0`` propagates any
-    NaN/Inf left in a stale cache row, whereas the ``index_put_`` this replaces
-    overwrote it unconditionally.
-    """
-    if states.numel() == 0:
-        return states
-
-    keep = has_initial_state.to(device=states.device, dtype=torch.bool).reshape(-1)
-    mask_shape = [states.shape[0]] + [1] * (states.ndim - 1)
-    keep = keep.reshape(mask_shape)
-    zero = torch.zeros((), dtype=states.dtype, device=states.device)
-    return torch.where(keep, states, zero)
 
 
 def _flatten_state_indices(
@@ -396,7 +352,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
             # 2.2: Process the remaining part
             if attn_metadata.num_prefills > 0:
                 initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
-                initial_state = _clear_states_without_initial(initial_state, has_initial_state)
+                initial_state[~has_initial_state, ...] = 0
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
@@ -408,20 +364,13 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     beta=beta_non_spec,
                     initial_state=initial_state,
                     output_final_state=True,
-                    cu_seqlens=_prefill_cu_seqlens_310(attn_metadata),
+                    cu_seqlens=non_spec_query_start_loc,
                     head_first=False,
                     use_qk_l2norm_in_kernel=True,
                 )
 
                 # Init cache
-                state_to_commit = last_recurrent_state.to(ssm_state.dtype)
-                if copy_single_prefill_state(
-                    ssm_state, state_to_commit,
-                    getattr(attn_metadata, "prefill_host_state_slot", None),
-                ):
-                    self.prefill_host_commit_count = getattr(self, "prefill_host_commit_count", 0) + 1
-                else:
-                    ssm_state[non_spec_state_indices_tensor] = state_to_commit
+                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(ssm_state.dtype)
             elif attn_metadata.num_decodes > 0:
                 core_attn_out_non_spec = npu_recurrent_gated_delta_rule_310(
                     q=query_non_spec,
