@@ -52,6 +52,15 @@ The separately preserved HQ_TEST integration is not modified by this cleanup.
 
 ## Validation boundaries
 
+The non-310P FwdH launcher is restored to the historical base contract.
+The original optimization commit `81567adcd` used newer arch22/arch35 headers;
+copying its complete launcher into this older tree introduced an incompatible
+six-parameter dispatch and a missing arch35 include. The restored launcher
+matches the checked-in four-parameter kernels and retains the 12-argument
+310P entry without the omitted `gk` input. No device kernel is changed by this
+launcher repair. Source-contract and host-stub compilation tests cover the
+architecture routes; they are not a CANN build or NPU correctness test.
+
 Prior integrated standalone and e2e results remain evidence for their exact
 recorded source, binaries, environment and configuration. They are not a new
 build, correctness or performance result for this cleaned standalone branch.
