@@ -54,6 +54,7 @@
 #include "attention/attn_res_fwd/attn_res_fwd_torch_adpt.h"
 #include "attention/kda_gate_cumsum_vllm/kda_gate_cumsum_vllm_torch_adpt.h"
 #include "attention/kda_layout_swap12/kda_layout_swap12_torch_adpt.h"
+#include "qbmm/quant_batch_matmul_v3/quant_batch_matmul_v3_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
 #include "attention/k2q_csr/k2q_csr_torch_adpt.h"
 #include "attention/msa_index_score/msa_index_score_torch_adpt.h"
@@ -2948,6 +2949,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "chunk_gated_delta_rule_compute_wy(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, int? chunk_size=None) -> (Tensor q_kernel, Tensor k_kernel, Tensor w_kernel, Tensor u_kernel, Tensor g_kernel)"
     );
     ops.impl("chunk_gated_delta_rule_compute_wy", torch::kPrivateUse1, &vllm_ascend::chunk_gated_delta_rule_compute_wy);
+
+    ops.def(
+        "quant_batch_matmul_v3(Tensor x1, "
+        "                       Tensor x2, "
+        "                       Tensor scale, "
+        "                       Tensor? offset=None, "
+        "                       Tensor? pertoken_scale=None, "
+        "                       Tensor? bias=None, "
+        "                       bool transpose_x1=False, "
+        "                       bool transpose_x2=False, "
+        "                       int group_size=0) -> Tensor");
+    ops.impl("quant_batch_matmul_v3", torch::kPrivateUse1, &vllm_ascend::quant_batch_matmul_v3);
 }
 #else
 // Pybind on other platform

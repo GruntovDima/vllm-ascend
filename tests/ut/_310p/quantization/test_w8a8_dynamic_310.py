@@ -119,8 +119,8 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
 
         self.assertTrue(torch.equal(output, expected_y_output))
 
-    @patch("vllm_ascend._310p.quantization.methods.w8a8_dynamic.maybe_trans_nz", side_effect=lambda x: x)
-    def test_process_weights_after_loading_uses_nz_kn_layout_310p(self, mock_trans_nz):
+    @patch("vllm_ascend._310p.quantization.methods.w8a8_dynamic.maybe_trans_zn", side_effect=lambda x: x)
+    def test_process_weights_after_loading_uses_zn_kn_layout_310p(self, mock_trans_zn):
         from types import SimpleNamespace
 
         layer = SimpleNamespace(
@@ -131,7 +131,7 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
 
         self.method.process_weights_after_loading(layer)
 
-        mock_trans_nz.assert_called_once()
+        mock_trans_zn.assert_called_once()
         self.assertEqual(layer.weight_scale.data.ndim, 1)
         self.assertFalse(hasattr(layer, "weight_fp"))
         self.assertEqual(layer.weight.data.shape, (256, 128))

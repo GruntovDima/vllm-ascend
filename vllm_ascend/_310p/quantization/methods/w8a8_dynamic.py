@@ -22,12 +22,13 @@ import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_ep_group
 
+from vllm_ascend._310p.ops.quant_batch_matmul import quant_batch_matmul
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
 from vllm_ascend.quantization.methods.base import AscendMoEScheme, QuantType
-from vllm_ascend.utils import maybe_trans_nz
+from vllm_ascend.utils import maybe_trans_nz, maybe_trans_zn
 
 from .registry import register_scheme
 from .w8a8_base import AscendW8A8Linear310pScheme
@@ -175,6 +176,9 @@ class AscendW8A8DynamicFusedMoEMethod310(AscendMoEScheme):
         )
 
     def process_weights_after_loading(self, layer):
+        # NOTE: fused_moe consumes these as FRACTAL_NZ logical [E, 2F, H] /
+        # [E, H, F] (no [K, N] swap, no ZN bytes), so the ZN layout does not
+        # apply here -- keep maybe_trans_nz (NZ, no transpose).
         layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
         layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(layer.w13_weight_scale.data.shape[0], -1)
@@ -223,20 +227,25 @@ class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
 
         # NOTE(310P):
         # - Currently, W8A8 dynamic quantization supports only symmetric quantization.
-        output = torch_npu.npu_quant_matmul(
+        output = quant_batch_matmul(
             quantized_x,
             layer.weight.data,
             layer.weight_scale,
             pertoken_scale=pertoken_scale,
-            bias=bias,
+            transpose_x2=False,
             output_dtype=x.dtype,
         )
+        if bias is not None:
+            # quant_batch_matmul_v3's bias slot is an int32 accumulator bias
+            # (pre-dequant); vLLM's linear bias is a floating-point addend,
+            # so apply it on the dequantized output instead.
+            output = output + bias.to(output.dtype)
         if need_unsqz:
             output = output.unsqueeze(dim=1)
         return output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # cast quantized weight tensors in NZ format for higher inference speed
-        layer.weight.data = maybe_trans_nz(layer.weight.data).transpose(0, 1)
+        # cast quantized weight tensors into the ZN layout for higher inference speed
+        layer.weight.data = maybe_trans_zn(layer.weight.data)
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_offset.data = layer.weight_offset.data.flatten()

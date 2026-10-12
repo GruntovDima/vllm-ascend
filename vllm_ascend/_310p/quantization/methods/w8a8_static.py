@@ -20,7 +20,11 @@ from typing import Any
 import torch
 import torch_npu
 
-from vllm_ascend.utils import maybe_trans_nz
+from vllm_ascend._310p.ops.quant_batch_matmul import (
+    quant_batch_matmul,
+    use_custom_quant_batch_matmul,
+)
+from vllm_ascend.utils import maybe_trans_nz, maybe_trans_zn
 
 from .registry import register_scheme
 from .w8a8_base import AscendW8A8Linear310pScheme
@@ -60,14 +64,23 @@ class AscendW8A8LinearMethod310(AscendW8A8Linear310pScheme):
         quant_bias = layer.quant_bias if tp_rank == 0 else None
 
         # NOTE(310P):
-        # - Current torch_npu.npu_quant_matmul on Ascend 310P expects the weight layout in a transposed form
-        #   for correct/efficient execution, so we pass `layer.weight.T` here.
-        # - This is a temporary workaround. The planned replacement quant-matmul op will accept the
-        #   canonical (non-transposed) weight layout directly, so this explicit transpose will be removed
-        #   once that op is enabled on 310P.
+        # quant_batch_matmul_v3 consumes the weight as a FRACTAL_NZ tensor in
+        # [K, N] view carrying the ZN byte layout (storage [K1, N1, 16, 32]
+        # with a compact K-tail when K % 32 != 0) -- exactly what
+        # maybe_trans_zn(weight) produces in process_weights_after_loading.
+        # transpose_x2 is therefore False.
+        if use_custom_quant_batch_matmul():
+            return quant_batch_matmul(
+                x,
+                layer.weight.data,
+                layer.deq_scale,
+                bias=quant_bias,
+                transpose_x2=False,
+                output_dtype=layer.params_dtype,
+            )
         return torch_npu.npu_quant_matmul(
             x,
-            layer.weight.data,
+            layer.weight,
             layer.deq_scale,
             bias=quant_bias,
             output_dtype=layer.params_dtype,
@@ -91,7 +104,10 @@ class AscendW8A8LinearMethod310(AscendW8A8Linear310pScheme):
         ).to(layer.aclnn_input_scale.dtype)
 
         # ---- matmul stage tensor ----
-        layer.weight.data = maybe_trans_nz(layer.weight.data).transpose(0, 1)
+        if use_custom_quant_batch_matmul():
+            layer.weight.data = maybe_trans_zn(layer.weight.data)
+        else:
+            layer.weight.data = maybe_trans_nz(layer.weight.data).transpose(0, 1)
 
         # ---- dequant stage tensors ----
         layer.weight_scale.data = torch.flatten(layer.weight_scale.data)
