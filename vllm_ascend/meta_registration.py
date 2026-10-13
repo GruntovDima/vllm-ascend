@@ -1,6 +1,7 @@
 import torch
 from torch.library import Library
 
+from vllm_ascend.device.device_config import is_310p
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
 # This file provides a template and registration utilities for writing "meta" implementations
