@@ -16,6 +16,7 @@
 from unittest.mock import MagicMock, patch
 
 import torch
+from vllm.config import CUDAGraphMode
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.attention.attention_v1 import (
@@ -99,6 +100,7 @@ class TestAscendAttentionBackendImpl310(TestBase):
         metadata.attn_mask = torch.randn(1, 1, 10, 10)
         metadata.query_lens = torch.tensor([10])
         metadata.seq_lens = torch.tensor([10])
+        metadata.seq_lens_cpu = torch.tensor([10], dtype=torch.int32)
         metadata.actual_seq_lengths_q = [10]
         metadata.block_tables = torch.zeros(1, 5, dtype=torch.long)
         metadata.num_actual_tokens = 10
@@ -118,12 +120,101 @@ class TestAscendAttentionBackendImpl310(TestBase):
         self.assertIs(kwargs["key"], key)
         self.assertIs(kwargs["value"], value)
         self.assertIs(kwargs["mask"], metadata.attn_mask)
-        self.assertIs(kwargs["seq_len"], metadata.seq_lens)
+        # Host seq_lens_cpu is fed to ATB directly (no device->host sync).
+        self.assertIs(kwargs["seq_len"], metadata.seq_lens_cpu)
         self.assertEqual(kwargs["scale_value"], self.impl.scale)
         self.assertEqual(kwargs["num_heads"], self.impl.num_heads)
         self.assertEqual(kwargs["num_kv_heads"], self.impl.num_kv_heads)
         self.assertIs(kwargs["out"], output)
         self.assertIs(result, output)
+
+    @patch("vllm_ascend._310p.dflash_full_and_piecewise.is_310p", return_value=True)
+    @patch("torch_npu._npu_flash_attention")
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_hybrid_piecewise_prefill_keeps_padding_out_of_logical_attention(
+        self,
+        mock_get_forward_context,
+        mock_npu_flash_attention,
+        mock_is_310p,
+    ):
+        """Catch physical descriptor padding being appended to the real request."""
+        real_tokens = 82
+        physical_tokens = 160
+        query = torch.randn(physical_tokens, 8, 64)
+        key = torch.randn(physical_tokens, 8, 64)
+        value = torch.randn(physical_tokens, 8, 64)
+        output = torch.full_like(query, 7)
+
+        self.mock_vllm_config.speculative_config.method = "dflash"
+        self.mock_vllm_config.compilation_config.cudagraph_mode = (
+            CUDAGraphMode.FULL_AND_PIECEWISE
+        )
+        self.mock_vllm_config.additional_config = {
+            "ascend_compilation_config": {
+                "dflash_full_and_piecewise_capture_config": {
+                    "piecewise_capture_size": 64,
+                    "full_capture_size": 160,
+                },
+            },
+        }
+        mock_get_forward_context.return_value.cudagraph_runtime_mode = (
+            CUDAGraphMode.PIECEWISE
+        )
+
+        metadata = self.attn_metadata
+        metadata.attn_mask = torch.randn(1, 1, physical_tokens, physical_tokens)
+        metadata.seq_lens = torch.tensor([real_tokens], dtype=torch.int32)
+        metadata.seq_lens_cpu = torch.tensor([real_tokens], dtype=torch.int32)
+
+        self.impl.support_compressed_mask = False
+        result = self.impl.forward_prefill_310(query, key, value, metadata, output)
+
+        mock_npu_flash_attention.assert_called_once()
+        kwargs = mock_npu_flash_attention.call_args.kwargs
+        self.assertEqual(kwargs["query"].shape[0], real_tokens)
+        self.assertEqual(kwargs["key"].shape[0], real_tokens)
+        self.assertEqual(kwargs["value"].shape[0], real_tokens)
+        self.assertEqual(kwargs["out"].shape[0], real_tokens)
+        torch.testing.assert_close(
+            kwargs["seq_len"], torch.tensor([real_tokens], dtype=torch.int32)
+        )
+        self.assertIs(result, output)
+        torch.testing.assert_close(
+            output[real_tokens:], torch.zeros_like(output[real_tokens:])
+        )
+
+    @patch("torch_npu._npu_reshape_and_cache")
+    @patch("torch_npu._npu_flash_attention")
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_forward_prefill_310_falls_back_to_device_copy(
+        self, mock_get_forward_context, mock_npu_flash_attention, mock_npu_reshape_and_cache
+    ):
+        """When no host seq_lens_cpu is attached, forward_prefill_310 must copy the
+        device seq_lens to host int32 (ATB flash attention needs host data)."""
+        query = torch.randn(10, 8, 64)
+        key = torch.randn(10, 8, 64)
+        value = torch.randn(10, 8, 64)
+        output = torch.empty_like(query)
+
+        host_seq_len = torch.tensor([10], dtype=torch.int32)
+        device_seq_len = MagicMock()
+        device_seq_len.device = MagicMock(type="npu")
+        device_seq_len.to.return_value = host_seq_len
+
+        metadata = self.attn_metadata
+        metadata.attn_state = AscendAttentionState.PrefillNoCache
+        metadata.attn_mask = torch.randn(1, 1, 10, 10)
+        metadata.seq_lens = device_seq_len
+        metadata.seq_lens_cpu = None
+
+        self.impl.support_compressed_mask = False
+        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        mock_npu_flash_attention.return_value = torch.ones(10, 8, 64)
+        self.impl.forward_impl(query, key, value, None, metadata, output)
+
+        device_seq_len.to.assert_called_once_with("cpu", dtype=torch.int32)
+        _, kwargs = mock_npu_flash_attention.call_args
+        self.assertIs(kwargs["seq_len"], host_seq_len)
 
     @patch("torch_npu.npu_format_cast", return_value=torch.randn((1, 128, 16, 16), dtype=torch.float16))
     @patch("torch_npu._npu_reshape_and_cache")
@@ -197,6 +288,40 @@ class TestAscendAttentionBackendImpl310(TestBase):
 
         mock_npu_paged_attention_splitfuse.assert_called_once()
 
+    @patch("torch_npu.npu_format_cast", return_value=torch.randn((1, 128, 16, 16), dtype=torch.float16))
+    @patch("torch_npu._npu_reshape_and_cache")
+    @patch("torch_npu._npu_paged_attention_splitfuse")
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_forward_chunked_prefill_non_causal_310(
+        self,
+        mock_get_forward_context,
+        mock_npu_paged_attention_splitfuse,
+        mock_npu_reshape_and_cache,
+        mock_format_cast,
+    ):
+        """Non-causal chunked prefill uses the all-zero splitfuse mask (dflash)."""
+        query = torch.randn(5, 8, 64)
+        output = torch.empty_like(query)
+        metadata = self.attn_metadata
+        metadata.attn_state = AscendAttentionState.ChunkedPrefill
+        metadata.causal = False
+        metadata.attn_mask = torch.randn(1, 128, 16, 16)
+        metadata.seq_lens = torch.tensor([1, 4])
+        metadata.query_start_loc = torch.tensor([0, 1, 5])
+        metadata.block_tables = torch.zeros(1, 5, dtype=torch.long)
+        metadata.num_actual_tokens = 5
+        metadata.slot_mapping = torch.zeros(10, dtype=torch.long)
+
+        self.impl.support_compressed_mask = False
+        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        with patch(
+            "vllm_ascend._310p.attention.attention_v1.AttentionMaskBuilder310.get_non_causal_splitfuse_mask",
+            return_value=torch.zeros(1, 128, 16, 16),
+        ) as mock_non_causal_mask:
+            self.impl.forward_impl(query, None, None, None, metadata, output)
+            mock_non_causal_mask.assert_called_once()
+            mock_npu_paged_attention_splitfuse.assert_called_once()
+
     @patch("vllm_ascend.attention.attention_v1.using_paged_attention")
     @patch("torch_npu._npu_paged_attention", create=True)
     @patch("torch_npu._npu_reshape_and_cache")
@@ -257,6 +382,27 @@ class TestAscendAttentionMetadataBuilder310(TestBase):
         expected = torch.tensor([1, 4, 6], dtype=torch.int32)
         torch.testing.assert_close(result, expected)
         assert result.data_ptr() == builder._query_lens_cpu_buffer[:3].data_ptr()
+
+    def test_fill_query_lens_cpu_refreshes_same_buffer_for_piecewise_replay(self):
+        """A fixed descriptor must consume the current runtime qLens values."""
+        builder = AscendMetadataBuilder310Direct.__new__(AscendMetadataBuilder310Direct)
+        builder._query_lens_cpu_buffer = torch.zeros(4, dtype=torch.int32, device="cpu")
+
+        first = builder._fill_query_lens_cpu(
+            num_reqs=1,
+            query_start_loc_cpu=torch.tensor([0, 640], dtype=torch.int32),
+            is_drafting=False,
+        )
+        first_snapshot = first.clone()
+        second = builder._fill_query_lens_cpu(
+            num_reqs=1,
+            query_start_loc_cpu=torch.tensor([0, 896], dtype=torch.int32),
+            is_drafting=False,
+        )
+
+        assert first.data_ptr() == second.data_ptr()
+        torch.testing.assert_close(first_snapshot, torch.tensor([640], dtype=torch.int32))
+        torch.testing.assert_close(second, torch.tensor([896], dtype=torch.int32))
 
     def test_fill_query_lens_cpu_with_buffer_is_drafting(self):
         builder = AscendMetadataBuilder310Direct.__new__(AscendMetadataBuilder310Direct)

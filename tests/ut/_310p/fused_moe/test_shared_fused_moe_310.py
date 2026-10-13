@@ -14,6 +14,7 @@ from vllm_ascend._310p.fused_moe.fused_moe import (
     AscendUnquantizedFusedMoEMethod310,
 )
 from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.ops.fused_moe.dataclass import fused_experts as fused_experts_dataclass
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import (
     PreparedSharedExpertInput,
     RoutedMoEMilestones,
@@ -98,6 +99,19 @@ def test_routed_experts_310_replaces_only_unquantized_method_after_parent_init(m
     else:
         assert routed_experts.quant_method is parent_method
         specialized_method_factory.assert_not_called()
+
+
+def test_full_decode_eventless_moe_skips_capture_events(monkeypatch):
+    current_stream = MagicMock()
+    sentinel = object()
+    current_stream.record_event.return_value = sentinel
+    monkeypatch.setattr(fused_experts_dataclass.torch.npu, "current_stream", lambda: current_stream)
+
+    assert fused_experts_dataclass.maybe_record_fused_moe_event(False) is None
+    current_stream.record_event.assert_not_called()
+
+    assert fused_experts_dataclass.maybe_record_fused_moe_event(True) is sentinel
+    current_stream.record_event.assert_called_once_with()
 
 
 def test_runner_310_installs_specialized_comm():

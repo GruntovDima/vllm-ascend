@@ -143,6 +143,26 @@ Design / ops (analysis branch): `docs/source/developer_guide/Design_Documents/ru
 | `fuse_norm_quant`  | bool | `True` | Whether to enable fuse_norm_quant pass. |
 | `fuse_qknorm_rope` | bool | `True` | Whether to enable fuse_qknorm_rope pass. If Triton is not in the environment, set it to False. |
 | `fuse_muls_add` | bool | `True` | Whether to enable fuse_muls_add pass.|
+| `dflash_full_and_piecewise_capture_config` | dict | unset | Explicit mode-specific capture portfolio for Ascend 310P DFlash `FULL_AND_PIECEWISE`. See [Graph Mode Guide](../feature_guide/graph_mode.md#310p-dflash-asymmetric-portfolio). |
+
+`dflash_full_and_piecewise_capture_config` accepts one or multiple PIECEWISE
+capacities and one or multiple FULL capacities:
+
+| Name | Type | Description |
+| ---- | ---- | ----------- |
+| `piecewise_capture_size` | int or list[int] | One or more resident PIECEWISE descriptor capacities. A list must be non-empty and contain unique positive integers, each divisible by `num_speculative_tokens + 1`. Every value must fit `max_num_batched_tokens`. |
+| `full_capture_size` | int or list[int] | One or more resident FULL descriptor capacities, shared by Target and Draft. A list must be non-empty and contain unique positive integers. Every value must be divisible by `num_speculative_tokens + 1` and fit the deployment limits. |
+
+This option is active only for Ascend 310P + DFlash +
+`FULL_AND_PIECEWISE`. If it is omitted, the existing upstream shared
+`cudagraph_capture_sizes` behavior is unchanged. Scalar values remain supported
+for both fields. Multiple PIECEWISE capacities are an explicit opt-in
+configuration capability, not a claim of Event-resource readiness. Each added
+PIECEWISE capacity retains the model's captured subgraphs; each added FULL
+capacity retains Target and Draft graphs for every LoRA capture case. Validate
+graph memory and Event resources on the target deployment. This option does
+not change the Event allocator or runtime dispatcher. Until that validation
+passes, retain a single PIECEWISE capacity for production workloads.
 
 **ascend_warmup_config**
 

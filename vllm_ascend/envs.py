@@ -22,6 +22,14 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+FDO_PROBE_DIR_ENV = "VLLM_ASCEND_310P_DFLASH_FDO_PROBE_DIR"
+FDO_PROBE_COMPONENT_ENV = "VLLM_ASCEND_310P_DFLASH_FDO_PROBE_COMPONENT"
+FDO_PROBE_LAYER_ENV = "VLLM_ASCEND_310P_DFLASH_FDO_PROBE_LAYER"
+FDO_PROBE_DATASET_REQUEST_ENV = "VLLM_ASCEND_310P_DFLASH_FDO_PROBE_DATASET_REQUEST"
+FDO_PROBE_MAX_ITERATIONS_ENV = "VLLM_ASCEND_310P_DFLASH_FDO_PROBE_MAX_ITERATIONS"
+FDO_PROBE_MAX_RECORDS_ENV = "VLLM_ASCEND_310P_DFLASH_FDO_PROBE_MAX_RECORDS"
+FDO_PROBE_MAX_BYTES_ENV = "VLLM_ASCEND_310P_DFLASH_FDO_PROBE_MAX_BYTES"
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -87,6 +95,28 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # Optional owner-only output directory that enables the 310P DFlash FDO
+    # numerical probe. Unset by default, so the probe adds no runtime work.
+    # The path may contain model intermediates and is not a credential.
+    FDO_PROBE_DIR_ENV: lambda: os.getenv(FDO_PROBE_DIR_ENV, None),
+    # Probe component selector. Valid values are boundary, target,
+    # target_layer, draft, rejection, and layer. Default: boundary.
+    FDO_PROBE_COMPONENT_ENV: lambda: os.getenv(FDO_PROBE_COMPONENT_ENV, "boundary"),
+    # Optional target/draft layer selector. Accepts "all" or comma-separated
+    # zero-based layer indices. Default: unset.
+    FDO_PROBE_LAYER_ENV: lambda: os.getenv(FDO_PROBE_LAYER_ENV, None),
+    # Zero-based formal-dataset request index attached to probe artifacts.
+    # Must be non-negative. Default: 0.
+    FDO_PROBE_DATASET_REQUEST_ENV: lambda: os.getenv(FDO_PROBE_DATASET_REQUEST_ENV, "0"),
+    # Maximum speculative iterations recorded per rank. Must be positive.
+    # Default: 64.
+    FDO_PROBE_MAX_ITERATIONS_ENV: lambda: os.getenv(FDO_PROBE_MAX_ITERATIONS_ENV, "64"),
+    # Maximum tensor records written by one probe. Must be positive.
+    # Default: 256.
+    FDO_PROBE_MAX_RECORDS_ENV: lambda: os.getenv(FDO_PROBE_MAX_RECORDS_ENV, "256"),
+    # Maximum artifact bytes written by one probe. Minimum: 1024.
+    # Default: 128 MiB.
+    FDO_PROBE_MAX_BYTES_ENV: lambda: os.getenv(FDO_PROBE_MAX_BYTES_ENV, str(128 * 1024 * 1024)),
 }
 
 # end-env-vars-definition

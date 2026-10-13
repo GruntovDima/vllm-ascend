@@ -88,9 +88,11 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
         self.assertEqual(params["weight_offset"].shape, (10, 1))
 
     @patch("torch_npu.npu_dynamic_quant", create=True)
-    @patch("torch_npu.npu_quant_matmul")
-    def test_apply_310(self, mock_npu_quant_matmul, mock_npu_dynamic_quantize):
+    @patch("vllm_ascend._310p.quantization.methods.w8a8_dynamic.quant_batch_matmul")
+    def test_apply_310(self, mock_quant_batch_matmul, mock_npu_dynamic_quantize):
         layer = MagicMock()
+        # int8 [N, K] weight with the matching per-channel scale, per the ZN
+        # contract consumed by quant_batch_matmul_v3 with transpose_x2=False.
         layer.weight = torch.randint(-127, 128, (256, 128), dtype=torch.int8)
         layer.weight_scale = torch.randn(256, dtype=torch.float32)
         layer.params_dtype = torch.float16
@@ -101,25 +103,32 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
         mock_npu_dynamic_quantize.return_value = expect_x_output, expect_pertoken_scale_output
 
         expected_y_output = torch.randn(32, 256)
-        mock_npu_quant_matmul.return_value = expected_y_output
+        mock_quant_batch_matmul.return_value = expected_y_output
 
         output = self.method.apply(layer, x, tp_rank=0)
 
-        mock_npu_dynamic_quantize.assert_called_with(x.contiguous())
-        mock_npu_quant_matmul.assert_called_once()
-        (args, kwargs) = mock_npu_quant_matmul.call_args
+        mock_npu_dynamic_quantize.assert_called_with(x)
+        mock_quant_batch_matmul.assert_called_once()
+        (args, kwargs) = mock_quant_batch_matmul.call_args
 
+        # positional args
         self.assertTrue(torch.equal(args[0], expect_x_output))
         self.assertTrue(torch.equal(args[1], layer.weight.data))
         self.assertTrue(torch.equal(args[2], layer.weight_scale))
 
+        # kwargs
         self.assertTrue(torch.equal(kwargs["pertoken_scale"], expect_pertoken_scale_output))
-        self.assertTrue(kwargs["bias"] is None)
+        self.assertEqual(kwargs["transpose_x2"], False)
         self.assertEqual(kwargs["output_dtype"], x.dtype)
+        # No bias is forwarded when the layer has none.
+        self.assertNotIn("bias", kwargs)
 
         self.assertTrue(torch.equal(output, expected_y_output))
 
-    @patch("vllm_ascend._310p.quantization.methods.w8a8_dynamic.maybe_trans_zn", side_effect=lambda x: x)
+    @patch(
+        "vllm_ascend._310p.quantization.methods.w8a8_dynamic.maybe_trans_zn",
+        side_effect=lambda weight: weight.t(),
+    )
     def test_process_weights_after_loading_uses_zn_kn_layout_310p(self, mock_trans_zn):
         from types import SimpleNamespace
 
@@ -128,10 +137,49 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
             weight_scale=SimpleNamespace(data=torch.randn(128, 1, dtype=torch.bfloat16)),
             weight_offset=SimpleNamespace(data=torch.randn(128, 1, dtype=torch.bfloat16)),
         )
+        original_weight = layer.weight.data
 
         self.method.process_weights_after_loading(layer)
 
-        mock_trans_zn.assert_called_once()
-        self.assertEqual(layer.weight_scale.data.ndim, 1)
-        self.assertFalse(hasattr(layer, "weight_fp"))
+        # The 310P ZN policy relayouts the quantized weight to a logical
+        # [K, N] view; per-channel scale/offset are stored flattened.
+        mock_trans_zn.assert_called_once_with(original_weight)
         self.assertEqual(layer.weight.data.shape, (256, 128))
+        self.assertEqual(layer.weight_scale.data.ndim, 1)
+        self.assertEqual(layer.weight_offset.data.ndim, 1)
+        self.assertFalse(hasattr(layer, "weight_fp"))
+
+    @patch("torch_npu.npu_dynamic_quant", create=True)
+    @patch("vllm_ascend._310p.quantization.methods.w8a8_dynamic.quant_batch_matmul")
+    def test_apply_uses_one_matmul_for_the_complete_token_dimension(
+        self,
+        mock_quant_batch_matmul,
+        mock_npu_dynamic_quantize,
+    ):
+        layer = MagicMock()
+        layer.weight = torch.randint(-127, 128, (128, 256), dtype=torch.int8)
+        layer.weight_scale = torch.randn(256, dtype=torch.float32)
+
+        for num_tokens in (233, 1025, 2049):
+            with self.subTest(num_tokens=num_tokens):
+                x = torch.randn(num_tokens, 128, dtype=torch.float16)
+                quantized_x = torch.randint(-128, 127, x.shape, dtype=torch.int8)
+                pertoken_scale = torch.randn(num_tokens, dtype=torch.float32)
+                expected_output = torch.randn(num_tokens, 256, dtype=x.dtype)
+                mock_npu_dynamic_quantize.reset_mock()
+                mock_quant_batch_matmul.reset_mock()
+                mock_npu_dynamic_quantize.return_value = quantized_x, pertoken_scale
+                mock_quant_batch_matmul.return_value = expected_output
+
+                output = self.method.apply(layer, x)
+
+                self.assertEqual(mock_quant_batch_matmul.call_count, 1)
+                args, kwargs = mock_quant_batch_matmul.call_args
+                self.assertIs(args[0], quantized_x)
+                self.assertEqual(args[1].data_ptr(), layer.weight.data_ptr())
+                self.assertIs(args[2], layer.weight_scale)
+                self.assertIs(kwargs["pertoken_scale"], pertoken_scale)
+                self.assertEqual(kwargs["transpose_x2"], False)
+                self.assertEqual(kwargs["output_dtype"], x.dtype)
+                self.assertIsNone(kwargs.get("bias"))
+                self.assertIs(output, expected_output)

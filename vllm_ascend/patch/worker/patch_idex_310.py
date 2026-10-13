@@ -1,17 +1,52 @@
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
+from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Attention, DFlashQwen3ForCausalLM, DFlashQwen3Model
 from vllm.third_party.flash_linear_attention.ops import index as fla_index
+from vllm.v1.spec_decode.dflash import DFlashProposer
 
 from vllm_ascend._310p.ops.fla.gdn_310 import AscendGatedDeltaNetAttention310
 from vllm_ascend._310p.ops.fla.idex import (
     prepare_chunk_indices_310,
     prepare_chunk_offsets_310,
 )
+from vllm_ascend._310p.spec_decode.dflash_model_310 import (
+    dflash_attention_forward_310,
+    patch_dflash_read_mask_embedding_310,
+    precompute_and_store_context_kv_310,
+)
+from vllm_ascend._310p.spec_decode.dflash_proposer_310 import (
+    AscendDflashProposer310,
+    AscendDsparkProposer310,
+    wrap_dummy_run_with_draft_flag,
+)
+from vllm_ascend._310p.spec_decode.dflash_vocab import load_dflash_weights_310, maybe_share_dflash_lm_head_310
 from vllm_ascend._310p.spec_decode.llm_base_proposer_310 import AscendSpecDecodeBaseProposer310
+from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
+from vllm_ascend.spec_decode.dspark_proposer import AscendDsparkProposer
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
 from vllm_ascend.utils import is_rc_device
 
 fla_index.prepare_chunk_indices = prepare_chunk_indices_310
 fla_index.prepare_chunk_offsets = prepare_chunk_offsets_310
+
+
+_original_spec_decode_base_proposer_init_310 = AscendSpecDecodeBaseProposer.__init__
+
+
+def _init_spec_decode_base_proposer_310(self, *args, **kwargs):
+    """Preserve the public constructor and initialize guarded 310P buffers."""
+    _original_spec_decode_base_proposer_init_310(self, *args, **kwargs)
+    AscendSpecDecodeBaseProposer310._initialize_hybrid_draft_slot_mapping_310(self)
+
+
+AscendSpecDecodeBaseProposer.__init__ = (  # type: ignore[method-assign]
+    _init_spec_decode_base_proposer_310
+)
+AscendSpecDecodeBaseProposer.load_model = (  # type: ignore[method-assign]
+    AscendSpecDecodeBaseProposer310.load_model
+)
+AscendSpecDecodeBaseProposer._maybe_share_lm_head = maybe_share_dflash_lm_head_310  # type: ignore[method-assign]
+DFlashQwen3ForCausalLM.load_weights = load_dflash_weights_310  # type: ignore[method-assign]
 
 # 310P: protect tail slot during MTP input_ids shift to avoid GatherV2 corruption
 # caused by the NPU slice-assign writing one element past the intended range
@@ -22,6 +57,74 @@ AscendSpecDecodeBaseProposer.set_inputs_first_pass = (  # type: ignore[method-as
 AscendSpecDecodeBaseProposer._run_merged_draft = (  # type: ignore[method-assign]
     AscendSpecDecodeBaseProposer310._run_merged_draft
 )
+AscendSpecDecodeBaseProposer._compute_draft_step_slot_mapping = (  # type: ignore[method-assign]
+    AscendSpecDecodeBaseProposer310._compute_draft_step_slot_mapping
+)
+AscendSpecDecodeBaseProposer._prepare_full_decode_draft_rope = (  # type: ignore[method-assign]
+    AscendSpecDecodeBaseProposer310._prepare_full_decode_draft_rope
+)
+AscendSpecDecodeBaseProposer._finish_full_decode_draft_rope = (  # type: ignore[method-assign]
+    AscendSpecDecodeBaseProposer310._finish_full_decode_draft_rope
+)
+
+# 310P has no Triton, so dflash/dspark build their draft-model inputs via the
+# AscendC npu_copy_and_expand_dflash_inputs custom op instead of the Triton
+# kernel used on other platforms.
+AscendDflashProposer.__init__ = AscendDflashProposer310.__init__  # type: ignore[method-assign]
+AscendDflashProposer._raise_if_mrope = AscendDflashProposer310._raise_if_mrope  # type: ignore[method-assign]
+# GPUModelRunner.__init__ creates a temporary upstream DFlash proposer before
+# NPUModelRunner replaces it. Scope the bootstrap exception to that class too;
+# the shared speculative base (and EAGLE/DSpark) keeps its original guard.
+DFlashProposer._raise_if_mrope = AscendDflashProposer310._raise_if_mrope  # type: ignore[method-assign]
+AscendDflashProposer.set_inputs_first_pass = (  # type: ignore[method-assign]
+    AscendDflashProposer310.set_inputs_first_pass
+)
+AscendDflashProposer.prepare_next_token_ids_padded = (  # type: ignore[method-assign]
+    AscendDflashProposer310.prepare_next_token_ids_padded
+)
+AscendDflashProposer.build_model_inputs_first_pass = (  # type: ignore[method-assign]
+    AscendDflashProposer310.build_model_inputs_first_pass
+)
+AscendDflashProposer._build_first_pass_per_layer_attn_metadata = (  # type: ignore[method-assign]
+    AscendDflashProposer310._build_first_pass_per_layer_attn_metadata
+)
+AscendDsparkProposer.set_inputs_first_pass = (  # type: ignore[method-assign]
+    AscendDsparkProposer310.set_inputs_first_pass
+)
+
+# 310P: the profile branch of dummy_run calls the draft model directly (not via
+# _run_merged_draft), so enable the drafting RoPE flag around dummy_run so the
+# draft builds cos/sin from its own cache (required for VL main + text draft,
+# where the global cos/sin slice is never populated). dspark has an independent
+# dummy_run, so wrap both.
+AscendDflashProposer.dummy_run = wrap_dummy_run_with_draft_flag(  # type: ignore[method-assign]
+    AscendDflashProposer.dummy_run
+)
+AscendDsparkProposer.dummy_run = wrap_dummy_run_with_draft_flag(  # type: ignore[method-assign]
+    AscendDsparkProposer.dummy_run
+)
+
+# 310P has no functional Triton: kernels cannot be compiled (bishengir-compile
+# fails on Ascend310P3) and the 310P worker never calls
+# init_device_properties_triton(), so get_vectorcore_num() asserts. Yet
+# vllm.triton_utils.HAS_TRITON is True because the triton package imports, so
+# every ``if HAS_TRITON:`` runtime gate takes the broken Triton path (e.g.
+# rejection_sample() and prepare_inputs_padded() both crash on the uninitialized
+# vector-core count). Force the flag off on the vllm_ascend modules that gate
+# inference behavior on it so their PyTorch fallbacks are used consistently.
+import vllm_ascend.sample.rejection_sampler as _rejection_sampler_mod  # noqa: E402
+import vllm_ascend.sample.sampler as _sampler_mod  # noqa: E402
+import vllm_ascend.spec_decode.llm_base_proposer as _llm_base_proposer_mod  # noqa: E402
+
+for _mod in (_rejection_sampler_mod, _sampler_mod, _llm_base_proposer_mod):
+    if getattr(_mod, "HAS_TRITON", False):
+        _mod.HAS_TRITON = False
+
+# 310P: patch_qwen3_dflash is excluded on 310P, so wire the dflash model
+# precompute (context KV + RoPE) and mask-embedding fallback here.
+DFlashQwen3Model.precompute_and_store_context_kv = precompute_and_store_context_kv_310  # type: ignore[method-assign]
+DFlashQwen3Attention.forward = dflash_attention_forward_310  # type: ignore[method-assign]
+patch_dflash_read_mask_embedding_310()
 
 # Patch _warmup_prefill_kernels to no-op on 310P: triton.next_power_of_2 does
 # not exist in the triton version used on 310P CI, and NPU does not use these
@@ -34,9 +137,23 @@ QwenGatedDeltaNetAttention.get_state_dtype = AscendGatedDeltaNetAttention310.get
 # MTP ACL graph padding replay fixes provided by gdn_attn_builder_310.py.
 QwenGatedDeltaNetAttention.get_attn_backend = AscendGatedDeltaNetAttention310.get_attn_backend
 
-# Vision pos-embed: 310P images do not install Triton, so upstream
-# ``HAS_TRITON=False`` already selects ``pos_embed_interpolate_native``.
-# No ``fast_pos_embed_interpolate`` rewrite is required.
+# Eagerly selected even though upstream ``HAS_TRITON=False`` also falls back
+# to ``pos_embed_interpolate_native``: DFlash's Qwen3-VL path pins the native
+# implementation explicitly.
+# 310P: `patch_qwen3vl` is excluded on 310P because it also patches the Qwen3
+# attention forward onto a Triton kernel (triton_split_qkv_rmsnorm_mrope), which
+# 310P cannot compile.  The vision pos-embed interpolation, however, has a Triton
+# kernel too (bishengir-compile fails on Ascend310P3), so wire only the native
+# (non-Triton) pos-embed replacement here.  Guarded because older vLLM releases
+# may not expose Qwen3-VL / pos_embed_interpolate_native.
+try:
+    from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer as _Qwen3VisionTransformer310
+
+    from vllm_ascend._310p.ops.qwen3vl_310 import fast_pos_embed_interpolate_310
+
+    _Qwen3VisionTransformer310.fast_pos_embed_interpolate = fast_pos_embed_interpolate_310  # type: ignore[method-assign]
+except Exception:
+    pass
 
 if is_rc_device():
     from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer

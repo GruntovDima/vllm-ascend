@@ -17,7 +17,15 @@
 
 import torch
 import torch_npu
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 
+from vllm_ascend._310p.dflash_full_and_piecewise import (
+    is_310p_dflash_effective_piecewise,
+    is_310p_dflash_full_and_piecewise,
+)
+from vllm_ascend._310p.dflash_full_decode_only import is_310p_dflash_full_decode_only
 from vllm_ascend.attention.attention_v1 import AscendMetadata
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, nd_to_nz_2d, nd_to_nz_spec
 
@@ -32,6 +40,7 @@ def is_compressed_mask_supported() -> bool:
 class AttentionMaskBuilder310:
     chunked_prefill_attn_mask = None
     compressed_chunked_prefill_attn_mask = None
+    compressed_non_causal_splitfuse_mask = None
     max_seqlen = 16384
 
     def __init__(self, device: torch.device, max_seqlen: int):
@@ -69,8 +78,176 @@ class AttentionMaskBuilder310:
         mask.masked_fill_(upper, float("-inf"))
         return mask
 
+    @staticmethod
+    def _requires_graph_safe_query_positions() -> bool:
+        try:
+            forward_context = get_forward_context()
+        except (AssertionError, RuntimeError) as exc:
+            logger.debug(
+                "[310p-dflash-graph/mask-route] context=unavailable error=%s",
+                type(exc).__name__,
+            )
+            return False
+        vllm_config = getattr(forward_context, "vllm_config", None)
+        if vllm_config is None:
+            logger.debug(
+                "[310p-dflash-graph/mask-route] context=missing-vllm-config runtime=%s",
+                getattr(
+                    getattr(forward_context, "cudagraph_runtime_mode", None),
+                    "name",
+                    None,
+                ),
+            )
+            return False
+        runtime_mode = forward_context.cudagraph_runtime_mode
+        piecewise_graph = is_310p_dflash_effective_piecewise(
+            vllm_config,
+            runtime_mode,
+        )
+        hybrid_full_graph = runtime_mode == CUDAGraphMode.FULL and is_310p_dflash_full_and_piecewise(vllm_config)
+        full_decode_graph = runtime_mode == CUDAGraphMode.FULL and is_310p_dflash_full_decode_only(vllm_config)
+        logger.debug(
+            "[310p-dflash-graph/mask-route] runtime=%s configured=%s piecewise=%s hybrid_full=%s full_decode_only=%s",
+            getattr(runtime_mode, "name", runtime_mode),
+            getattr(
+                vllm_config.compilation_config.cudagraph_mode,
+                "name",
+                vllm_config.compilation_config.cudagraph_mode,
+            ),
+            piecewise_graph,
+            hybrid_full_graph,
+            full_decode_graph,
+        )
+        return piecewise_graph or hybrid_full_graph or full_decode_graph
+
+    @staticmethod
+    def _get_graph_safe_query_positions(
+        attn_metadata: AscendMetadata,
+        device: torch.device,
+        causal: bool,
+        zero_descriptor_padding: bool = False,
+    ) -> torch.Tensor:
+        """Build SplitFuse rows entirely on-device for capture and replay."""
+        num_query_tokens = int(attn_metadata.num_actual_tokens)
+        query_start_loc = attn_metadata.query_start_loc.to(
+            device=device,
+            dtype=torch.int32,
+        )
+        seq_lens = attn_metadata.seq_lens.to(device=device, dtype=torch.int32)
+        num_reqs = seq_lens.shape[0]
+
+        token_indices = torch.arange(
+            num_query_tokens,
+            dtype=torch.int32,
+            device=device,
+        )
+        row_starts = query_start_loc[:num_reqs]
+        row_ends = query_start_loc[1 : num_reqs + 1]
+        request_mask = (token_indices.unsqueeze(0) >= row_starts.unsqueeze(1)) & (
+            token_indices.unsqueeze(0) < row_ends.unsqueeze(1)
+        )
+        valid_token_mask = request_mask.any(dim=0)
+        request_indices = request_mask.to(torch.int32).argmax(dim=0)
+        if not zero_descriptor_padding:
+            request_indices = torch.where(
+                valid_token_mask,
+                request_indices,
+                torch.full_like(request_indices, num_reqs - 1),
+            )
+
+        token_row_starts = row_starts.index_select(0, request_indices)
+        query_lens = (row_ends - row_starts).index_select(0, request_indices)
+        context_lens = seq_lens.index_select(0, request_indices)
+        if causal:
+            positions = context_lens - query_lens + token_indices - token_row_starts
+        else:
+            positions = context_lens - 1
+        positions.clamp_min_(0)
+        if zero_descriptor_padding:
+            positions.mul_(valid_token_mask.to(dtype=positions.dtype))
+        return positions
+
+    @staticmethod
+    def _requires_zero_descriptor_padding() -> bool:
+        try:
+            forward_context = get_forward_context()
+        except (AssertionError, RuntimeError):
+            return False
+        vllm_config = getattr(forward_context, "vllm_config", None)
+        return (
+            vllm_config is not None
+            and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and is_310p_dflash_full_decode_only(vllm_config)
+        )
+
     @classmethod
-    def get_splitfuse_mask(cls, attn_metadata: AscendMetadata, device: torch.device):
+    def _get_query_positions(
+        cls,
+        attn_metadata: AscendMetadata,
+        device: torch.device,
+        causal: bool,
+    ) -> torch.Tensor:
+        if cls._requires_graph_safe_query_positions():
+            return cls._get_graph_safe_query_positions(
+                attn_metadata,
+                device,
+                causal=causal,
+                zero_descriptor_padding=cls._requires_zero_descriptor_padding(),
+            )
+
+        qsl = attn_metadata.query_start_loc.to("cpu", dtype=torch.int32)
+        query_lens = (qsl[1:] - qsl[:-1]).tolist()
+        context_lens = attn_metadata.seq_lens.to("cpu", dtype=torch.int32).tolist()
+        if causal:
+            rows = [
+                row
+                for query_len, context_len in zip(query_lens, context_lens)
+                for row in range(context_len - query_len, context_len)
+            ]
+        else:
+            rows = [
+                context_len - 1 for query_len, context_len in zip(query_lens, context_lens) for _ in range(query_len)
+            ]
+        return torch.tensor(rows, dtype=torch.int32, device=device)
+
+    @classmethod
+    def _forward_mask_cache(cls, attn_metadata, device, causal, query_head_repeat=1):
+        """Share mask preparation only inside one exact FDO FULL forward.
+
+        A capture records the producer once and every graph replay executes it
+        again using the updated device metadata. Nothing is cached across
+        forwards, graph descriptors, target/draft contexts, or PIECEWISE graphs.
+        Metadata is read-only for the duration of a model forward.
+        """
+        try:
+            context = get_forward_context()
+        except (AssertionError, RuntimeError):
+            return None, None
+        config = getattr(context, "vllm_config", None)
+        if (
+            config is None
+            or context.cudagraph_runtime_mode != CUDAGraphMode.FULL
+            or not is_310p_dflash_full_decode_only(config)
+        ):
+            return None, None
+        cache = getattr(context, "splitfuse_mask_cache_310", None)
+        if cache is None:
+            cache = {}
+            context.splitfuse_mask_cache_310 = cache
+        key = (
+            id(attn_metadata),
+            id(attn_metadata.query_start_loc),
+            id(attn_metadata.seq_lens),
+            int(attn_metadata.num_actual_tokens),
+            str(device),
+            causal,
+            cls.max_seqlen,
+            query_head_repeat,
+        )
+        return cache, key
+
+    @classmethod
+    def get_splitfuse_mask(cls, attn_metadata: AscendMetadata, device: torch.device, query_head_repeat: int = 1):
         """
         Generates and formats the attention mask for SplitFuse (chunked prefill) decoding.
 
@@ -85,17 +262,53 @@ class AttentionMaskBuilder310:
         Returns:
             torch.Tensor: The splitfuse attention mask cast to ACL_FORMAT_FRACTAL_NZ.
         """
+        cache, key = cls._forward_mask_cache(attn_metadata, device, causal=True, query_head_repeat=query_head_repeat)
+        if cache is not None and key in cache:
+            return cache[key][1]
         if cls.chunked_prefill_attn_mask is None:
             cls.chunked_prefill_attn_mask = cls.gen_causal_additive_mask(cls.max_seqlen, device)
-        qsl = attn_metadata.query_start_loc.to("cpu", dtype=torch.int32)
-        qlens = qsl[1:] - qsl[:-1]
-        q_list = qlens.tolist()
-        context_lens = attn_metadata.seq_lens.to("cpu", dtype=torch.int32)
-        c_list = context_lens.tolist()
-        pos_list = [p for ql, cl in zip(q_list, c_list) for p in range(cl - ql, cl)]
-        position = torch.tensor(pos_list, dtype=torch.int32, device=device)
+        position = cls._get_query_positions(attn_metadata, device, causal=True)
+        if query_head_repeat != 1:
+            # Fold independent GQA heads into query rows. Repeat row indices
+            # before gathering, avoiding a costly conversion/repeat of NZ masks.
+            position = position[:, None].expand(-1, query_head_repeat).reshape(-1)
         splitfuse_mask = cls.chunked_prefill_attn_mask.index_select(0, position)
         splitfuse_mask_nz = torch_npu.npu_format_cast(nd_to_nz_spec(splitfuse_mask).contiguous(), ACL_FORMAT_FRACTAL_NZ)
+        if cache is not None:
+            # Retain metadata to prevent identity reuse within this context.
+            cache[key] = (attn_metadata, splitfuse_mask_nz)
+        return splitfuse_mask_nz
+
+    @classmethod
+    def get_non_causal_splitfuse_mask(
+        cls, attn_metadata: AscendMetadata, device: torch.device, query_head_repeat: int = 1
+    ):
+        """SplitFuse mask for full / non-causal attention (dflash/dspark draft).
+
+        Every query token must attend to the entire valid sequence ``[0, cl)``
+        (full context + all query tokens), and nothing beyond ``cl``.
+
+        A naive all-zero ``[num_query_tokens, max_seqlen]`` mask makes
+        ``_npu_paged_attention_splitfuse`` emit an all-zero output (the op
+        expects the same additive-mask structure as the causal path, where
+        out-of-range columns carry ``-inf``). Instead, reuse the causal additive
+        matrix and give every query token the row at ``cl - 1``: that row is 0
+        for columns ``< cl`` and ``-inf`` for columns ``>= cl``, i.e. full
+        attention over the valid sequence with the garbage tail masked. This
+        mirrors ``get_splitfuse_mask`` so the operator accepts it.
+        """
+        cache, key = cls._forward_mask_cache(attn_metadata, device, causal=False, query_head_repeat=query_head_repeat)
+        if cache is not None and key in cache:
+            return cache[key][1]
+        if cls.chunked_prefill_attn_mask is None:
+            cls.chunked_prefill_attn_mask = cls.gen_causal_additive_mask(cls.max_seqlen, device)
+        position = cls._get_query_positions(attn_metadata, device, causal=False)
+        if query_head_repeat != 1:
+            position = position[:, None].expand(-1, query_head_repeat).reshape(-1)
+        splitfuse_mask = cls.chunked_prefill_attn_mask.index_select(0, position)
+        splitfuse_mask_nz = torch_npu.npu_format_cast(nd_to_nz_spec(splitfuse_mask).contiguous(), ACL_FORMAT_FRACTAL_NZ)
+        if cache is not None:
+            cache[key] = (attn_metadata, splitfuse_mask_nz)
         return splitfuse_mask_nz
 
     @classmethod
@@ -118,6 +331,23 @@ class AttentionMaskBuilder310:
             mask = torch.triu(mask, diagonal=1)
             cls.compressed_chunked_prefill_attn_mask = mask.mul_(PAGED_ATTENTION_COMPRESSED_MASK_VALUE)
         return cls.compressed_chunked_prefill_attn_mask
+
+    @classmethod
+    def get_compressed_non_causal_splitfuse_mask(cls, device: torch.device):
+        """Fixed [2048, 2048] all-zero mask for compressed SplitFuse PA.
+
+        Matches ``sparse_mode=0`` / no-mask semantics on the generic path.
+        """
+        if (
+            cls.compressed_non_causal_splitfuse_mask is None
+            or cls.compressed_non_causal_splitfuse_mask.device != device
+        ):
+            cls.compressed_non_causal_splitfuse_mask = torch.zeros(
+                size=(COMPRESSED_MASK_SEQ_LEN, COMPRESSED_MASK_SEQ_LEN),
+                dtype=torch.float16,
+                device=device,
+            )
+        return cls.compressed_non_causal_splitfuse_mask
 
     def get_attention_mask(self, causal: bool, model_config) -> torch.Tensor:
         """

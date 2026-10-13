@@ -55,6 +55,31 @@ def _zero_padded_tokens(
     return tensor * valid_mask.reshape(mask_shape).to(dtype=tensor.dtype)
 
 
+def _clear_states_without_initial(
+    states: torch.Tensor,
+    has_initial_state: torch.Tensor,
+) -> torch.Tensor:
+    """Zero the rows of ``states`` whose sequence has no initial state.
+
+    A boolean-mask ``index_put_`` (``states[~has_initial_state] = 0``) lowers to
+    an aicpu ``IndexPut`` kernel that fails on 310P (error 0x2a -> 507018). Use
+    an elementwise select instead, mirroring the Triton ``clear_ssm_states``
+    helper used on the non-310P path.
+
+    ``torch.where`` rather than a mask multiply: ``states * 0`` propagates any
+    NaN/Inf left in a stale cache row, whereas the ``index_put_`` this replaces
+    overwrote it unconditionally.
+    """
+    if states.numel() == 0:
+        return states
+
+    keep = has_initial_state.to(device=states.device, dtype=torch.bool).reshape(-1)
+    mask_shape = [states.shape[0]] + [1] * (states.ndim - 1)
+    keep = keep.reshape(mask_shape)
+    zero = torch.zeros((), dtype=states.dtype, device=states.device)
+    return torch.where(keep, states, zero)
+
+
 def _flatten_state_indices(
     ssm_state_indices: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -180,6 +205,26 @@ def _merge_spec_and_non_spec_outputs_310(
     out[non_spec_token_indx] = non_spec_out
 
 
+def _rearrange_mixed_qkv_310(self, mixed_qkv: torch.Tensor | None):
+    """Materialize Q/K/V separately without a second concatenation copy.
+
+    The upstream concatenate is meant for Triton fusion. On 310P, the three
+    materializations and concatenation are separate kernels. Consumers only
+    require contiguous tensors, not a shared backing allocation.
+    """
+    if mixed_qkv is None:
+        return None, None, None
+    seq_len = mixed_qkv.shape[0]
+    q_dim = self.key_dim // self.tp_size
+    v_dim = self.value_dim // self.tp_size
+    query, key, value = torch.split(mixed_qkv, [q_dim, q_dim, v_dim], dim=-1)
+    return (
+        query.contiguous().view(1, seq_len, q_dim // self.head_k_dim, self.head_k_dim),
+        key.contiguous().view(1, seq_len, q_dim // self.head_k_dim, self.head_k_dim),
+        value.contiguous().view(1, seq_len, v_dim // self.head_v_dim, self.head_v_dim),
+    )
+
+
 class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
     get_state_dtype = _310p_get_state_dtype
 
@@ -223,6 +268,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
         non_spec_token_indx = attn_metadata.non_spec_token_indx
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
+        non_spec_prefill_metadata = getattr(attn_metadata, "non_spec_prefill_metadata", None)
         self_kv_cache = self.kv_cache
         conv_state = self_kv_cache[0]
         ssm_state = self_kv_cache[1]
@@ -313,8 +359,8 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
             )
         else:
             mixed_qkv_non_spec = None
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+        query_spec, key_spec, value_spec = _rearrange_mixed_qkv_310(self, mixed_qkv_spec)
+        query_non_spec, key_non_spec, value_non_spec = _rearrange_mixed_qkv_310(self, mixed_qkv_non_spec)
 
         g, beta = fused_gdn_gating_pytorch(self.A_log, a, b, self.dt_bias)
         if attn_metadata.num_prefills > 0 or spec_sequence_masks is not None:
@@ -357,8 +403,10 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
 
             # 2.2: Process the remaining part
             if attn_metadata.num_prefills > 0:
+                if non_spec_prefill_metadata is None:
+                    raise RuntimeError("Expected non-spec prefill metadata for the 310P chunk GDN path.")
                 initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
-                initial_state[~has_initial_state, ...] = 0
+                initial_state = _clear_states_without_initial(initial_state, has_initial_state)
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
@@ -373,6 +421,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     cu_seqlens=non_spec_query_start_loc,
                     head_first=False,
                     use_qk_l2norm_in_kernel=True,
+                    cu_seqlens_host=non_spec_prefill_metadata.query_start_loc_host,
                 )
 
                 # Init cache

@@ -18,17 +18,527 @@
 from typing import Any
 
 import torch
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_ascend._310p.ops.rotary_embedding import AscendRotaryEmbedding310
+from vllm_ascend._310p.attention.dflash_hybrid_draft_graph_safe_attention import (
+    DFlashHybridDraftAttentionInputs310,
+    copy_dflash_hybrid_draft_attention_inputs_310,
+)
+from vllm_ascend._310p.attention.metadata_builder import (
+    get_dflash_hybrid_draft_attention_inputs_310,
+)
+from vllm_ascend._310p.dflash_full_and_piecewise import (
+    is_310p_dflash_full_and_piecewise,
+)
+from vllm_ascend._310p.dflash_full_decode_only import (
+    is_310p_dflash_full_decode_only,
+)
+from vllm_ascend._310p.dflash_piecewise import is_310p_dflash_piecewise
+from vllm_ascend._310p.ops.rotary_embedding import (
+    AscendRotaryEmbedding310,
+    clear_full_decode_draft_rope_310,
+    get_full_decode_draft_rope_buffers_310,
+    prepare_full_decode_draft_rope_310,
+)
+from vllm_ascend._310p.spec_decode.dflash_mrope import DFlashMRoPEState310
+from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
 
 _original_run_merged_draft = AscendSpecDecodeBaseProposer._run_merged_draft
+_original_load_model = AscendSpecDecodeBaseProposer.load_model
+_original_compute_draft_step_slot_mapping = AscendSpecDecodeBaseProposer._compute_draft_step_slot_mapping
+
+
+class DFlashHybridDraftACLGraphWrapper310(ACLGraphWrapper):
+    """Refresh FAP device inputs around the complete merged Draft graph."""
+
+    def __init__(self, *args, proposer, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.proposer = proposer
+        self._hybrid_context_slots_310: dict[int, list[torch.Tensor]] = {}
+        self._hybrid_draft_staging_by_descriptor_310: dict[
+            Any,
+            dict[str, DFlashHybridDraftAttentionInputs310],
+        ] = {}
+
+    @staticmethod
+    def _collect_private_inputs_310(
+        per_layer_metadata: dict[str, Any],
+    ) -> dict[str, DFlashHybridDraftAttentionInputs310]:
+        result = {}
+        for layer_name, metadata in per_layer_metadata.items():
+            inputs = get_dflash_hybrid_draft_attention_inputs_310(metadata)
+            if inputs is None:
+                raise RuntimeError(
+                    f"310P DFlash Hybrid Draft FULL metadata is missing the private device contract for {layer_name}"
+                )
+            result[layer_name] = inputs
+        if not result:
+            raise RuntimeError("310P DFlash Hybrid Draft FULL received no layer metadata")
+        return result
+
+    @staticmethod
+    def _copy_runtime_inputs_310(
+        captured: dict[str, DFlashHybridDraftAttentionInputs310],
+        current: dict[str, DFlashHybridDraftAttentionInputs310],
+    ) -> None:
+        if captured.keys() != current.keys():
+            raise RuntimeError("310P DFlash Hybrid Draft FULL layer metadata changed after capture")
+        copied: set[tuple[int, int]] = set()
+        for layer_name, destination in captured.items():
+            source = current[layer_name]
+            identity = (
+                destination.valid_num_reqs.data_ptr(),
+                source.valid_num_reqs.data_ptr(),
+            )
+            if identity in copied:
+                continue
+            copied.add(identity)
+            copy_dflash_hybrid_draft_attention_inputs_310(
+                destination,
+                source,
+            )
+
+    def __call__(self, *args, **kwargs):
+        context = get_forward_context()
+        if is_310p_dflash_full_and_piecewise(self.vllm_config) and context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            return self._call_merged_draft(**kwargs)
+        return self._call_with_metadata(*args, **kwargs)
+
+    def _call_merged_draft(self, **kwargs):
+        proposer = self.proposer
+        capacity = kwargs["num_input_tokens"]
+        logical_context = proposer._dflash_num_context
+        if logical_context > capacity:
+            # A mixed step can have more context than the decode graph holds.
+            # Keep its original logical inputs and the existing eager path.
+            context = get_forward_context()
+            saved_mode = context.cudagraph_runtime_mode
+            context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+            try:
+                return self._call_with_metadata(**kwargs)
+            finally:
+                context.cudagraph_runtime_mode = saved_mode
+
+        indices = kwargs["token_indices_to_sample"]
+        k = proposer.num_speculative_tokens
+        graph_indices = capacity // (k + 1) * k
+        if not (
+            0 <= logical_context <= capacity <= proposer._context_slot_mapping_buffer.numel()
+            and capacity <= proposer._slot_mapping_buffer.numel()
+            and capacity % (k + 1) == 0
+            and indices.numel() % k == 0
+            and indices.numel() <= graph_indices <= proposer.token_indices_to_sample.numel()
+        ):
+            raise RuntimeError("310P FAP merged Draft inputs exceed graph capacity")
+
+        # Capture retains this query-slot buffer, not slot_mapping_group[0].
+        # Invalidate its stale padding after a larger batch so replay cannot
+        # write padded Draft K/V into cache slots reused by real tokens.
+        num_query_tokens = indices.numel() // k * (k + 1)
+        if num_query_tokens < capacity:
+            proposer._slot_mapping_buffer[num_query_tokens:capacity].fill_(-1)
+
+        # These tensors were previously consumed outside capture. Keep their
+        # addresses stable, refresh real entries, and invalidate context padding.
+        old_slots = getattr(proposer, "_dflash_context_slot_mapping_by_layer_310", None)
+        source_slots = (
+            old_slots
+            if old_slots is not None
+            else [proposer._context_slot_mapping_buffer] * len(proposer.attn_layer_names)
+        )
+        if len(source_slots) != len(proposer.attn_layer_names) or any(
+            slots.numel() < logical_context for slots in source_slots
+        ):
+            raise RuntimeError("310P FAP merged Draft context slots do not match its layers")
+        slots = self._hybrid_context_slots_310.get(capacity)
+        if slots is None:
+            slots = [torch.full_like(proposer._context_slot_mapping_buffer[:capacity], -1) for _ in source_slots]
+            self._hybrid_context_slots_310[capacity] = slots
+        for destination, source in zip(slots, source_slots):
+            destination[:logical_context].copy_(source[:logical_context])
+            destination[logical_context:].fill_(-1)
+        sample_buffer = proposer.token_indices_to_sample[:graph_indices]
+        sample_buffer[: indices.numel()].copy_(indices)
+        sample_buffer[indices.numel() :].zero_()
+        kwargs["token_indices_to_sample"] = sample_buffer
+        proposer._dflash_context_slot_mapping_by_layer_310 = slots
+        proposer._dflash_num_context = capacity
+        try:
+            result = self._call_with_metadata(**kwargs)
+            return result[: indices.numel() // k]
+        finally:
+            proposer._dflash_num_context = logical_context
+            if old_slots is None:
+                del proposer._dflash_context_slot_mapping_by_layer_310
+            else:
+                proposer._dflash_context_slot_mapping_by_layer_310 = old_slots
+
+    def _call_with_metadata(self, *args, **kwargs):
+        forward_context = get_forward_context()
+        descriptor = forward_context.batch_descriptor
+        entry = self.concrete_aclgraph_entries.get(descriptor)
+        is_full = (
+            is_310p_dflash_full_and_piecewise(self.vllm_config)
+            and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+        )
+        current_inputs = None
+        if is_full:
+            current_metadata = forward_context.attn_metadata
+            if not isinstance(current_metadata, dict):
+                raise RuntimeError(
+                    "310P DFlash Hybrid Draft FULL replay requires one "
+                    "per-layer attention metadata mapping for the current "
+                    "Draft substep"
+                )
+            current_inputs = self._collect_private_inputs_310(current_metadata)
+            captured_inputs = self._hybrid_draft_staging_by_descriptor_310.get(descriptor)
+            if captured_inputs is not None and entry is not None and entry.aclgraph is not None:
+                if captured_inputs.keys() == current_inputs.keys() and any(
+                    captured_inputs[name].uniform_query_width != current_inputs[name].uniform_query_width
+                    for name in captured_inputs
+                ):
+                    # Host SplitFuse grouping is capture-fixed. A different
+                    # logical layout must not overwrite its device inputs or
+                    # replay that graph. Keep this bypass local to the Draft
+                    # forward island, and restore the caller's context even
+                    # when the uncaptured model call fails.
+                    logger.debug(
+                        "[310p-dflash-full-and-piecewise/draft-island] event=host-grouping-fallback actual_runtime=NONE"
+                    )
+                    saved_mode = forward_context.cudagraph_runtime_mode
+                    forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+                    try:
+                        return super().__call__(*args, **kwargs)
+                    finally:
+                        forward_context.cudagraph_runtime_mode = saved_mode
+                self._copy_runtime_inputs_310(
+                    captured_inputs,
+                    current_inputs,
+                )
+            logger.debug(
+                "[310p-dflash-full-and-piecewise/draft-island] event=%s descriptor_tokens=%d layer_metadata=%d",
+                ("device-metadata-refresh" if captured_inputs is not None else "device-metadata-capture-source"),
+                int(descriptor.num_tokens),
+                len(current_metadata),
+            )
+        result = super().__call__(*args, **kwargs)
+        if is_full and current_inputs is not None:
+            entry = self.concrete_aclgraph_entries.get(descriptor)
+            if (
+                entry is not None
+                and entry.aclgraph is not None
+                and descriptor not in self._hybrid_draft_staging_by_descriptor_310
+            ):
+                self._hybrid_draft_staging_by_descriptor_310[descriptor] = current_inputs
+        return result
 
 
 class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
     """310P proposer overrides for NPU-specific spec-decode workarounds."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._initialize_hybrid_draft_slot_mapping_310()
+
+    def load_model(self, model: torch.nn.Module) -> None:
+        """Load normally, retaining the FDO-style merged Draft boundary."""
+        _original_load_model(self, model)
+        AscendSpecDecodeBaseProposer310._install_hybrid_draft_full_graph_310(self)
+
+    def _install_hybrid_draft_full_graph_310(self) -> None:
+        """Install FAP input refresh around the merged Draft callable."""
+        if not (is_310p_dflash_full_and_piecewise(self.vllm_config) and self.use_cuda_graph):
+            return
+
+        runnable = self._runnable
+        if isinstance(runnable, ACLGraphWrapper):
+            runnable = runnable.unwrap()
+        self._runnable = DFlashHybridDraftACLGraphWrapper310(
+            runnable,
+            self.vllm_config,
+            runtime_mode=CUDAGraphMode.FULL,
+            use_eagle=self.use_eagle,
+            enable_enpu=self.enable_enpu,
+            component="draft",
+            retained_input_provider=self._full_decode_draft_retained_inputs,
+            proposer=self,
+        )
+
+    def _initialize_hybrid_draft_slot_mapping_310(self) -> None:
+        """Allocate stable Hybrid Draft slot-mapping work buffers.
+
+        Production 310P workers patch selected methods onto the public proposer
+        class instead of instantiating this subclass directly. Keep allocation
+        in a standalone method so that patch_idex_310 can invoke it immediately
+        after the original public constructor, before graph capture starts.
+        """
+        if not is_310p_dflash_full_and_piecewise(self.vllm_config):
+            return
+        reference = self.slot_mapping_group[0]
+        capacity = int(reference.shape[0])
+        device = reference.device
+        if not hasattr(self, "_hybrid_draft_slot_gather_indices_310"):
+            self._hybrid_draft_slot_gather_indices_310 = torch.empty(
+                (capacity, 1),
+                dtype=torch.int64,
+                device=device,
+            )
+            for suffix, dtype in (("i32", torch.int32), ("i64", torch.int64)):
+                setattr(
+                    self,
+                    f"_hybrid_draft_slot_block_ids_{suffix}_310",
+                    torch.empty(capacity, dtype=dtype, device=device),
+                )
+                setattr(
+                    self,
+                    f"_hybrid_draft_slot_starts_{suffix}_310",
+                    torch.empty(capacity, dtype=dtype, device=device),
+                )
+                setattr(
+                    self,
+                    f"_hybrid_draft_slot_offsets_{suffix}_310",
+                    torch.empty(capacity, dtype=dtype, device=device),
+                )
+                setattr(
+                    self,
+                    f"_hybrid_draft_slot_output_{suffix}_310",
+                    torch.empty(capacity, dtype=dtype, device=device),
+                )
+
+    def _compute_draft_step_slot_mapping(
+        self,
+        block_table_for_slot: torch.Tensor,
+        clamped_positions: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        if not is_310p_dflash_full_and_piecewise(self.vllm_config):
+            return _original_compute_draft_step_slot_mapping(
+                self,
+                block_table_for_slot,
+                clamped_positions,
+                block_size,
+            )
+
+        logical_positions = clamped_positions[0] if self.uses_mrope else clamped_positions
+        num_tokens = int(logical_positions.shape[0])
+        capacity = int(self._hybrid_draft_slot_gather_indices_310.shape[0])
+        if num_tokens > capacity:
+            raise RuntimeError(
+                "310P DFlash Hybrid Draft slot mapping exceeds persistent "
+                f"capacity: tokens={num_tokens}, capacity={capacity}"
+            )
+
+        if block_table_for_slot.dtype == torch.int64:
+            table_suffix = "i64"
+        elif block_table_for_slot.dtype == torch.int32:
+            table_suffix = "i32"
+        else:
+            raise TypeError(
+                "310P DFlash Hybrid Draft slot mapping requires int32/int64, "
+                f"got table={block_table_for_slot.dtype}, "
+                f"positions={logical_positions.dtype}"
+            )
+
+        gather_indices = self._hybrid_draft_slot_gather_indices_310[:num_tokens]
+        block_ids = getattr(
+            self,
+            f"_hybrid_draft_slot_block_ids_{table_suffix}_310",
+        )[:num_tokens]
+        # The persistent destination consumed by attention is int32. Keep the
+        # complete address arithmetic in that dtype as well: the 310P int64
+        # Add kernel faults for unaligned dynamic lengths (for example C7's
+        # 112 slots), while all legal cache slot ids already fit the public
+        # int32 slot_mapping contract.
+        block_starts = self._hybrid_draft_slot_starts_i32_310[:num_tokens]
+        block_offsets = self._hybrid_draft_slot_offsets_i32_310[:num_tokens]
+        output = self._hybrid_draft_slot_output_i32_310[:num_tokens]
+
+        gather_indices.copy_(
+            (logical_positions // block_size).view(-1, 1),
+        )
+        torch.gather(
+            block_table_for_slot,
+            dim=1,
+            index=gather_indices,
+            out=block_ids.view(-1, 1),
+        )
+        block_starts.copy_(block_ids)
+        block_starts.mul_(block_size)
+        block_offsets.copy_(logical_positions)
+        block_offsets.remainder_(block_size)
+        block_offsets.neg_()
+        torch.sub(block_starts, block_offsets, out=output)
+        return output
+
+    def _prepare_full_decode_draft_rope(
+        self,
+        *,
+        query_positions: torch.Tensor,
+        query_actual_tokens: int,
+        descriptor_tokens: int,
+        runtime_mode: CUDAGraphMode,
+    ) -> bool:
+        """Refresh stable query/context RoPE inputs outside a compiled graph."""
+        runner = getattr(self, "runner", None)
+        if getattr(self, "method", None) == "dflash" and getattr(self, "uses_mrope", False):
+            state = getattr(self, "_dflash_mrope_state", None)
+            if state is None:
+                from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Attention
+
+                attention_layers = [m for m in self.model.modules() if isinstance(m, DFlashQwen3Attention)]
+                if not attention_layers:
+                    raise ValueError("310P DFlash m-RoPE requires DFlash attention layers")
+                capacity = self.mrope_positions.shape[-1] - 1
+                state = DFlashMRoPEState310(attention_layers[0].rotary_emb, capacity)
+                self._dflash_mrope_state = state
+                for layer in attention_layers:
+                    layer._dflash_mrope_state = state
+            # The outer argument can still be TARGET positions in eager mode.
+            # Always refresh from the proposer's actual query positions.
+            num_context = int(getattr(self, "_dflash_num_context", 0))
+            scope_config = getattr(runner, "vllm_config", self.vllm_config)
+            if (
+                is_310p_dflash_full_decode_only(scope_config)
+                and runtime_mode == CUDAGraphMode.FULL
+                and num_context < descriptor_tokens
+            ):
+                # Rotary coordinates are separate from cache slots, but FULL
+                # replay must invalidate padded KV writes for both RoPE paths.
+                self._context_slot_mapping_buffer[num_context:descriptor_tokens].fill_(-1)
+            state.refresh(
+                self._get_positions(query_actual_tokens),
+                self._context_mrope_positions_buffer[:, :num_context],
+            )
+            # State is instance-owned and remains bound across graph replay;
+            # no legacy global RoPE state needs to be cleared by the caller.
+            return False
+        scope_config = getattr(runner, "vllm_config", self.vllm_config)
+        uses_full_decode_only = is_310p_dflash_full_decode_only(scope_config)
+        uses_hybrid_graph = is_310p_dflash_full_and_piecewise(scope_config)
+        uses_piecewise = is_310p_dflash_piecewise(scope_config)
+        uses_precomputed_rope = uses_full_decode_only or uses_hybrid_graph or uses_piecewise
+        if getattr(self, "method", None) != "dflash" or not uses_precomputed_rope:
+            return False
+        # FDO, Hybrid and Piecewise compile the rotary branch while precomputed
+        # buffers are selected. The compiled callable keeps those stable
+        # addresses, so every call in each configured mode must refresh them
+        # from the current logical positions.
+        query_descriptor_tokens = descriptor_tokens
+        if uses_hybrid_graph or uses_piecewise:
+            max_query_tokens = getattr(self, "max_query_tokens", None)
+            if isinstance(max_query_tokens, int) and max_query_tokens > 0:
+                query_descriptor_tokens = min(
+                    query_descriptor_tokens,
+                    max_query_tokens,
+                )
+        if query_actual_tokens > query_descriptor_tokens:
+            raise RuntimeError(
+                "310P DFlash FULL draft RoPE active query extent exceeds "
+                "the Draft query capacity: "
+                f"actual={query_actual_tokens}, "
+                f"query_descriptor={query_descriptor_tokens}, "
+                f"target_descriptor={descriptor_tokens}"
+            )
+        if runtime_mode != CUDAGraphMode.FULL:
+            query_positions = self._get_positions(query_descriptor_tokens)
+        elif query_positions.ndim == 1 and query_positions.shape[0] > query_descriptor_tokens:
+            query_positions = query_positions[:query_descriptor_tokens]
+        if query_positions.ndim != 1 or query_positions.shape[0] != query_descriptor_tokens:
+            raise RuntimeError(
+                "310P DFlash FULL draft RoPE requires one Draft-query-sized "
+                f"query position vector, got shape={tuple(query_positions.shape)}, "
+                f"query_descriptor={query_descriptor_tokens}, "
+                f"target_descriptor={descriptor_tokens}"
+            )
+
+        context_positions_buffer = self._context_positions_buffer
+        context_actual_tokens = int(getattr(self, "_dflash_num_context", 0))
+        context_descriptor_tokens = max(
+            descriptor_tokens,
+            context_actual_tokens,
+        )
+        if context_positions_buffer.shape[0] < context_descriptor_tokens:
+            raise RuntimeError(
+                "310P DFlash graph context-position buffer is smaller than the "
+                f"descriptor: capacity={context_positions_buffer.shape[0]}, "
+                f"descriptor={context_descriptor_tokens}"
+            )
+        context_positions = context_positions_buffer[:context_descriptor_tokens]
+        if not 0 <= context_actual_tokens <= context_descriptor_tokens:
+            raise RuntimeError(
+                "310P DFlash graph context extent is outside the descriptor: "
+                f"actual={context_actual_tokens}, "
+                f"descriptor={context_descriptor_tokens}"
+            )
+
+        if (
+            uses_full_decode_only
+            and runtime_mode == CUDAGraphMode.FULL
+            and context_actual_tokens < context_descriptor_tokens
+        ):
+            # FULL replay also writes padded context KV. Stale slots would
+            # overwrite valid history with padding computed at position zero.
+            self._context_slot_mapping_buffer[context_actual_tokens:context_descriptor_tokens].fill_(-1)
+
+        draft_rotary = getattr(self, "_full_decode_draft_rotary_310", None)
+        if draft_rotary is None:
+            draft_rotary = next(
+                (module for module in self.model.modules() if isinstance(module, AscendRotaryEmbedding310)),
+                None,
+            )
+            if draft_rotary is None:
+                raise RuntimeError("310P DFlash graph draft model has no Ascend rotary embedding")
+            self._full_decode_draft_rotary_310 = draft_rotary
+
+        capacity_tokens = max(
+            int(getattr(runner, "max_num_tokens", descriptor_tokens)),
+            descriptor_tokens,
+        )
+        prepare_full_decode_draft_rope_310(
+            draft_rotary.cos_sin_cache,
+            query_positions=query_positions,
+            query_actual_tokens=query_actual_tokens,
+            context_positions=context_positions,
+            context_actual_tokens=context_actual_tokens,
+            capacity_tokens=capacity_tokens,
+        )
+        (
+            query_cos,
+            query_sin,
+            context_cos,
+            context_sin,
+        ) = get_full_decode_draft_rope_buffers_310()
+        assert query_cos is not None and query_sin is not None
+        assert context_cos is not None and context_sin is not None
+        self._full_decode_draft_query_rope_cos_310 = query_cos
+        self._full_decode_draft_query_rope_sin_310 = query_sin
+        self._full_decode_draft_context_rope_cos_310 = context_cos
+        self._full_decode_draft_context_rope_sin_310 = context_sin
+        logger.debug(
+            "[310p-dflash-graph/rope-precompute] "
+            "component=draft actual_runtime=%s descriptor_tokens=%d "
+            "query_actual=%d "
+            "context_actual=%d query_positions_ptr=%d "
+            "context_positions_ptr=%d query_cos_ptr=%d context_cos_ptr=%d",
+            runtime_mode.name,
+            descriptor_tokens,
+            query_actual_tokens,
+            context_actual_tokens,
+            query_positions.data_ptr(),
+            context_positions.data_ptr(),
+            query_cos.data_ptr(),
+            context_cos.data_ptr(),
+        )
+        return True
+
+    def _finish_full_decode_draft_rope(self, prepared: bool) -> None:
+        if prepared:
+            clear_full_decode_draft_rope_310()
 
     def _run_merged_draft(
         self,

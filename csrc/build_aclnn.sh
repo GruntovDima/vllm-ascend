@@ -89,6 +89,10 @@ if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
         "chunk_gated_delta_rule_compute_wy"
         "chunk_gated_delta_rule_fwd_h_vllm"
         "quant_batch_matmul_v3"
+        "copy_and_expand_dflash_inputs"
+        "adn_rms_norm"
+        "rejection_sample_greedy_v310"
+        "vllm_quant_grouped_matmul_dequant_v310"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend310p"
@@ -264,6 +268,11 @@ log_selected_ops
   log "subshell cwd after cd=$(pwd)"
   log "preserving csrc/build and cleaning output dirs"
   rm -rf -- output build_out
+  # The kernel list may change while csrc/build is preserved. Invalidate only
+  # the generated indexes so Ninja rebuilds them from the current .json files.
+  rm -f -- \
+    "build/binary/${SOC_ARG}/bin/binary_info_config.json" \
+    "build/binary/${SOC_ARG}/bin/relocatable_kernel_info_config.json"
 
   : "${CUSTOM_OPS:?CUSTOM_OPS is not set}"
   : "${SOC_VERSION:?SOC_VERSION is not set}"

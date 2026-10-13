@@ -50,6 +50,7 @@ from vllm_ascend.utils import (
     bootstrap_custom_op_env,
     check_kv_extra_config,
     enable_sfa_dcp_replicated_indexer,
+    is_310p,
     is_moe_model,
     model_uses_kpool_indexer,
     model_uses_sfa_sparse,
@@ -485,6 +486,42 @@ class NPUPlatform(Platform):
                     else:
                         has_topk = True
 
+    @staticmethod
+    def _disable_unsupported_310p_cp_async_dflash(
+        vllm_config: VllmConfig,
+    ) -> None:
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        if (
+            not is_310p()
+            or speculative_config is None
+            or getattr(speculative_config, "method", None) != "dflash"
+            or scheduler_config is None
+            or not getattr(scheduler_config, "async_scheduling", False)
+            or parallel_config is None
+        ):
+            return
+
+        uses_context_parallel = (
+            getattr(parallel_config, "decode_context_parallel_size", 1) > 1
+            or getattr(
+                parallel_config,
+                "prefill_context_parallel_size",
+                1,
+            )
+            > 1
+        )
+        if not uses_context_parallel:
+            return
+
+        logger.warning(
+            "Asynchronous DFlash on 310P currently supports single-rank "
+            "metadata preparation only; disabling async scheduling because "
+            "context parallelism is enabled."
+        )
+        scheduler_config.async_scheduling = False
+
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         # Lazy import vllm/vllm-ascend to avoid circular import
@@ -522,6 +559,7 @@ class NPUPlatform(Platform):
         validate_turboquant(vllm_config)
         if vllm_config.cache_config.cache_dtype == "fp8" or vllm_config.attention_config.indexer_kv_dtype == "fp8":
             assert get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION)
+        cls._disable_unsupported_310p_cp_async_dflash(vllm_config)
 
         # 4.Make sure the config is compatible with Ascend
         _fix_incompatible_config(vllm_config)
@@ -541,6 +579,7 @@ class NPUPlatform(Platform):
             compile_backend=cls.get_compile_backend(),
             enable_shared_expert_dp=ascend_config.enable_shared_expert_dp,
             enable_dsa_cp=ascend_config.enable_dsa_cp,
+
         )
 
         # 8.Setup worker class, custom ops and scheduler (ascend_config -> vllm_config).
@@ -1292,6 +1331,19 @@ def _setup_compile_backend(
     # Recompute cudagraph sizes before extending splitting_ops (honors the
     # current max / size inputs after the mode adjustments above).
     compilation_config.cudagraph_num_of_warmups = 1
+
+    # 310P DFlash installations the explicit FULL/PIECEWISE capture portfolio
+    # before the sizes are recomputed below.
+    ascend_compilation_cfg = additional_config.get("ascend_compilation_config") or {}
+    if isinstance(ascend_compilation_cfg, dict) and (
+        ascend_compilation_cfg.get("dflash_full_and_piecewise_capture_config") is not None
+    ):
+        from vllm_ascend._310p.dflash_full_and_piecewise import (
+            apply_dflash_full_and_piecewise_capture_config,
+        )
+
+        apply_dflash_full_and_piecewise_capture_config(vllm_config)
+
     vllm_config._set_cudagraph_sizes()
     additional_config = vllm_config.additional_config or {}
     requires_tp_aligned_capture_sizes = enable_sp(vllm_config) or enable_shared_expert_dp or enable_dsa_cp

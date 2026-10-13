@@ -120,6 +120,23 @@ from vllm.v1.worker.utils import (
     raise_if_nan_logits,
 )
 
+from vllm_ascend._310p.dflash_fdo_numerical_probe import (
+    create_rejection_loop_probe,
+    create_target_boundary_probe,
+    create_target_layer_probe,
+)
+from vllm_ascend._310p.dflash_full_decode_contract import (
+    build_target_full_decode_contract_sources,
+)
+from vllm_ascend._310p.dflash_full_decode_manifest import (
+    get_full_decode_local_rank,
+    reset_full_decode_capture_manifest,
+    validate_full_decode_capture_manifest,
+)
+from vllm_ascend._310p.dflash_full_decode_only import (
+    is_310p_dflash_full_decode_only,
+)
+
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
@@ -145,6 +162,7 @@ from vllm_ascend.attention.utils import (
 # yapf: disable
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphWrapper,
+    get_graph_params,
     set_draft_graph_params,
     set_graph_params,
     update_full_graph_params,
@@ -361,6 +379,27 @@ class ExecuteModelState(NamedTuple):
     batch_desc: BatchDescriptor
 
 
+def _align_attention_spec_page_size(
+    layer_spec: AttentionSpec,
+    aligned_page_size: int,
+    *,
+    prefer_block_size: bool,
+) -> None:
+    """Align an attention page without padding when its block can be scaled."""
+    layer_page_size = layer_spec.page_size_bytes
+    if layer_page_size >= aligned_page_size:
+        return
+    if prefer_block_size and aligned_page_size % layer_page_size == 0:
+        block_size_ratio = aligned_page_size // layer_page_size
+        object.__setattr__(
+            layer_spec,
+            "block_size",
+            layer_spec.block_size * block_size_ratio,
+        )
+        return
+    object.__setattr__(layer_spec, "page_size_padded", aligned_page_size)
+
+
 class NPUModelRunner(GPUModelRunner):
     # vLLM #51718 describes compatible KV cache groups as views over one
     # standardized backing allocation. The default runner preserves that
@@ -415,11 +454,24 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+
         self.use_score_encoder_cache = is_score_encoder_cache_manager(self.vllm_config)
 
         self.kvpp = KVPPRuntime()
 
-        # Dump / PrecisionDebugger configuration now comes from AscendConfig
+        self._fdo_target_numerical_probe = create_target_boundary_probe(
+            vllm_config
+        )
+        self._fdo_rejection_numerical_probe = create_rejection_loop_probe(
+            vllm_config
+        )
+        self._fdo_target_layer_probe = create_target_layer_probe(
+            vllm_config,
+            max_num_tokens=self.max_num_tokens,
+            hidden_size=self.model_config.get_hidden_size(),
+            dtype=self.model_config.dtype,
+            device=self.device,
+        )        # Dump / PrecisionDebugger configuration now comes from AscendConfig
         dump_cfg = self.ascend_config.dump_config_path
         self.debugger = None
         if dump_cfg is not None:
@@ -750,8 +802,17 @@ class NPUModelRunner(GPUModelRunner):
                 elif self.speculative_config.method == "extract_hidden_states":
                     assert isinstance(self.drafter, AscendExtractHiddenStatesProposer)
                     self.use_aux_hidden_state_outputs = True
+
                 elif self.speculative_config.use_dspark():
                     assert isinstance(self.drafter, AscendDSparkProposer)
+                    self.use_aux_hidden_state_outputs = True
+                elif self.speculative_config.method == "dflash":
+                    # DFlash is trained on the target model's auxiliary
+                    # (intermediate-layer) hidden states, exactly like dspark and
+                    # eagle3. This must be set here (not under the version-guarded
+                    # dspark branch in __init__) so it takes effect on every vLLM
+                    # version; otherwise the target returns its FINAL hidden state
+                    # and the draft gets wrong context features (acceptance ~0).
                     self.use_aux_hidden_state_outputs = True
                 self.rejection_sampler = AscendRejectionSampler(
                     self.sampler, self.speculative_config, self.device
@@ -806,6 +867,29 @@ class NPUModelRunner(GPUModelRunner):
             dspark_layer_ids = getattr(hf_config, "target_layer_ids", None)
             if dspark_layer_ids:
                 return tuple(i + 1 for i in dspark_layer_ids)
+        # dflash nests target_layer_ids under dflash_config / eagle_config.
+        # Check both so the target collects the exact layers the drafter's fc
+        # was trained on (a mismatch crashes combine_hidden_states or silently
+        # degrades acceptance).
+        hf_config = self.speculative_config.draft_model_config.hf_config
+        candidate_ids = getattr(hf_config, "target_layer_ids", None)
+        if not candidate_ids:
+            for cfg_name in ("dflash_config", "eagle_config"):
+                cfg = getattr(hf_config, cfg_name, None)
+                if isinstance(cfg, dict) and cfg.get("target_layer_ids"):
+                    candidate_ids = cfg["target_layer_ids"]
+                    break
+        if candidate_ids and isinstance(candidate_ids, (list, tuple)):
+            # DFlash target_layer_ids are 0-based layer indices, but vLLM
+            # captures auxiliary hidden states with the ``layer_idx + 1``
+            # convention in ``_maybe_add_hidden_state`` (a config value N is
+            # otherwise matched with layer_idx N-1, capturing the wrong layer).
+            # Upstream applies this +1 only for the dflash path; eagle3/dspark
+            # use their own indexing and are left as-is. Missing this offset
+            # feeds the draft hidden states from adjacent (wrong) layers, which
+            # collapses acceptance on hybrid models like Qwen3.x-A3B.
+            offset = 1 if self.speculative_config.method == "dflash" else 0
+            return tuple(int(i) + offset for i in candidate_ids)
         return None
 
     def _draft_uses_qwen3_gqa_dspark(self) -> bool:
@@ -2311,6 +2395,108 @@ class NPUModelRunner(GPUModelRunner):
         return cut_tokens
 
     @torch.inference_mode()
+    def _record_target_numerical_probe(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        sample_indices: torch.Tensor,
+        selected_hidden: torch.Tensor,
+        logits: torch.Tensor,
+        descriptor: int,
+        actual_tokens: int,
+        runtime_mode: CUDAGraphMode,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        boundary_probe = self._fdo_target_numerical_probe
+        layer_probe = getattr(self, "_fdo_target_layer_probe", None)
+        if boundary_probe is None and layer_probe is None:
+            return
+        req_ids = self.input_batch.req_ids
+        if len(req_ids) == 1:
+            generated_prefix = tuple(
+                self.requests[req_ids[0]].output_token_ids
+            )
+        else:
+            generated_prefix = tuple(
+                token
+                for req_id in req_ids
+                for token in (
+                    *self.requests[req_id].output_token_ids,
+                    -1,
+                )
+            )
+        tp_rank = get_tp_group().rank_in_group
+        if boundary_probe is not None and spec_decode_metadata is not None:
+            boundary_probe.record_after_model(
+                tp_rank=tp_rank,
+                generated_prefix=generated_prefix,
+                input_ids=input_ids,
+                positions=positions,
+                sample_indices=sample_indices,
+                selected_hidden=selected_hidden,
+                logits=logits,
+                descriptor=descriptor,
+                actual_tokens=actual_tokens,
+                runtime_mode=runtime_mode,
+            )
+        if layer_probe is not None:
+            layer_probe.record_after_model(
+                tp_rank=tp_rank,
+                generated_prefix=generated_prefix,
+                descriptor=descriptor,
+                actual_tokens=actual_tokens,
+                runtime_mode=runtime_mode,
+            )
+
+    @torch.inference_mode()
+    def _record_rejection_numerical_probe(
+        self,
+        *,
+        sampled_token_ids: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        descriptor: int,
+        actual_tokens: int,
+    ) -> None:
+        probe = self._fdo_rejection_numerical_probe
+        if probe is None or spec_decode_metadata is None:
+            return
+        req_ids = self.input_batch.req_ids
+        if len(req_ids) == 1:
+            generated_prefix = tuple(
+                self.requests[req_ids[0]].output_token_ids
+            )
+        else:
+            generated_prefix = tuple(
+                token
+                for req_id in req_ids
+                for token in (
+                    *self.requests[req_id].output_token_ids,
+                    -1,
+                )
+            )
+        num_draft_tokens = torch.tensor(
+            spec_decode_metadata.num_draft_tokens,
+            dtype=torch.int32,
+            device=sampled_token_ids.device,
+        )
+        valid_sampled_token_count = torch.sum(
+            sampled_token_ids != PLACEHOLDER_TOKEN_ID,
+            dim=1,
+            dtype=torch.int64,
+        )
+        probe.record_after_sample(
+            tp_rank=get_tp_group().rank_in_group,
+            generated_prefix=generated_prefix,
+            draft_token_ids=spec_decode_metadata.draft_token_ids,
+            num_draft_tokens=num_draft_tokens,
+            sampled_token_ids=sampled_token_ids,
+            valid_sampled_token_count=valid_sampled_token_count,
+            descriptor=descriptor,
+            actual_tokens=actual_tokens,
+        )
+
+    @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2739,6 +2925,18 @@ class NPUModelRunner(GPUModelRunner):
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+            self._record_target_numerical_probe(
+                input_ids=input_ids,
+                positions=positions,
+                sample_indices=logits_indices,
+                selected_hidden=sample_hidden_states,
+                logits=logits,
+                descriptor=batch_desc.num_tokens,
+                actual_tokens=num_tokens_unpadded,
+                runtime_mode=cudagraph_mode,
+                spec_decode_metadata=spec_decode_metadata,
+            )
+
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
                 scheduler_output,
@@ -2896,7 +3094,16 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
-
+        self._record_rejection_numerical_probe(
+            sampled_token_ids=sampler_output.sampled_token_ids,
+            spec_decode_metadata=spec_decode_metadata,
+            descriptor=batch_desc.num_tokens,
+            actual_tokens=(
+                int(spec_decode_metadata.logits_indices.numel())
+                if spec_decode_metadata is not None
+                else 0
+            ),
+        )
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
                 self.sampling_done_event = torch.npu.Event()
@@ -2971,7 +3178,6 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
-
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
                 if not early_pp_padded_drafter:
@@ -3069,6 +3275,7 @@ class NPUModelRunner(GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
+
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
@@ -3124,7 +3331,9 @@ class NPUModelRunner(GPUModelRunner):
         discard_sampled_tokens_req_indices = self.discard_request_indices.np[: self.num_discarded_requests]
         for i in discard_sampled_tokens_req_indices:
             gen = self.input_batch.generators.get(int(i))
-            if gen is not None:
+            if gen is not None and get_ascend_device_type() != AscendDeviceType._310P:
+                # 310P restores both CPU and device RNG snapshots in _sample;
+                # its CPU exponential draw does not advance the device by 4.
                 gen.set_offset(gen.get_offset() - 4)
 
         # Copy some objects so they don't get modified after returning.
@@ -4460,6 +4669,38 @@ class NPUModelRunner(GPUModelRunner):
             # collect eplb heat for all requests.
             self.eplb_heat_collection_status =  True
 
+    @staticmethod
+    def _full_decode_buffer_tensor(buffer: Any) -> Any:
+        return getattr(buffer, "gpu", buffer)
+
+    def _full_decode_target_retained_inputs(
+        self,
+        forward_context: ForwardContext,
+        batch_descriptor: BatchDescriptor,
+    ):
+        """Expose target FULL inputs that are not model call arguments."""
+        runner_buffers = {
+            "input_ids": self._full_decode_buffer_tensor(self.input_ids),
+            "positions": self._full_decode_buffer_tensor(self.positions),
+            "query_start_loc": self._full_decode_buffer_tensor(
+                self.query_start_loc
+            ),
+            "seq_lens": self._full_decode_buffer_tensor(self.seq_lens),
+            "group_len": self._full_decode_buffer_tensor(self.group_len),
+            "group_key_idx": self._full_decode_buffer_tensor(
+                self.group_key_idx
+            ),
+            "group_key_cache_idx": self._full_decode_buffer_tensor(
+                self.group_key_cache_idx
+            ),
+        }
+        return build_target_full_decode_contract_sources(
+            forward_context=forward_context,
+            graph_params=get_graph_params(),
+            runner_buffers=runner_buffers,
+            descriptor_num_tokens=batch_descriptor.num_tokens,
+        )
+
     def load_model(self) -> None:
         from vllm_ascend.model_executor.warmup.early_kernel_warmup import (
             join_early_kernel_warmup,
@@ -4494,6 +4735,8 @@ class NPUModelRunner(GPUModelRunner):
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            if self._fdo_target_layer_probe is not None:
+                self._fdo_target_layer_probe.bind(self.model)
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name
@@ -4594,6 +4837,7 @@ class NPUModelRunner(GPUModelRunner):
         ) # type: bool
 
         # wrap the model with full graph wrapper if needed.
+
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
 
@@ -4642,6 +4886,8 @@ class NPUModelRunner(GPUModelRunner):
                     use_eagle=self.use_eagle,
                     enable_enpu=self.enable_enpu,
                     update_stream=self.update_stream,
+                    component="target",
+                    retained_input_provider=self._full_decode_target_retained_inputs,
                 )
 
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
@@ -6445,8 +6691,15 @@ class NPUModelRunner(GPUModelRunner):
                     mamba_page_size_padded = spec.page_size_bytes
             # align attn_page_size to mamba_page_size_padded
             for layer_name in attn_layer_names:
-                if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
-                    object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
+                layer_spec = kv_cache_spec[layer_name]
+                assert isinstance(layer_spec, AttentionSpec)
+                _align_attention_spec_page_size(
+                    layer_spec,
+                    mamba_page_size_padded,
+                    prefer_block_size=(
+                        get_ascend_device_type() == AscendDeviceType._310P
+                    ),
+                )
 
         if self.sparse_kv_offload_enabled:
             self.kv_cache_spec = kv_cache_spec # reserve for Sparse KV offload usage
@@ -6535,6 +6788,9 @@ class NPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
+        if is_310p_dflash_full_decode_only(self.vllm_config):
+            reset_full_decode_capture_manifest()
+
         parent_module_name = _get_gpu_model_runner_module_name(self)
         self._engram_capture_active = True
         try:
@@ -6542,6 +6798,11 @@ class NPUModelRunner(GPUModelRunner):
                 cuda_graph_size = GPUModelRunner.capture_model(self)
         finally:
             self._engram_capture_active = False
+
+        validate_full_decode_capture_manifest(
+            self.vllm_config,
+            local_rank=get_full_decode_local_rank(),
+        )
 
         mgr = self.encoder_cudagraph_manager
         if mgr is not None and self.update_stream is not None:

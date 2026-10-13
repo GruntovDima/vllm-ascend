@@ -20,6 +20,8 @@ import importlib.util
 import json
 import math
 import os
+from collections.abc import Mapping
+from dataclasses import dataclass
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -36,6 +38,79 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SUPPORTED = None
 
+DFLASH_FULL_AND_PIECEWISE_CAPTURE_CONFIG = (
+    "dflash_full_and_piecewise_capture_config"
+)
+
+
+@dataclass(frozen=True)
+class DFlashFullAndPiecewiseCaptureConfig:
+    """Explicit mode-owned PIECEWISE and shared FULL capture capacities."""
+
+    piecewise_capture_size: int | tuple[int, ...]
+    full_capture_size: int | tuple[int, ...]
+
+    @classmethod
+    def from_raw(
+        cls,
+        raw: Any,
+    ) -> "DFlashFullAndPiecewiseCaptureConfig | None":
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"{DFLASH_FULL_AND_PIECEWISE_CAPTURE_CONFIG} must be a mapping")
+
+        expected = {"piecewise_capture_size", "full_capture_size"}
+        actual = set(raw)
+        if actual != expected:
+            raise ValueError(
+                f"{DFLASH_FULL_AND_PIECEWISE_CAPTURE_CONFIG} requires exactly {sorted(expected)}, got {sorted(actual)}"
+            )
+
+        parsed: dict[str, int | tuple[int, ...]] = {}
+        for name in ("piecewise_capture_size", "full_capture_size"):
+            value = raw[name]
+            if isinstance(value, list):
+                if not value:
+                    raise ValueError(f"{name} must be a non-empty list")
+                sizes = tuple(value)
+            elif isinstance(value, (tuple, set)):
+                raise ValueError(f"{name} must be a positive integer or a list of positive integers, got {value!r}")
+            else:
+                sizes = (value,)
+            if any(isinstance(size, bool) or not isinstance(size, int) or size <= 0 for size in sizes):
+                raise ValueError(f"{name} must be a positive integer or a list of positive integers, got {value!r}")
+            if len(set(sizes)) != len(sizes):
+                raise ValueError(f"{name} must not contain duplicate capacities, got {value!r}")
+            parsed[name] = value if isinstance(value, int) else sizes
+
+        return cls(
+            piecewise_capture_size=parsed["piecewise_capture_size"],
+            full_capture_size=parsed["full_capture_size"],
+        )
+
+    @property
+    def piecewise_capture_sizes(self) -> tuple[int, ...]:
+        if isinstance(self.piecewise_capture_size, int):
+            return (self.piecewise_capture_size,)
+        return self.piecewise_capture_size
+
+    @property
+    def full_capture_sizes(self) -> tuple[int, ...]:
+        if isinstance(self.full_capture_size, int):
+            return (self.full_capture_size,)
+        return self.full_capture_size
+
+    def as_dict(self) -> dict[str, int | list[int]]:
+        return {
+            name: value if isinstance(value, int) else list(value)
+            for name, value in (
+                ("piecewise_capture_size", self.piecewise_capture_size),
+                ("full_capture_size", self.full_capture_size),
+            )
+        }
+
+
 
 def is_mega_moe_supported() -> bool:
     """Whether the megamoe op is available at runtime.
@@ -44,6 +119,7 @@ def is_mega_moe_supported() -> bool:
     ``from ascend_config import _MEGA_MOE_SUPPORTED``: the global is rebound
     during config init (AscendConfig._validate_user_input_ranges rolls back
     megamoe), and a direct import binds a stale snapshot for the bool.
+
     """
     global _MEGA_MOE_SUPPORTED
     if _MEGA_MOE_SUPPORTED is None:
@@ -115,6 +191,31 @@ class AscendCompilationConfig:
     fuse_norm_quant: bool = True
     fuse_qknorm_rope: bool = True
     fuse_muls_add: bool = True
+    # Explicit 310P DFlash FULL_AND_PIECEWISE capture portfolio; the raw
+    # mapping is normalized here so the platform can detect its presence.
+    dflash_full_and_piecewise_capture_config: dict | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_dflash_capture_config(cls, data: Any) -> Any:
+        def normalized(raw: Any) -> Any:
+            capture_config = DFlashFullAndPiecewiseCaptureConfig.from_raw(raw)
+            return None if capture_config is None else capture_config.as_dict()
+
+        if isinstance(data, ArgsKwargs):
+            if data.kwargs is None or DFLASH_FULL_AND_PIECEWISE_CAPTURE_CONFIG not in data.kwargs:
+                return data
+            kw = dict(data.kwargs)
+            kw[DFLASH_FULL_AND_PIECEWISE_CAPTURE_CONFIG] = normalized(
+                kw[DFLASH_FULL_AND_PIECEWISE_CAPTURE_CONFIG]
+            )
+            return ArgsKwargs(data.args, kw)
+        if isinstance(data, dict) and DFLASH_FULL_AND_PIECEWISE_CAPTURE_CONFIG in data:
+            data = dict(data)
+            data[DFLASH_FULL_AND_PIECEWISE_CAPTURE_CONFIG] = normalized(
+                data[DFLASH_FULL_AND_PIECEWISE_CAPTURE_CONFIG]
+            )
+        return data
 
     @model_validator(mode="before")
     @classmethod

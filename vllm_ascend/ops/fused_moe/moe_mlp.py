@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
+from vllm_ascend.ops.fused_moe.dataclass.fused_experts import maybe_record_fused_moe_event
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 
 
@@ -52,7 +53,7 @@ def apply_moe_mlp(
         hidden_states = _unified_apply_activation(mlp_compute_input, hidden_states, quant_method)
         hidden_states, act_out_scale = quant_method.apply_act_quant(mlp_compute_input, hidden_states)
 
-    before_gmm2_evt = torch.npu.current_stream().record_event()
+    before_gmm2_evt = maybe_record_fused_moe_event(mlp_compute_input.record_events)
     hidden_states = quant_method.apply_gmm2(mlp_compute_input, hidden_states, act_out_scale)
     return hidden_states, before_gmm2_evt
 

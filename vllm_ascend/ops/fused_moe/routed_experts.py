@@ -169,6 +169,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 pertoken_scale=layer.ascend_pertoken_scale,
                 activation=activation,
+                record_events=getattr(layer, "_record_fused_moe_events", True),
                 lora_context=getattr(layer, "_ascend_moe_lora_context", None),
             ),
             quant_method=self,

@@ -54,6 +54,35 @@ def _prepare_cpu_generators_310p(
     return prepared
 
 
+def _get_cpu_generator_310p(generator: torch.Generator) -> torch.Generator:
+    """Resolve one device generator to its cached CPU stream.
+
+    Used by the 310P model runner for discarded-row state rollback, where the
+    sampler's batch-oriented ``_prepare_cpu_generators_310p`` is not a fit.
+    """
+    for source, cpu_generator in _CPU_GENERATOR_CACHE_310P.values():
+        if source is generator:
+            return cpu_generator
+    cpu_generator = torch.Generator(device="cpu")
+    try:
+        # Keep the CPU stream consistent with the device generator.
+        cpu_generator.set_state(generator.get_state())
+    except Exception:
+        cpu_generator.manual_seed(generator.initial_seed())
+    key = max(_CPU_GENERATOR_CACHE_310P, default=-1) + 1
+    _CPU_GENERATOR_CACHE_310P[key] = (generator, cpu_generator)
+    return cpu_generator
+
+
+def release_cpu_generator_310p(generator: torch.Generator | None) -> None:
+    """Release a finished/cancelled request; preempted streams stay cached."""
+    if generator is None:
+        return
+    for key, (source, _) in list(_CPU_GENERATOR_CACHE_310P.items()):
+        if source is generator:
+            del _CPU_GENERATOR_CACHE_310P[key]
+
+
 def _generate_request_uniforms_310p(
     batch_size: int,
     generators: dict[int, torch.Generator],

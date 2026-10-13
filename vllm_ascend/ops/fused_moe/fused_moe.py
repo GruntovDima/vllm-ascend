@@ -29,8 +29,12 @@ from vllm.model_executor.layers.fused_moe.layer import MoERunner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import _moe_forward_shared, _unpack
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm.config import get_current_vllm_config
+
+from vllm_ascend._310p.dflash_full_decode_only import is_310p_dflash_full_decode_only
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.ops.fused_moe.dataclass.fused_experts import maybe_record_fused_moe_event
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import PreparedSharedExpertInput, RoutedMoEMilestones
 from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
@@ -114,6 +118,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
 
         self.quant_type = routed_experts.quant_type
         self.routed_experts.router = router
+
+        # 310P DFlash FULL_DECODE_ONLY graph replay cannot re-create stream
+        # events; skip synchronization-event recording in that capture mode.
+        self._record_fused_moe_events = not is_310p_dflash_full_decode_only(get_current_vllm_config())
+        routed_experts._record_fused_moe_events = self._record_fused_moe_events
 
         self.moe_config.tp_group = get_tp_group()
         self.moe_config.dp_group = get_dp_group()
@@ -526,7 +535,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             milestones.shared_input_ready = shared_input_ready
             milestones.router_output_ready = router_output_ready
             if prepared_shared_input.is_gathered:
-                milestones.routed_finalize_done = torch.npu.current_stream().record_event()
+                milestones.routed_finalize_done = maybe_record_fused_moe_event(self._record_fused_moe_events)
 
             if submitted_gate_up is None:
                 shared_out = self.ascend_shared_experts.forward(

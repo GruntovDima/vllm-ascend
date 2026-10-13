@@ -228,6 +228,7 @@ if not _npu_available:
     sys.modules["torch_npu"].npu.current_device = MagicMock(return_value="cpu")
     sys.modules["torch_npu._inductor"] = MagicMock()
     sys.modules["torch_npu"]._npu_flash_attention = MagicMock()  # type: ignore[attr-defined]
+    sys.modules["torch_npu"]._npu_paged_attention = MagicMock()  # type: ignore[attr-defined]
     sys.modules["torch_npu"]._npu_paged_attention_splitfuse = MagicMock()  # type: ignore[attr-defined]
     sys.modules["torch_npu"]._npu_reshape_and_cache = MagicMock()  # type: ignore[attr-defined]
     sys.modules["torch_npu"].npu_scatter_pa_kv_cache = MagicMock()  # type: ignore[attr-defined]
@@ -254,6 +255,8 @@ if not _npu_available:
     )
     sys.modules["torch_npu"].npu_mla_prolog_v3 = MagicMock()  # type: ignore[attr-defined]
     sys.modules["torch_npu"].npu_kv_rmsnorm_rope_cache = MagicMock()  # type: ignore[attr-defined]
+    # Device boundary for host dispatch tests; numerical RMSNorm is checked on NPU.
+    sys.modules["torch_npu"].npu_add_rms_norm = MagicMock()  # type: ignore[attr-defined]
     sys.modules["torch_npu"].npu_swiglu = MagicMock()  # type: ignore[attr-defined]
     sys.modules["torch_npu"].npu_fast_gelu = MagicMock()  # type: ignore[attr-defined]
     sys.modules["torch_npu"].npu_convert_weight_to_int4pack = MagicMock()  # type: ignore[attr-defined]

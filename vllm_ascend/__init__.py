@@ -16,6 +16,7 @@
 #
 
 import importlib.util
+import logging
 import sys
 from types import ModuleType
 
@@ -50,6 +51,7 @@ if _triton_available:
             _tl_core._aggregate = lambda *a, **kw: None
 
 _GLOBAL_PATCH_APPLIED = False
+_logger = logging.getLogger(__name__)
 
 
 def _ensure_global_patch():

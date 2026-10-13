@@ -42,6 +42,9 @@ from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: igno
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
+from vllm_ascend._310p.dflash_full_decode_only import (
+    select_dflash_full_decode_slot_mapping,
+)
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.context_parallel.common_cp import (
@@ -347,7 +350,13 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             speculative_config=self.speculative_config,
             vllm_config=self.vllm_config,
         )
-        slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
+        slot_mapping = select_dflash_full_decode_slot_mapping(
+            vllm_config=self.vllm_config,
+            attn_state=common_attn_metadata.attn_state,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            num_actual_tokens=num_actual_tokens,
+            num_input_tokens=common_attn_metadata.num_input_tokens,
+        )
         # this slot_mapping override doesn't work since vllm will override it again. We should fix it vllm.
         # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
         if isinstance(self.kv_cache_spec, CrossAttentionSpec):

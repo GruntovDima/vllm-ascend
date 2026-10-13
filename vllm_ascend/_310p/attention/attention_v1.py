@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 import torch_npu
+from vllm.config import CUDAGraphMode
 from vllm.v1.attention.backends.registry import (  # type: ignore
     AttentionBackendEnum,
     register_backend,
@@ -28,10 +29,21 @@ from vllm_ascend._310p.attention.attention_mask import (
     AttentionMaskBuilder310,
     is_compressed_mask_supported,
 )
+from vllm_ascend._310p.attention.dflash_hybrid_draft_graph_safe_attention import (
+    dflash_hybrid_draft_graph_safe_attention_310,
+)
 from vllm_ascend._310p.attention.metadata_builder import (
     AscendAttentionMetadataBuilder310,
+    get_dflash_hybrid_draft_attention_inputs_310,
     get_query_lens_cpu,
 )
+from vllm_ascend._310p.dflash_full_and_piecewise import (
+    is_310p_dflash_effective_full,
+    is_310p_dflash_effective_piecewise,
+    is_310p_dflash_full_and_piecewise,
+)
+from vllm_ascend._310p.dflash_full_decode_only import is_310p_dflash_full_decode_only
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_forward_context
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -42,6 +54,10 @@ from vllm_ascend.attention.attention_v1 import (
 
 MASK_TYPE_NORM_COMPRESS_SELF_ATTENTION = 3
 MASK_TYPE_NORM_COMPRESS_PAGED_ATTENTION = 5
+HEAD_FOLD_QUERY_LEN = 8
+HEAD_FOLD_TOKEN_COUNT = 80
+HEAD_FOLD_GQA_RATIOS = (4, 8)
+HEAD_FOLD_HEAD_SIZES = (128, 256)
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -171,6 +187,22 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             output,
         )
 
+    def _uses_hybrid_piecewise_prefill(self) -> bool:
+        """Return whether this forward uses the hybrid PIECEWISE prefill route."""
+        if not is_310p_dflash_full_and_piecewise(self.vllm_config):
+            return False
+
+        from vllm_ascend.ascend_forward_context import get_forward_context
+
+        try:
+            runtime_mode = get_forward_context().cudagraph_runtime_mode
+        except (AssertionError, RuntimeError):
+            return False
+        return is_310p_dflash_effective_piecewise(
+            self.vllm_config,
+            runtime_mode,
+        )
+
     def forward_paged_attention(
         self,
         query: Any,
@@ -233,18 +265,71 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         Returns:
             The output tensor after flash attention.
         """
-        real_tokens = int(attn_metadata.seq_lens.sum().item())
-        seq_len = attn_metadata.seq_lens
+        # ATB SelfAttention reads seqLen from host data to build its tiling. Prefer
+        # the host seq_lens attached by the 310P metadata builder: the base builder
+        # leaves attn_metadata.seq_lens on device for the parallel-drafting path
+        # (dflash/dspark), which has no hostData and crashes ATB with
+        # "tensor.hostData is null". Reading the CPU copy also lets us compute the
+        # token count on host, avoiding a device->host sync in this prefill path.
+        seq_len = attn_metadata.seq_lens_cpu
+        if seq_len is None or seq_len.device.type != "cpu":
+            seq_len = attn_metadata.seq_lens.to("cpu", dtype=torch.int32)
+
+        real_tokens = int(seq_len.sum())
         aligned_tokens = int(query.shape[0])
         delta = aligned_tokens - real_tokens
 
-        # Adjust sequence length if padding (alignment) was applied to the inputs
+        # FULL_AND_PIECEWISE keeps a fixed physical descriptor while prefill is
+        # executed by the PIECEWISE route.  The descriptor tail is capacity,
+        # not part of the final logical request.  Run attention only over the
+        # real view and keep the returned physical output buffer stable for the
+        # surrounding graph islands.
+        if delta > 0 and self._uses_hybrid_piecewise_prefill():
+            output_slice = output[:real_tokens]
+            self._flash_attention(
+                query[:real_tokens],
+                key[:real_tokens],
+                value[:real_tokens],
+                attn_metadata.attn_mask,
+                seq_len,
+                output_slice,
+            )
+            output[real_tokens:].zero_()
+            return output
+
+        # Preserve the established public 310P behavior for every other route.
+        # Clone first so the shared host buffer is never mutated in place.
         if delta:
             seq_len = seq_len.clone()
             seq_len[-1] += delta
 
         mask = attn_metadata.attn_mask
         return self._flash_attention(query, key, value, mask, seq_len, output)
+
+    def _splitfuse_head_fold_factor(self, query, output, runtime_mode):
+        """Limit head folding to the validated K7 FDO decode contract.
+
+        This changes the operator's row/head presentation, not the model's
+        token count, KV-cache layout, attention scale, or graph descriptor.
+        Other speculative lengths and execution modes retain the original path.
+        """
+        if (
+            runtime_mode != CUDAGraphMode.FULL
+            or not is_310p_dflash_full_decode_only(self.vllm_config)
+            or self.vllm_config.speculative_config.num_speculative_tokens + 1 != HEAD_FOLD_QUERY_LEN
+            or query.ndim != 3
+            or query.shape[0] != HEAD_FOLD_TOKEN_COUNT
+            or query.shape[1] != self.num_heads
+            or query.dtype != torch.float16
+            or not query.is_contiguous()
+            or not output.is_contiguous()
+            or self.num_kv_heads <= 0
+            or self.num_heads % self.num_kv_heads
+            or query.shape[-1] not in HEAD_FOLD_HEAD_SIZES
+        ):
+            return 1
+        ratio = self.num_heads // self.num_kv_heads
+        return ratio if ratio in HEAD_FOLD_GQA_RATIOS else 1
 
     def forward_chunked_prefill_310(self, query, attn_metadata, output):
         """
@@ -259,6 +344,32 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             attn_metadata (AscendMetadata): Metadata containing start locations and block tables.
             output: The output tensor.
         """
+        private_draft_inputs = get_dflash_hybrid_draft_attention_inputs_310(attn_metadata)
+        try:
+            runtime_mode = get_forward_context().cudagraph_runtime_mode
+        except (AssertionError, RuntimeError):
+            runtime_mode = None
+        if (
+            private_draft_inputs is not None
+            and _EXTRA_CTX.is_draft_model
+            and not attn_metadata.causal
+            and runtime_mode is not None
+            and is_310p_dflash_effective_full(
+                self.vllm_config,
+                runtime_mode,
+            )
+        ):
+            return dflash_hybrid_draft_graph_safe_attention_310(
+                query=query,
+                key_cache=self.key_cache,
+                value_cache=self.value_cache,
+                inputs=private_draft_inputs,
+                num_kv_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                scale=self.scale,
+                output=output,
+            )
+
         num_actual_tokens = int(attn_metadata.num_actual_tokens)
         query = query[:num_actual_tokens]
         output_slice = output[:num_actual_tokens]
@@ -266,8 +377,6 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         # Host qLens filled in AscendAttentionMetadataBuilder310.build(); eager fallback only.
         qlens = get_query_lens_cpu(attn_metadata)
         if qlens is None:
-            from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
             if _EXTRA_CTX.capturing:
                 raise RuntimeError(
                     "310P splitfuse requires attn_metadata.query_lens_cpu during graph capture; "
@@ -288,7 +397,10 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
 
         if self.support_compressed_mask:
             # splitfuse_v2 requires fixed ND [2048, 2048]; parent build() may set FRACTAL_NZ mask.
-            mask = AttentionMaskBuilder310.get_compressed_splitfuse_mask(query.device)
+            if attn_metadata.causal:
+                mask = AttentionMaskBuilder310.get_compressed_splitfuse_mask(query.device)
+            else:
+                mask = AttentionMaskBuilder310.get_compressed_non_causal_splitfuse_mask(query.device)
             torch_npu._npu_paged_attention_splitfuse_v2(
                 query=query,
                 key_cache=self.key_cache,
@@ -305,8 +417,34 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             )
             return output
 
+        # Same-KV query heads are independent rows with identical visibility.
+        # Folding fills the small Cube M dimension without copying the KV cache.
+        fold = self._splitfuse_head_fold_factor(query, output_slice, runtime_mode)
+        original_tokens = query.shape[0]
+        folded_heads = self.num_heads // fold
+        if fold != 1:
+            query = query.view(original_tokens, folded_heads, fold, query.shape[-1])
+            query = query.transpose(1, 2).reshape(original_tokens * fold, folded_heads, query.shape[-1]).contiguous()
+            # Host qLens is descriptor-constant for uniform FULL decode; this
+            # operation is performed at capture, with no device synchronization.
+            qlens = (qlens * fold).pin_memory()
+            if folded_heads == 1:
+                folded_output = output_slice.view(original_tokens * fold, folded_heads, output_slice.shape[-1])
+            else:
+                folded_output = torch.empty_like(query)
+            # ATB's folded layout can skip writing zero-context descriptor
+            # slots. Never let stale outputs from an earlier replay escape.
+            folded_output.zero_()
+        else:
+            folded_output = output_slice
+
         # Generate the specific mask for splitfuse
-        mask = AttentionMaskBuilder310.get_splitfuse_mask(attn_metadata, query.device)
+        if attn_metadata.causal:
+            mask = AttentionMaskBuilder310.get_splitfuse_mask(attn_metadata, query.device, query_head_repeat=fold)
+        else:
+            mask = AttentionMaskBuilder310.get_non_causal_splitfuse_mask(
+                attn_metadata, query.device, query_head_repeat=fold
+            )
         torch_npu._npu_paged_attention_splitfuse(
             query=query,
             key_cache=self.key_cache,
@@ -316,10 +454,15 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             seq_len=qlens,
             context_lens=attn_metadata.seq_lens,
             num_kv_heads=self.num_kv_heads,
-            num_heads=self.num_heads,
+            num_heads=folded_heads,
             scale_value=self.scale,
-            out=output_slice,
+            out=folded_output,
         )
+
+        if fold != 1 and folded_heads != 1:
+            restored = folded_output.view(original_tokens, fold, folded_heads, output_slice.shape[-1])
+            output_view = output_slice.view(original_tokens, folded_heads, fold, output_slice.shape[-1])
+            output_view.copy_(restored.transpose(1, 2))
 
         return output
 

@@ -18,14 +18,18 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
 import torch
-import torch_npu
-from vllm.third_party.flash_linear_attention.ops.utils import tensor_cache
+
+from vllm_ascend._310p.ops.adn_rms_norm import adn_rms_norm_or_fallback
 
 
-@tensor_cache
+@lru_cache(maxsize=8)
 def _l2norm_unit_weight(dim: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    # These keys describe values, not tensor identities. In particular,
+    # x.device may return a fresh but equal device object on every access.
+    # Keep the existing bounded cache; no activations are retained here.
     # RMSNorm with weight 1/sqrt(dim) matches L2 norm: x / sqrt(sum(x^2)).
     return torch.full((dim,), 1.0 / math.sqrt(dim), dtype=dtype, device=device)
 
@@ -39,5 +43,9 @@ def l2norm_310p(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     # RMSNorm: y = x / sqrt(mean(x^2) + eps_rms) * weight
     # With weight=1/sqrt(dim), this equals x / sqrt(sum(x^2) + dim * eps_rms).
     # L2 norm needs y = x / sqrt(sum(x^2) + eps), so eps_rms = eps / dim.
-    y, _ = torch_npu.npu_rms_norm(x_2d, weight, eps / dim)
+    y = adn_rms_norm_or_fallback(
+        x_2d,
+        weight,
+        eps / dim,
+    )
     return y.reshape(orig_shape)

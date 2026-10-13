@@ -80,11 +80,43 @@ class TestSampler310pStandalone(unittest.TestCase):
         second = sampler_310p._prepare_cpu_generators_310p({0: source_second})
 
         self.assertIsNot(second[0], first[0])
+        self.assertIs(sampler_310p._CPU_GENERATOR_CACHE_310P[0][0], source_second)
         expected = torch.Generator(device="cpu")
         expected.manual_seed(22)
         self.assertEqual(
             torch.rand((), generator=second[0]).item(),
             torch.rand((), generator=expected).item(),
+        )
+
+    def test_prepare_cpu_generators_reuses_cpu_generator_for_same_source(self):
+        """Adapted from the dflash cache-continuity test: the merged API keys
+        the cache on the source generator identity, so the same request
+        generator keeps the same CPU generator across sampling rounds."""
+        source = _SourceGenerator(11)
+
+        first = sampler_310p._prepare_cpu_generators_310p({0: source})
+        second = sampler_310p._prepare_cpu_generators_310p({0: source})
+
+        self.assertIs(second[0], first[0])
+        self.assertIs(sampler_310p._CPU_GENERATOR_CACHE_310P[0][1], first[0])
+
+    def test_prepare_cpu_generators_seeds_cpu_generator_from_initial_seed(self):
+        """Adapted from the dflash set_state-fallback test: the merged API no
+        longer imports device RNG state (there is no set_state path); it always
+        seeds the CPU generator from the request's initial_seed()."""
+        source = MagicMock()
+        source.initial_seed.return_value = 1234
+
+        prepared = sampler_310p._prepare_cpu_generators_310p({0: source})
+        source.get_state.assert_not_called()
+
+        expected = torch.Generator(device="cpu")
+        expected.manual_seed(1234)
+        self.assertTrue(
+            torch.equal(
+                torch.rand((4,), generator=prepared[0]),
+                torch.rand((4,), generator=expected),
+            )
         )
 
     def test_sample_from_cdf_handles_zero_weight_prefix_and_boundaries(self):

@@ -25,10 +25,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
-from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
-from vllm_ascend.distributed.parallel_state import get_mc2_group
-from vllm_ascend.ops.fused_moe import moe_utils
-from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEFusedExpertsInput
+from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEFusedExpertsInput, maybe_record_fused_moe_event
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput, build_mlp_compute_input
 from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
 from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import build_token_dispatch_input
@@ -151,7 +148,10 @@ class MoECommMethod(ABC):
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         assert moe_comm_method is not None, "Missing communication context"
 
-        before_dispatch_evt = torch.npu.current_stream().record_event()
+        before_dispatch_evt = maybe_record_fused_moe_event(fused_experts_input.record_events)
+        routed_topk_ids = fused_experts_input.topk_ids
+        if fused_experts_input.routing.log2phy is not None:
+            routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]
 
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
@@ -177,7 +177,7 @@ class MoECommMethod(ABC):
         if shared_activation_overlap_start_evt is None:
             shared_activation_overlap_start_evt = before_gmm2_evt
 
-        before_combine_evt = torch.npu.current_stream().record_event()
+        before_combine_evt = maybe_record_fused_moe_event(fused_experts_input.record_events)
         routed_out = self.token_dispatcher.token_combine(
             hidden_states=mlp_output,
             combine_metadata=token_dispatch_output.combine_metadata,

@@ -50,6 +50,9 @@ class MoEMlpComputeInput:
     activation: MoEActivation = MoEActivation.SILU
     need_trans: bool = False
     dynamic_eplb: bool = False
+    # Skip synchronization-event recording, propagated from
+    # MoEFusedExpertsInput (see there for details).
+    record_events: bool = True
     activation_situ_beta: float | None = None
     activation_situ_linear_beta: float | None = None
     swiglu_limit: float = 0.0
@@ -105,6 +108,7 @@ def build_mlp_compute_input(
         activation=activation,
         need_trans=fused_experts_input.need_trans,
         dynamic_eplb=fused_experts_input.dynamic_eplb,
+        record_events=fused_experts_input.record_events,
         activation_situ_beta=activation_situ_beta,
         activation_situ_linear_beta=activation_situ_linear_beta,
         swiglu_limit=swiglu_limit,

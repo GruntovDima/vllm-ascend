@@ -38,6 +38,10 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSlidingWindowMLASpec,
     register_ascend_kv_cache_specs,
 )
+from vllm_ascend.patch.platform.dflash_kv_context import (
+    dflash_scheduler_init_scope,
+    resolve_kv_use_eagle,
+)
 from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
     AscendHybridKVCacheCoordinator,
     _is_deepseek_v4_kv_cache_spec,
@@ -440,6 +444,7 @@ def _make_vllm_config(
     *,
     enable_prefix_caching: bool,
     dcp: int,
+    pcp: int = 1,
     block_size: int = 16,
     prefix_match_unit: int | None = None,
 ) -> SimpleNamespace:
@@ -452,6 +457,7 @@ def _make_vllm_config(
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=pcp,
         ),
         kv_transfer_config=None,
     )
@@ -460,10 +466,12 @@ def _make_vllm_config(
 def _make_coordinator_for_effective_block_size(
     *,
     dcp_world_size: int,
+    pcp_world_size: int = 1,
     enable_caching: bool,
 ) -> AscendHybridKVCacheCoordinator:
     coordinator = AscendHybridKVCacheCoordinator.__new__(AscendHybridKVCacheCoordinator)
     coordinator.dcp_world_size = dcp_world_size
+    coordinator.pcp_world_size = pcp_world_size
     coordinator.enable_caching = enable_caching
     return coordinator
 
@@ -510,6 +518,64 @@ def test_ascend_mla_merge_preserves_upstream_layout_fields() -> None:
     assert merged.scale_dtype == spec.scale_dtype
 
 
+def _full_spec(block_size: int) -> FullAttentionSpec:
+    return FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+    )
+
+
+def test_finalize_common_prefix_truncates_every_full_attention_group() -> None:
+    coordinator = _make_coordinator_for_effective_block_size(
+        dcp_world_size=1,
+        pcp_world_size=1,
+        enable_caching=True,
+    )
+    coordinator.attention_groups = [
+        (_full_spec(1280), [0], MagicMock()),
+        (_full_spec(640), [1, 2], MagicMock()),
+    ]
+    blocks = [
+        [object(), object()],
+        [object()] * 4,
+        [object()] * 4,
+    ]
+
+    finalized, hit_length = coordinator._finalize_common_prefix_hit(
+        blocks,
+        hit_length=1280,
+        longest_hit_length=2560,
+    )
+
+    assert [len(group) for group in finalized] == [1, 2, 2]
+    assert hit_length == 1280
+    assert coordinator.num_uncached_common_prefix_tokens == 1280
+
+
+def test_finalize_common_prefix_rejects_undercovered_group() -> None:
+    coordinator = _make_coordinator_for_effective_block_size(
+        dcp_world_size=1,
+        pcp_world_size=1,
+        enable_caching=True,
+    )
+    coordinator.attention_groups = [
+        (_full_spec(1280), [0], MagicMock()),
+        (_full_spec(640), [1], MagicMock()),
+    ]
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"group_id=1.*expected_blocks=2.*actual_blocks=1",
+    ):
+        coordinator._finalize_common_prefix_hit(
+            [[object()], [object()]],
+            hit_length=1280,
+            longest_hit_length=1280,
+        )
+
+
 @pytest.mark.parametrize(
     ("enable_prefix_caching", "expected_hash_block_size"),
     [
@@ -535,6 +601,44 @@ def test_resolve_kv_cache_block_sizes_with_cp_hybrid_groups(
     expected_scheduler_block_size = math.lcm(16, 32) * 2
     assert scheduler_block_size == expected_scheduler_block_size
     assert hash_block_size == expected_hash_block_size
+
+
+def test_dflash_resolve_uses_common_hash_granularity() -> None:
+    kv_cache_config = _make_hybrid_kv_cache_config(
+        full_block_size=1280,
+        mamba_block_size=1280,
+    )
+    draft_spec = FullAttentionSpec(
+        block_size=640,
+        num_kv_heads=4,
+        head_size=128,
+        dtype=torch.float16,
+    )
+    kv_cache_config.kv_cache_groups.append(
+        KVCacheGroupSpec(
+            layer_names=["draft_attn"],
+            kv_cache_spec=draft_spec,
+        )
+    )
+    vllm_config = _make_vllm_config(
+        enable_prefix_caching=True,
+        dcp=1,
+        pcp=1,
+        block_size=1280,
+    )
+    vllm_config.speculative_config = SimpleNamespace(method="dflash")
+
+    with patch(
+        "vllm_ascend.patch.platform.patch_kv_cache_utils._orig_resolve_kv_cache_block_sizes",
+        return_value=(1280, 1280),
+    ):
+        scheduler_block_size, hash_block_size = _ascend_resolve_kv_cache_block_sizes(
+            kv_cache_config,
+            vllm_config,
+        )
+
+    assert scheduler_block_size == 1280
+    assert hash_block_size == 640
 
 
 @pytest.mark.parametrize(
@@ -1125,6 +1229,66 @@ def test_get_kv_cache_coordinator_delegates_single_group(monkeypatch) -> None:
     )
 
     assert coordinator is sentinel
+
+
+def test_dflash_scheduler_context_disables_eagle_kv_policy(monkeypatch) -> None:
+    kv_cache_config = _make_hybrid_kv_cache_config(
+        full_block_size=16,
+        mamba_block_size=16,
+    )
+    single_group_config = KVCacheConfig(
+        num_blocks=kv_cache_config.num_blocks,
+        kv_cache_tensors=kv_cache_config.kv_cache_tensors[:1],
+        kv_cache_groups=kv_cache_config.kv_cache_groups[:1],
+    )
+    captured_use_eagle = None
+
+    def _fake_orig(*args, **kwargs):
+        nonlocal captured_use_eagle
+        captured_use_eagle = kwargs["use_eagle"]
+        return object()
+
+    monkeypatch.setattr(
+        "vllm_ascend.patch.platform.patch_kv_cache_coordinator._orig_get_kv_cache_coordinator",
+        _fake_orig,
+    )
+
+    with dflash_scheduler_init_scope():
+        get_kv_cache_coordinator(
+            single_group_config,
+            max_model_len=1024,
+            max_in_flight_tokens=1024,
+            use_eagle=True,
+            enable_caching=True,
+            enable_kv_cache_events=False,
+            dcp_world_size=1,
+            pcp_world_size=1,
+            hash_block_size=16,
+        )
+
+    assert captured_use_eagle is False
+
+
+def test_dflash_scheduler_context_restores_policy_after_exception() -> None:
+    assert resolve_kv_use_eagle(True) is True
+
+
+def test_dflash_scheduler_context_restores_nested_scope() -> None:
+    assert resolve_kv_use_eagle(True) is True
+
+    with dflash_scheduler_init_scope():
+        assert resolve_kv_use_eagle(True) is False
+        with dflash_scheduler_init_scope():
+            assert resolve_kv_use_eagle(True) is False
+        assert resolve_kv_use_eagle(True) is False
+
+    assert resolve_kv_use_eagle(True) is True
+
+    with pytest.raises(RuntimeError, match="scheduler init failed"), dflash_scheduler_init_scope():
+        assert resolve_kv_use_eagle(True) is False
+        raise RuntimeError("scheduler init failed")
+
+    assert resolve_kv_use_eagle(True) is True
 
 
 def test_get_kv_cache_coordinator_delegates_hybrid_without_caching(monkeypatch) -> None:

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -82,3 +82,81 @@ class TestAscendSpecDecodeBaseProposer310(TestBase):
                 )
 
         self.assertFalse(AscendRotaryEmbedding310._is_drafting_update_enabled)
+
+    def test_dummy_run_wrapper_enables_and_restores_flag(self):
+        from vllm_ascend._310p.spec_decode.dflash_proposer_310 import wrap_dummy_run_with_draft_flag
+
+        AscendRotaryEmbedding310.set_rope_position_flag_310p(False)
+        seen = []
+
+        def original(self, *args, **kwargs):
+            seen.append(AscendRotaryEmbedding310._is_drafting_update_enabled)
+            return "ok"
+
+        wrapped = wrap_dummy_run_with_draft_flag(original)
+        result = wrapped(object())
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(seen, [True])
+        # Restored to the prior value after the call.
+        self.assertFalse(AscendRotaryEmbedding310._is_drafting_update_enabled)
+
+    def test_dummy_run_wrapper_restores_flag_on_exception(self):
+        from vllm_ascend._310p.spec_decode.dflash_proposer_310 import wrap_dummy_run_with_draft_flag
+
+        AscendRotaryEmbedding310.set_rope_position_flag_310p(False)
+
+        def original(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+        wrapped = wrap_dummy_run_with_draft_flag(original)
+        with self.assertRaises(RuntimeError):
+            wrapped(object())
+
+        self.assertFalse(AscendRotaryEmbedding310._is_drafting_update_enabled)
+
+    def test_dummy_run_wrapper_reserves_exact_piecewise_draft_rope_capacity(self):
+        from vllm_ascend._310p.spec_decode.dflash_proposer_310 import wrap_dummy_run_with_draft_flag
+
+        proposer = MagicMock()
+        proposer.vllm_config = object()
+        proposer.runner.max_num_tokens = 1280
+
+        with (
+            patch(
+                "vllm_ascend._310p.spec_decode.dflash_proposer_310.is_310p_dflash_piecewise",
+                return_value=True,
+                create=True,
+            ),
+            patch(
+                "vllm_ascend._310p.spec_decode.dflash_proposer_310.configure_draft_rope_capacity_310",
+                create=True,
+            ) as configure_capacity,
+        ):
+            wrapped = wrap_dummy_run_with_draft_flag(lambda self: "ok")
+            self.assertEqual(wrapped(proposer), "ok")
+
+        configure_capacity.assert_called_once_with(1280)
+
+    def test_dummy_run_wrapper_does_not_reserve_out_of_scope_capacity(self):
+        from vllm_ascend._310p.spec_decode.dflash_proposer_310 import wrap_dummy_run_with_draft_flag
+
+        proposer = MagicMock()
+        proposer.vllm_config = object()
+        proposer.runner.max_num_tokens = 1280
+
+        with (
+            patch(
+                "vllm_ascend._310p.spec_decode.dflash_proposer_310.is_310p_dflash_piecewise",
+                return_value=False,
+                create=True,
+            ),
+            patch(
+                "vllm_ascend._310p.spec_decode.dflash_proposer_310.configure_draft_rope_capacity_310",
+                create=True,
+            ) as configure_capacity,
+        ):
+            wrapped = wrap_dummy_run_with_draft_flag(lambda self: "ok")
+            self.assertEqual(wrapped(proposer), "ok")
+
+        configure_capacity.assert_not_called()

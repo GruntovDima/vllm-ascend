@@ -695,6 +695,76 @@ npu_copy_and_expand_eagle_inputs_meta(
             out_new_token_indices, out_hidden_state_mapping};
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+npu_copy_and_expand_dflash_inputs_meta(
+    const at::Tensor &next_token_ids,
+    const at::Tensor &target_positions,
+    const at::Tensor &context_slot_mapping,
+    const at::Tensor &query_start_loc,
+    const at::Tensor &seq_lens,
+    const at::Tensor &block_table,
+    const at::Tensor &num_rejected_tokens,
+    int64_t parallel_drafting_token_id,
+    int64_t block_size,
+    int64_t num_query_per_req,
+    int64_t num_speculative_tokens,
+    bool sample_from_anchor)
+{
+    auto num_context = target_positions.sym_size(0);
+    auto num_reqs = query_start_loc.sym_size(0) - c10::SymInt(1);
+    auto num_query_total = num_reqs * c10::SymInt(num_query_per_req);
+
+    auto int_opts = target_positions.options().dtype(at::kInt);
+    at::Tensor out_input_ids = at::empty_symint(c10::SymDimVector{num_query_total}, int_opts);
+    at::Tensor out_query_positions = at::empty_symint(c10::SymDimVector{num_query_total}, int_opts);
+    at::Tensor out_query_slot_mapping = at::empty_symint(c10::SymDimVector{num_query_total}, int_opts);
+    at::Tensor out_context_positions = at::empty_symint(c10::SymDimVector{num_context}, int_opts);
+    at::Tensor out_context_slot_mapping = at::empty_symint(c10::SymDimVector{num_context}, int_opts);
+    at::Tensor out_token_indices = at::empty_symint(
+        c10::SymDimVector{num_reqs * c10::SymInt(num_speculative_tokens)}, int_opts);
+
+    return {out_input_ids, out_query_positions, out_query_slot_mapping,
+            out_context_positions, out_context_slot_mapping, out_token_indices};
+}
+
+at::Tensor adn_rms_norm_meta(
+    const at::Tensor& x,
+    const at::Tensor& gamma,
+    double epsilon)
+{
+    TORCH_CHECK(x.scalar_type() == at::kHalf,
+                "adn_rms_norm only supports FP16 x");
+    TORCH_CHECK(gamma.scalar_type() == at::kHalf,
+                "adn_rms_norm only supports FP16 gamma");
+    TORCH_CHECK(x.dim() > 0,
+                "adn_rms_norm requires x to have at least one dimension");
+    const c10::SymInt hiddenSize = x.sym_size(-1);
+    TORCH_CHECK(hiddenSize == c10::SymInt(128) ||
+                    hiddenSize == c10::SymInt(256) ||
+                    hiddenSize == c10::SymInt(2048),
+                "adn_rms_norm requires x.shape[-1] in {128, 256, 2048}");
+    // Do not call numel() here: the leading dimensions can be symbolic while
+    // torch.compile traces a decode graph.  Empty concrete inputs are rejected
+    // by the Python dispatcher and the NPU binding before kernel launch.
+    TORCH_CHECK(gamma.dim() == 1 && gamma.sym_size(0) == hiddenSize,
+                "adn_rms_norm requires one-dimensional gamma with size x.shape[-1]");
+    // Hidden-size checks above use SymInt so the changing decode row dimension
+    // remains symbolic.  Contiguity is validated by the concrete-device
+    // binding because calling
+    // is_contiguous() on a FakeTensor can specialize its symbolic row count.
+    return at::empty_symint(x.sym_sizes(), x.options());
+}
+
+at::Tensor npu_rejection_sample_greedy_310_meta(
+    const at::Tensor &cu_num_draft_tokens,
+    const at::Tensor &draft_token_ids,
+    const at::Tensor &target_argmax,
+    const at::Tensor &bonus_token_ids,
+    at::Tensor &output_token_ids,
+    int64_t max_spec_len)
+{
+    return output_token_ids;
+}
 at::Tensor npu_causal_conv1d_310_meta(
     const at::Tensor& x,
     const at::Tensor& weight,
@@ -1609,6 +1679,13 @@ at::Tensor kda_gate_cumsum_vllm_meta(
     (void)layout;
     return at::empty_symint(g.sym_sizes(), g.options().dtype(at::kFloat));
 }
+at::Tensor npu_quant_grouped_matmul_dequant_310_meta(
+    const at::Tensor& x, const at::Tensor& weight, const at::Tensor& weight_scale,
+    const at::Tensor& group_list, const at::Tensor& x_scale)
+{
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "Expected X[M,K] and W[E,N,K]");
+    return at::empty_symint(c10::SymDimVector{x.sym_size(0), weight.sym_size(1)}, x.options());
+}
 
 at::Tensor kda_layout_swap12_meta(
     const at::Tensor &x,
@@ -1845,6 +1922,7 @@ void npu_fused_quant_lightning_indexer_manage_meta(
 namespace {
 TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("get_physical_device_id", &vllm_ascend::meta::get_physical_device_id_meta);
+    ops.impl("npu_quant_grouped_matmul_dequant_310", &vllm_ascend::meta::npu_quant_grouped_matmul_dequant_310_meta);
     // causal_conv1d_310
     ops.impl("npu_causal_conv1d_310", &vllm_ascend::meta::npu_causal_conv1d_310_meta);
     // npu_recurrent_gated_delta_rule_310
@@ -1859,6 +1937,12 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("kda_layout_swap12", &vllm_ascend::meta::kda_layout_swap12_meta);
     // chunk_gated_delta_rule_compute_wy
     ops.impl("chunk_gated_delta_rule_compute_wy", &vllm_ascend::meta::chunk_gated_delta_rule_compute_wy_meta);
+    // CopyAndExpandDflashInputs
+    ops.impl("npu_copy_and_expand_dflash_inputs", &vllm_ascend::meta::npu_copy_and_expand_dflash_inputs_meta);
+    // AdnRmsNorm
+    ops.impl("adn_rms_norm", &vllm_ascend::meta::adn_rms_norm_meta);
+    // RejectionSampleGreedy310
+    ops.impl("npu_rejection_sample_greedy_310", &vllm_ascend::meta::npu_rejection_sample_greedy_310_meta);
 }
 }
 #else

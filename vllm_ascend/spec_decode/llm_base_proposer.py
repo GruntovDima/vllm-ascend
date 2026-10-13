@@ -43,11 +43,28 @@ from vllm.v1.spec_decode.utils import (
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_ascend import utils as ascend_utils
+from vllm_ascend._310p.dflash_fdo_numerical_probe import (
+    create_draft_boundary_probe,
+    create_draft_layer_probe,
+)
+from vllm_ascend._310p.dflash_full_and_piecewise import (
+    is_310p_dflash_full_and_piecewise,
+)
+from vllm_ascend._310p.dflash_full_decode_contract import (
+    build_draft_full_decode_contract_sources,
+)
+from vllm_ascend._310p.dflash_full_decode_only import (
+    is_310p_dflash_full_decode_only,
+)
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
-from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
+from vllm_ascend.compilation.acl_graph import (
+    ACLGraphWrapper,
+    get_draft_graph_params,
+    update_full_graph_params,
+)
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import (
@@ -183,6 +200,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # Assign runner before it's used in the methods below
         self.runner = runner
+        self._fdo_draft_numerical_probe = create_draft_boundary_probe(vllm_config)
+        self._fdo_draft_layer_probe = create_draft_layer_probe(
+            vllm_config,
+            max_num_tokens=self.max_num_tokens,
+            hidden_size=self.hidden_size,
+            dtype=vllm_config.model_config.dtype,
+            device=device,
+        )
 
         logger.debug(
             "[spec_decode/base] Initializing spec decode proposer: method=%s,"
@@ -472,6 +497,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if self.method in ("dspark", "dflash") and hasattr(self.model, "post_process"):
             self.model.post_process(self.vllm_config)
 
+        if self._fdo_draft_layer_probe is not None:
+            self._fdo_draft_layer_probe.bind(self.model)
+
         if (
             self.parallel_drafting
             and self.pass_hidden_states_to_model
@@ -649,6 +677,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 runtime_mode=CUDAGraphMode.FULL,
                 use_eagle=self.use_eagle,
                 enable_enpu=self.enable_enpu,
+                component="draft",
+                retained_input_provider=(self._full_decode_draft_retained_inputs),
             )
 
     def set_update_stream(self, update_stream):
@@ -895,7 +925,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     slot_mapping_lens = common_attn_metadata.slot_mapping.shape[0]
                     self.slot_mapping_group[draft_index][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping)
                     self.slot_mapping_group[draft_index][slot_mapping_lens:].fill_(PADDING_SLOT_ID)
-                    common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_index]
+                    common_attn_metadata.slot_mapping = self._select_full_decode_slot_mapping(
+                        self.slot_mapping_group[draft_index],
+                        logical_tokens=num_tokens,
+                        runtime_mode=aclgraph_runtime_mode,
+                    )
                     self.seq_lens_group[draft_index][:num_reqs].copy_(common_attn_metadata.seq_lens)
                     self.seq_lens_group[draft_index][num_reqs:].fill_(0)
                     common_attn_metadata.seq_lens = self.seq_lens_group[draft_index][:num_reqs]
@@ -932,6 +966,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                                 draft_index,
                                 **extra_attn_metadata_args,
                             )
+                        self._bind_full_decode_draft_attention_buffers(
+                            attn_metadata_eagle,
+                            common_attn_metadata,
+                            draft_index=draft_index,
+                            runtime_mode=aclgraph_runtime_mode,
+                        )
                         for layer_name in attn_group.layer_names:
                             per_layer_attn_metadata[layer_name] = attn_metadata_eagle
                     multi_steps_attn_metadata.append(per_layer_attn_metadata)
@@ -984,16 +1024,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
-            self._runnable(
-                num_input_tokens=num_tokens,
-                batch_size=batch_size,
-                token_indices_to_sample=self.token_indices_to_sample[: batch_size * self.extra_slots_per_request],
-                # The target_position's address is same as the model_positions's
-                target_positions=model_positions,
-                inputs_embeds=inputs_embeds,
-                multi_steps_attn_metadata=multi_steps_attn_metadata,
-                num_tokens=num_tokens,
+            rope_prepared = self._prepare_full_decode_draft_rope(
+                query_positions=model_positions,
+                query_actual_tokens=num_tokens,
+                descriptor_tokens=num_tokens,
+                runtime_mode=aclgraph_runtime_mode,
             )
+            try:
+                self._runnable(
+                    num_input_tokens=num_tokens,
+                    batch_size=batch_size,
+                    token_indices_to_sample=self.token_indices_to_sample[: batch_size * self.extra_slots_per_request],
+                    # The target_position's address is same as the model_positions's
+                    target_positions=model_positions,
+                    inputs_embeds=inputs_embeds,
+                    multi_steps_attn_metadata=multi_steps_attn_metadata,
+                    num_tokens=num_tokens,
+                )
+            finally:
+                self._finish_full_decode_draft_rope(rope_prepared)
             forward_context = get_forward_context()
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
                 self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
@@ -1006,6 +1055,144 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     ) -> None:
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
             self._update_full_graph_params(forward_context, num_input_tokens, multi_steps_attn_metadata)
+
+    def _prepare_full_decode_draft_rope(
+        self,
+        *,
+        query_positions: torch.Tensor,
+        query_actual_tokens: int,
+        descriptor_tokens: int,
+        runtime_mode: CUDAGraphMode,
+    ) -> Any:
+        """Platform hook for graph-external draft RoPE preparation."""
+        return None
+
+    def _finish_full_decode_draft_rope(self, prepared: Any) -> None:
+        """Release temporary platform state after a draft graph call."""
+        del prepared
+
+    def _select_full_decode_target_positions(
+        self,
+        *,
+        target_positions: torch.Tensor,
+        num_input_tokens: int,
+        runtime_mode: CUDAGraphMode,
+    ) -> torch.Tensor:
+        if runtime_mode == CUDAGraphMode.FULL and (
+            is_310p_dflash_full_decode_only(self.vllm_config)
+            or is_310p_dflash_full_and_piecewise(self.vllm_config)
+        ):
+            return self._get_positions(num_input_tokens)
+        return target_positions
+
+    def _select_full_decode_outer_inputs_embeds(
+        self,
+        *,
+        inputs_embeds: torch.Tensor | None,
+        runtime_mode: CUDAGraphMode,
+    ) -> torch.Tensor | None:
+        if (
+            self.method == "dflash"
+            and runtime_mode == CUDAGraphMode.FULL
+            and is_310p_dflash_full_decode_only(self.vllm_config)
+        ):
+            return None
+        return inputs_embeds
+
+    def _select_full_decode_slot_mapping(
+        self,
+        buffer: torch.Tensor,
+        *,
+        logical_tokens: int,
+        runtime_mode: CUDAGraphMode,
+    ) -> torch.Tensor:
+        if runtime_mode == CUDAGraphMode.FULL and is_310p_dflash_full_decode_only(self.vllm_config):
+            return buffer[:logical_tokens]
+        return buffer
+
+    def _select_full_decode_token_indices_to_sample(
+        self,
+        runtime_indices: torch.Tensor,
+        *,
+        graph_num_reqs: int | None,
+        runtime_mode: CUDAGraphMode,
+    ) -> torch.Tensor:
+        """Bind DFlash sampling indices to a descriptor-sized buffer view."""
+        if not (runtime_mode == CUDAGraphMode.FULL and is_310p_dflash_full_decode_only(self.vllm_config)):
+            return runtime_indices
+        if graph_num_reqs is None:
+            raise RuntimeError("310P DFlash FULL descriptor has no request count")
+        logical_tokens = runtime_indices.numel()
+        graph_tokens = graph_num_reqs * self.num_speculative_tokens
+        if not logical_tokens <= graph_tokens <= self.token_indices_to_sample.numel():
+            raise RuntimeError(
+                "310P DFlash FULL sample-index descriptor is outside its "
+                "persistent buffer: "
+                f"actual={logical_tokens}, descriptor={graph_tokens}, "
+                f"capacity={self.token_indices_to_sample.numel()}"
+            )
+        self.token_indices_to_sample[:logical_tokens].copy_(
+            runtime_indices,
+            non_blocking=True,
+        )
+        self.token_indices_to_sample[logical_tokens:graph_tokens].fill_(0)
+        return self.token_indices_to_sample[:graph_tokens]
+
+    def _full_decode_draft_retained_inputs(
+        self,
+        forward_context: ForwardContext,
+        batch_descriptor: BatchDescriptor,
+    ):
+        """Expose merged-DFlash FULL inputs outside the call signature."""
+        proposer_buffers = {
+            "input_ids": self.input_ids,
+            "positions": self.positions,
+            "hidden_states": self.hidden_states,
+            "token_indices_to_sample": self.token_indices_to_sample,
+            "arange": self.arange,
+            "block_table": getattr(self, "block_table_tensor_clone", None),
+            "is_rejected_token_mask": getattr(self, "is_rejected_token_mask", None),
+            "is_masked_token_mask": getattr(self, "is_masked_token_mask", None),
+            "inputs_embeds": getattr(self, "inputs_embeds", None),
+            "draft_query_rope_cos_310": getattr(self, "_full_decode_draft_query_rope_cos_310", None),
+            "draft_query_rope_sin_310": getattr(self, "_full_decode_draft_query_rope_sin_310", None),
+            "draft_context_rope_cos_310": getattr(self, "_full_decode_draft_context_rope_cos_310", None),
+            "draft_context_rope_sin_310": getattr(self, "_full_decode_draft_context_rope_sin_310", None),
+        }
+        return build_draft_full_decode_contract_sources(
+            forward_context=forward_context,
+            graph_params=get_draft_graph_params(),
+            proposer_buffers=proposer_buffers,
+            descriptor_num_tokens=batch_descriptor.num_tokens,
+        )
+
+    def _bind_full_decode_draft_attention_buffers(
+        self,
+        attn_metadata: Any,
+        common_attn_metadata: CommonAttentionMetadata,
+        *,
+        draft_index: int,
+        runtime_mode: CUDAGraphMode,
+    ) -> None:
+        """Bind graph-visible draft metadata to proposer-owned storage."""
+        if runtime_mode != CUDAGraphMode.FULL or not is_310p_dflash_full_decode_only(self.vllm_config):
+            return
+        for field_name in ("seq_lens", "query_start_loc", "slot_mapping"):
+            persistent = getattr(common_attn_metadata, field_name, None)
+            if hasattr(attn_metadata, field_name) and isinstance(persistent, torch.Tensor):
+                previous = getattr(attn_metadata, field_name)
+                setattr(attn_metadata, field_name, persistent)
+                if field_name == "seq_lens" and draft_index == 0:
+                    logger.debug(
+                        "[310p-dflash-full-decode-only/contract-bind] "
+                        "component=draft step=%d field=%s previous_ptr=%s "
+                        "persistent_ptr=%d bound_ptr=%d",
+                        draft_index,
+                        field_name,
+                        (previous.data_ptr() if isinstance(previous, torch.Tensor) else None),
+                        persistent.data_ptr(),
+                        getattr(attn_metadata, field_name).data_ptr(),
+                    )
 
     def _propose(
         self,
@@ -1110,6 +1297,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             aclgraph_runtime_mode = CUDAGraphMode.NONE
             batch_descriptor = None
 
+        token_indices_to_sample = self._select_full_decode_token_indices_to_sample(
+            token_indices_to_sample,
+            graph_num_reqs=(batch_descriptor.num_reqs if batch_descriptor is not None else None),
+            runtime_mode=aclgraph_runtime_mode,
+        )
+
         if aclgraph_runtime_mode == CUDAGraphMode.FULL:
             # TODO: Due to the inconsistency between the proposer `dispatcher` and model runner, this padding
             # should have been done in model runner but not. For example, at prefill stage, target model
@@ -1207,7 +1400,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         slot_mapping_lens = common_attn_metadata.slot_mapping.shape[0]
         self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping)
         self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
-        common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
+        common_attn_metadata.slot_mapping = self._select_full_decode_slot_mapping(
+            self.slot_mapping_group[0],
+            logical_tokens=num_input_tokens,
+            runtime_mode=aclgraph_runtime_mode,
+        )
 
         self.seq_lens_group[0][:num_reqs_padded].copy_(common_attn_metadata.seq_lens)
         self.seq_lens_group[0][num_reqs_padded:].fill_(0)
@@ -1221,7 +1418,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         self._pad_draft_buffers(num_tokens, num_input_tokens)
         multi_steps_attn_metadata, attn_metadata_i = self.build_draft_attn_metadata(
-            common_attn_metadata, num_input_tokens, num_tokens
+            common_attn_metadata, num_input_tokens, num_tokens, aclgraph_runtime_mode
         )
 
         # Merged step 0 is the draft model's first-pass/prefill forward, not a
@@ -1241,6 +1438,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             used_update_positions = self.mrope_positions[:, token_indices_to_sample]
         else:
             used_update_positions = self.positions[token_indices_to_sample]
+
 
         # Clone the data so that when calculating the data at position 2 and position 3
         # in the merged graph, it does not affect position 1
@@ -1374,8 +1572,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "num_input_tokens": num_input_tokens,
                 "batch_size": batch_size,
                 "token_indices_to_sample": self.token_indices_to_sample[:token_indices_to_sample_len],
-                "target_positions": target_positions,
-                "inputs_embeds": inputs_embeds,
+                "target_positions": self._select_full_decode_target_positions(
+                    target_positions=target_positions,
+                    num_input_tokens=num_input_tokens,
+                    runtime_mode=aclgraph_runtime_mode,
+                ),
+                "inputs_embeds": self._select_full_decode_outer_inputs_embeds(
+                    inputs_embeds=inputs_embeds,
+                    runtime_mode=aclgraph_runtime_mode,
+                ),
                 "multi_steps_attn_metadata": multi_steps_attn_metadata,
                 "num_tokens": num_tokens,
                 "is_prefill": is_prefill_batch,
@@ -1384,14 +1589,46 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             runnable = cast(Callable[..., Any], self._runnable)
             run_draft: Callable[[], Any] = partial(runnable, **model_inputs)
 
-            if self.enable_enpu:
-                self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
-                draft_token_ids = run_draft()
-            else:
-                draft_token_ids = run_draft()
-                self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+            rope_prepared = self._prepare_full_decode_draft_rope(
+                query_positions=model_inputs["target_positions"],
+                query_actual_tokens=num_tokens,
+                descriptor_tokens=num_input_tokens,
+                runtime_mode=aclgraph_runtime_mode,
+            )
+            try:
+                if self.enable_enpu:
+                    self._update_full_graph_params_if_needed(
+                        forward_context,
+                        num_input_tokens,
+                        multi_steps_attn_metadata,
+                    )
+                    draft_token_ids = run_draft()
+                else:
+                    draft_token_ids = run_draft()
+                    self._update_full_graph_params_if_needed(
+                        forward_context,
+                        num_input_tokens,
+                        multi_steps_attn_metadata,
+                    )
+            finally:
+                self._finish_full_decode_draft_rope(rope_prepared)
         if active_device_metadata_executor is not None:
             active_device_metadata_executor.release()
+        self._record_draft_numerical_probe(
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden=target_hidden_states,
+            next_token_ids=next_token_ids,
+            proposed_token_ids=draft_token_ids,
+            descriptor=num_input_tokens,
+            actual_tokens=num_tokens,
+            runtime_mode=aclgraph_runtime_mode,
+        )
+        self._record_draft_layer_numerical_probe(
+            descriptor=num_input_tokens,
+            actual_tokens=num_tokens,
+            runtime_mode=aclgraph_runtime_mode,
+        )
         return draft_token_ids
 
     def _sample_draft_from_logits(
@@ -1420,6 +1657,85 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         return super()._sample_from_logits(logits, sampling_metadata)
 
+    def _record_draft_numerical_probe(
+        self,
+        *,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        proposed_token_ids: torch.Tensor,
+        descriptor: int,
+        actual_tokens: int,
+        runtime_mode: CUDAGraphMode,
+    ) -> None:
+        probe = self._fdo_draft_numerical_probe
+        if probe is None:
+            return
+        assert self.runner is not None
+        req_ids = self.runner.input_batch.req_ids
+        if len(req_ids) != 1:
+            raise RuntimeError("310P DFlash numerical diagnosis requires one active request")
+        request_state = self.runner.requests[req_ids[0]]
+        probe.record_after_model(
+            tp_rank=get_tp_group().rank_in_group,
+            generated_prefix=tuple(request_state.output_token_ids),
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden=target_hidden,
+            next_token_ids=next_token_ids,
+            proposed_token_ids=proposed_token_ids,
+            descriptor=descriptor,
+            actual_tokens=actual_tokens,
+            runtime_mode=runtime_mode,
+        )
+
+    def _record_draft_layer_numerical_probe(
+        self,
+        *,
+        descriptor: int,
+        actual_tokens: int,
+        runtime_mode: CUDAGraphMode,
+    ) -> None:
+        probe = self._fdo_draft_layer_probe
+        if probe is None:
+            return
+        assert self.runner is not None
+        req_ids = self.runner.input_batch.req_ids
+        if len(req_ids) == 1:
+            generated_prefix = tuple(self.runner.requests[req_ids[0]].output_token_ids)
+        else:
+            generated_prefix = tuple(
+                token
+                for req_id in req_ids
+                for token in (
+                    *self.runner.requests[req_id].output_token_ids,
+                    -1,
+                )
+            )
+        draft_input_ids = self.input_ids[:descriptor]
+        probe.record_after_model(
+            tp_rank=get_tp_group().rank_in_group,
+            generated_prefix=generated_prefix,
+            draft_input_ids=draft_input_ids,
+            draft_positions=self._get_positions(descriptor),
+            draft_embeddings=self.model.embed_input_ids(draft_input_ids),
+            descriptor=descriptor,
+            actual_tokens=actual_tokens,
+            context_actual_tokens=int(getattr(self, "_dflash_num_context", 0)),
+            runtime_mode=runtime_mode,
+        )
+
+    def _build_first_pass_per_layer_attn_metadata(
+        self,
+        builder,
+        common_attn_metadata: CommonAttentionMetadata,
+        attn_metadata,
+        extra_attn_metadata_args: dict,
+    ) -> dict[str, Any]:
+        """Allow platform/model proposers to specialize first-pass metadata."""
+        return {layer_name: attn_metadata for layer_name in self.attn_layer_names}
+
     def compute_draft_token_ids(
         self,
         hidden_states: torch.Tensor,
@@ -1447,6 +1763,26 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             logits = self.model.compute_logits(hidden_states)
             return self._sample_draft_from_logits(logits, sampling_metadata)
+
+    def _remap_dflash_draft_to_target(self, draft_token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        """Map reduced draft-vocab ids to target-vocab ids for DFlash drafters.
+
+        DFlash draft heads emit logits over a reduced draft vocabulary; the
+        trained rows map back to the target vocab via the d2t buffer
+        (``target_id = draft_id + d2t[draft_id]``). The ``compute_draft_token_ids``
+        reduce-sampling path applies this bias, but the plain ``argmax`` paths do
+        not. Without the remap the verifier compares draft-local ids against
+        target-vocab ids and rejects almost every speculative token
+        (acceptance ~0). Only remap when ``logits`` are over the reduced draft
+        vocab (width == d2t length); if ``compute_logits`` already returned full
+        target-vocab logits the argmax is a target id and this is a no-op.
+        """
+        d2t = getattr(self.model, "draft_id_to_target_id", None)
+        applied = self.method == "dflash" and d2t is not None and logits.shape[-1] == d2t.shape[0]
+        if not applied:
+            return draft_token_ids
+        bias = torch.index_select(d2t, dim=0, index=draft_token_ids.view(-1)).view(draft_token_ids.shape)
+        return draft_token_ids + bias
 
     def _run_merged_draft(
         self,
@@ -1623,6 +1959,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         is_logits=True,
                     )
                 draft_token_ids, draft_probs_step0 = self._sample_draft_from_logits(logits, sampling_metadata)
+                draft_token_ids = self._remap_dflash_draft_to_target(draft_token_ids, logits)
 
                 # Dynamic verify-length path for head-free DFlash only.
                 if hasattr(self, "dynamic_spec") and self.dynamic_spec is not None:
@@ -1760,6 +2097,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 logits = logits[:num_indices]
                 token_indices_to_sample = token_indices_to_sample[:num_indices]
             draft_token_ids, draft_probs_step = self._sample_draft_from_logits(logits, sampling_metadata)
+            draft_token_ids = self._remap_dflash_draft_to_target(draft_token_ids, logits)
+
 
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
@@ -1957,6 +2296,27 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
         return self.method not in ("mtp", "draft_model", "dflash", "dspark")
 
+    def _compute_draft_step_slot_mapping(
+        self,
+        block_table_for_slot: torch.Tensor,
+        clamped_positions: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Compute one Draft step's slot mapping.
+
+        Backend subclasses may override storage preparation, while the default
+        path preserves the existing public Gather/Add behavior exactly.
+        """
+        logical_positions = (
+            clamped_positions[0] if self.uses_mrope else clamped_positions
+        )
+        block_numbers = logical_positions // block_size
+        block_ids = block_table_for_slot.gather(
+            dim=1,
+            index=block_numbers.view(-1, 1),
+        ).view(-1)
+        return block_ids * block_size + logical_positions % block_size
+
     def attn_update_stack_num_spec_norm(
         self,
         # `draft_index` must start from `1`, no `0`
@@ -2100,6 +2460,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.slot_mapping_group[draft_index][:batch_size] = slot_mapping
             self.slot_mapping_group[draft_index][batch_size:].fill_(PADDING_SLOT_ID)
             common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_index]
+            common_attn_metadata.slot_mapping = self._select_full_decode_slot_mapping(
+                self.slot_mapping_group[draft_index],
+                logical_tokens=input_batch_size,
+                runtime_mode=aclgraph_runtime_mode,
+            )
         else:
             # NOTE: In vllm, `block_size = attn_metadata_builder.kv_cache_spec.block_size`.
             # However, in vllm-ascend, the above value can be multiple of `kernel_block_size`,
@@ -2119,16 +2484,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             else:
                 block_table_for_slot = old_common_metadata.block_table_tensor
 
-            if self.uses_mrope:
-                block_numbers = clamped_positions[0] // block_size
-            else:
-                block_numbers = clamped_positions // block_size
-            block_ids = block_table_for_slot.gather(dim=1, index=block_numbers.view(-1, 1))
-            block_ids = block_ids.view(-1)
-            if self.uses_mrope:
-                slot_mapping = block_ids * block_size + clamped_positions[0] % block_size
-            else:
-                slot_mapping = block_ids * block_size + clamped_positions % block_size
+            slot_mapping = self._compute_draft_step_slot_mapping(
+                block_table_for_slot,
+                clamped_positions,
+                block_size,
+            )
 
             # Mask out the slot mappings that exceed the max model length.
             # Otherwise, the KV cache will be inadvertently updated with the
@@ -2137,7 +2497,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.slot_mapping_group[draft_index][: slot_mapping.shape[0]].copy_(slot_mapping.to(torch.int32))
             self.slot_mapping_group[draft_index][slot_mapping.shape[0] :].fill_(PADDING_SLOT_ID)
             # Set the address of the attn_metadata.slot_mapping to the self.slot_mapping_group[idx]
-            common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_index]
+            common_attn_metadata.slot_mapping = self._select_full_decode_slot_mapping(
+                self.slot_mapping_group[draft_index],
+                logical_tokens=input_batch_size,
+                runtime_mode=aclgraph_runtime_mode,
+            )
 
         self.seq_lens_group[draft_index][: common_attn_metadata.seq_lens.shape[0]].copy_(common_attn_metadata.seq_lens)
         self.seq_lens_group[draft_index][common_attn_metadata.seq_lens.shape[0] :].fill_(0)
@@ -2183,6 +2547,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 draft_index=draft_index,
                 attn_metadata_builder=attn_metadata_builder,
             )
+
+        self._bind_full_decode_draft_attention_buffers(
+            attn_metadata,
+            common_attn_metadata,
+            draft_index=draft_index,
+            runtime_mode=aclgraph_runtime_mode,
+        )
 
         return common_attn_metadata, attn_metadata
 
@@ -2553,6 +2924,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata,
         num_input_tokens,
         num_actual_tokens,
+        aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ):
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
@@ -2635,10 +3007,42 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 per_layer_attn_metadata[layer_name] = attn_metadata
         if device_metadata_executor is not None and device_metadata_tasks:
             device_metadata_executor.submit(device_metadata_tasks)
-        multi_steps_attn_metadata = [per_layer_attn_metadata]
         # Copy the old attn_metadata and update
         primary_group = self._get_primary_draft_attn_group()
         attn_metadata_i = per_layer_attn_metadata[primary_group.layer_names[0]]
+
+        # The first step of speculative. Most drafters share one metadata
+        # object. 310P DFlash overrides this hook because hybrid draft layers
+        # can use different physical KV-cache block sizes and therefore require
+        # different slot mappings.
+        if (
+            type(self)._build_first_pass_per_layer_attn_metadata
+            is not AscendSpecDecodeBaseProposer._build_first_pass_per_layer_attn_metadata
+        ):
+            primary_builder = primary_group.get_metadata_builder()
+            primary_extra_args: dict = dict(shared_dsa_draft_cache)
+            if self.use_compress:
+                primary_extra_args["block_size"] = primary_group.kv_cache_spec.block_size
+            per_layer_attn_metadata = self._build_first_pass_per_layer_attn_metadata(
+                primary_builder,
+                common_attn_metadata,
+                attn_metadata_i,
+                primary_extra_args,
+            )
+            seen_metadata: set[int] = set()
+            for layer_metadata in per_layer_attn_metadata.values():
+                if id(layer_metadata) in seen_metadata:
+                    continue
+                seen_metadata.add(id(layer_metadata))
+                self._bind_full_decode_draft_attention_buffers(
+                    layer_metadata,
+                    common_attn_metadata,
+                    draft_index=0,
+                    runtime_mode=aclgraph_runtime_mode,
+                )
+            attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
+
+        multi_steps_attn_metadata = [per_layer_attn_metadata]
         return multi_steps_attn_metadata, attn_metadata_i
 
     def _pad_draft_buffers(

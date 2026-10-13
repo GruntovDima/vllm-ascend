@@ -796,6 +796,173 @@ npu_copy_and_expand_eagle_inputs(
             out_new_token_indices, out_hidden_state_mapping};
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+npu_copy_and_expand_dflash_inputs(
+    const at::Tensor &next_token_ids,
+    const at::Tensor &target_positions,
+    const at::Tensor &context_slot_mapping,
+    const at::Tensor &query_start_loc,
+    const at::Tensor &seq_lens,
+    const at::Tensor &block_table,
+    const at::Tensor &num_rejected_tokens,
+    int64_t parallel_drafting_token_id,
+    int64_t block_size,
+    int64_t num_query_per_req,
+    int64_t num_speculative_tokens,
+    bool sample_from_anchor)
+{
+    int64_t num_context = target_positions.size(0);
+    int64_t num_reqs = query_start_loc.size(0) - 1;
+    int64_t num_query_total = num_reqs * num_query_per_req;
+
+    auto device = target_positions.device();
+    auto int_opts = at::dtype(at::kInt).device(device);
+    at::Tensor out_input_ids = at::zeros({num_query_total}, int_opts);
+    at::Tensor out_query_positions = at::zeros({num_query_total}, int_opts);
+    at::Tensor out_query_slot_mapping = at::zeros({num_query_total}, int_opts);
+    at::Tensor out_context_positions = at::zeros({num_context}, int_opts);
+    at::Tensor out_context_slot_mapping = at::zeros({num_context}, int_opts);
+    at::Tensor out_token_indices = at::zeros({num_reqs * num_speculative_tokens}, int_opts);
+
+    EXEC_NPU_CMD(aclnnCopyAndExpandDflashInputs,
+        next_token_ids, target_positions, context_slot_mapping, query_start_loc,
+        seq_lens, block_table, num_rejected_tokens,
+        parallel_drafting_token_id, block_size, num_query_per_req,
+        num_speculative_tokens, sample_from_anchor,
+        out_input_ids, out_query_positions, out_query_slot_mapping,
+        out_context_positions, out_context_slot_mapping, out_token_indices);
+
+    return {out_input_ids, out_query_positions, out_query_slot_mapping,
+            out_context_positions, out_context_slot_mapping, out_token_indices};
+}
+
+at::Tensor adn_rms_norm(
+    const at::Tensor& x,
+    const at::Tensor& gamma,
+    double epsilon)
+{
+    TORCH_CHECK(
+        x.is_privateuseone() && gamma.is_privateuseone() &&
+            x.device() == gamma.device(),
+        "adn_rms_norm requires x and gamma on the same NPU device");
+    const c10_npu::OptionalNPUGuard npuGuard(x.device());
+    TORCH_CHECK(x.scalar_type() == at::kHalf,
+                "adn_rms_norm only supports FP16 x");
+    TORCH_CHECK(gamma.scalar_type() == at::kHalf,
+                "adn_rms_norm only supports FP16 gamma");
+    TORCH_CHECK(x.dim() > 0,
+                "adn_rms_norm requires x to have at least one dimension");
+    const int64_t hiddenSize = x.size(-1);
+    TORCH_CHECK(hiddenSize == 128 || hiddenSize == 256 || hiddenSize == 2048,
+                "adn_rms_norm requires x.shape[-1] in {128, 256, 2048}, got ",
+                hiddenSize);
+    TORCH_CHECK(x.numel() > 0,
+                "adn_rms_norm requires a non-empty x");
+    TORCH_CHECK(gamma.dim() == 1 && gamma.size(0) == hiddenSize,
+                "adn_rms_norm requires one-dimensional gamma with size x.shape[-1], got ",
+                gamma.sizes(), " and hidden size ", hiddenSize);
+    TORCH_CHECK(x.is_contiguous() && gamma.is_contiguous(),
+                "adn_rms_norm requires contiguous tensors");
+
+    at::Tensor y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnAdnRmsNorm, x, gamma, epsilon, y);
+    return y;
+}
+
+at::Tensor npu_quant_grouped_matmul_dequant_310(
+    const at::Tensor& x, const at::Tensor& weight, const at::Tensor& weight_scale,
+    const at::Tensor& group_list, const at::Tensor& x_scale)
+{
+    TORCH_CHECK(x.is_privateuseone(), "Expected NPU inputs");
+    const c10::OptionalDeviceGuard device_guard(x.device());
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 3 && x.size(0) == 640 && weight.size(0) == 256,
+                "VllmQuantGroupedMatmulDequantV310 requires 640 rows and 256 experts");
+    const bool gate = x.size(1) == 2048 && weight.size(1) == 512 && weight.size(2) == 2048;
+    const bool down = x.size(1) == 256 && weight.size(1) == 2048 && weight.size(2) == 256;
+    TORCH_CHECK(gate || down, "Unsupported MoE projection shape");
+    TORCH_CHECK(x.scalar_type() == at::kHalf && weight.scalar_type() == at::kChar &&
+                weight_scale.scalar_type() == at::kFloat && group_list.scalar_type() == at::kLong &&
+                x_scale.scalar_type() == at::kFloat, "Expected FP16 X, INT8 W, FP32 scales, INT64 groups");
+    TORCH_CHECK(weight_scale.dim() == 2 && weight_scale.size(0) == 256 &&
+                weight_scale.size(1) == weight.size(1) && group_list.dim() == 1 &&
+                group_list.numel() == 256 && x_scale.dim() == 1 && x_scale.numel() == 640,
+                "Invalid scales or cumulative group_list shape");
+    for (const auto& tensor : {x, weight, weight_scale, group_list, x_scale}) {
+        TORCH_CHECK(tensor.device() == x.device(), "All inputs must be on the same NPU");
+        TORCH_CHECK(tensor.is_contiguous(), "Inputs must be contiguous");
+    }
+    TORCH_CHECK(NPUBridge::GetNpuStorageImplDesc(weight).npu_format_ == ACL_FORMAT_FRACTAL_NZ,
+                "Weight must have FRACTAL_NZ storage");
+    for (const auto& tensor : {x, weight_scale, group_list, x_scale}) {
+        TORCH_CHECK(IsOpInputBaseFormat(tensor), "Only weight may use an internal storage format");
+    }
+    at::Tensor output = at::empty({x.size(0), weight.size(1)}, x.options());
+    EXEC_NPU_CMD(aclnnVllmQuantGroupedMatmulDequantV310, x, weight, weight_scale, group_list, x_scale, output);
+    return output;
+}
+
+at::Tensor npu_rejection_sample_greedy_310(
+    const at::Tensor &cu_num_draft_tokens,
+    const at::Tensor &draft_token_ids,
+    const at::Tensor &target_argmax,
+    const at::Tensor &bonus_token_ids,
+    at::Tensor &output_token_ids,
+    int64_t max_spec_len)
+{
+    TORCH_CHECK(max_spec_len >= 0, "max_spec_len must be non-negative");
+    TORCH_CHECK(cu_num_draft_tokens.dim() == 1, "cu_num_draft_tokens must be one-dimensional");
+    TORCH_CHECK(draft_token_ids.dim() == 1, "draft_token_ids must be one-dimensional");
+    TORCH_CHECK(target_argmax.dim() == 1, "target_argmax must be one-dimensional");
+    TORCH_CHECK(output_token_ids.dim() == 2, "output_token_ids must be two-dimensional");
+    TORCH_CHECK(
+        output_token_ids.size(0) == cu_num_draft_tokens.size(0),
+        "output_token_ids batch size must match cu_num_draft_tokens");
+    TORCH_CHECK(
+        output_token_ids.size(1) == max_spec_len + 1,
+        "output_token_ids width must equal max_spec_len + 1");
+    TORCH_CHECK(
+        bonus_token_ids.numel() == cu_num_draft_tokens.numel(),
+        "bonus_token_ids must contain one token per request");
+    TORCH_CHECK(
+        draft_token_ids.numel() == target_argmax.numel(),
+        "draft_token_ids and target_argmax must have equal lengths");
+    TORCH_CHECK(cu_num_draft_tokens.scalar_type() == at::kInt, "cu_num_draft_tokens must be int32");
+    TORCH_CHECK(draft_token_ids.scalar_type() == at::kInt, "draft_token_ids must be int32");
+    TORCH_CHECK(target_argmax.scalar_type() == at::kLong, "target_argmax must be int64");
+    TORCH_CHECK(bonus_token_ids.scalar_type() == at::kInt, "bonus_token_ids must be int32");
+    TORCH_CHECK(output_token_ids.scalar_type() == at::kInt, "output_token_ids must be int32");
+    TORCH_CHECK(
+        cu_num_draft_tokens.is_contiguous() && draft_token_ids.is_contiguous() &&
+            target_argmax.is_contiguous() && bonus_token_ids.is_contiguous() && output_token_ids.is_contiguous(),
+        "all rejection sampling tensors must be contiguous");
+    TORCH_CHECK(
+        cu_num_draft_tokens.device() == output_token_ids.device() &&
+            draft_token_ids.device() == output_token_ids.device() &&
+            target_argmax.device() == output_token_ids.device() &&
+            bonus_token_ids.device() == output_token_ids.device(),
+        "all rejection sampling tensors must be on the same device");
+
+    constexpr int64_t INT32_ELEMENTS_PER_BLOCK = 8;
+    const int64_t output_len = max_spec_len + 1;
+    const int64_t aligned_output_len =
+        (output_len + INT32_ELEMENTS_PER_BLOCK - 1) / INT32_ELEMENTS_PER_BLOCK * INT32_ELEMENTS_PER_BLOCK;
+    at::Tensor kernel_output = output_token_ids;
+    if (output_len != aligned_output_len) {
+        kernel_output = at::empty(
+            {output_token_ids.size(0), aligned_output_len},
+            output_token_ids.options());
+    }
+
+    EXEC_NPU_CMD(aclnnRejectionSampleGreedyV310,
+        cu_num_draft_tokens, draft_token_ids, target_argmax, bonus_token_ids,
+        max_spec_len, aligned_output_len, kernel_output);
+
+    if (output_len != aligned_output_len) {
+        output_token_ids.copy_(kernel_output.slice(1, 0, output_len).contiguous());
+    }
+    return output_token_ids;
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_hash(
     const at::Tensor& x,
     int64_t k,
@@ -2898,6 +3065,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def("get_physical_device_id(int user_device_id) -> int");
     ops.impl("get_physical_device_id", c10::DispatchKey::CompositeExplicitAutograd,
              &vllm_ascend::get_physical_device_id);
+    ops.def("npu_quant_grouped_matmul_dequant_310(Tensor x, Tensor weight, Tensor weight_scale, "
+            "Tensor group_list, Tensor x_scale) -> Tensor");
+    ops.impl("npu_quant_grouped_matmul_dequant_310", torch::kPrivateUse1,
+             &vllm_ascend::npu_quant_grouped_matmul_dequant_310);
     ops.def(
         "npu_causal_conv1d_310(Tensor x, "
         "                         Tensor weight, "
@@ -2961,6 +3132,28 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                       bool transpose_x2=False, "
         "                       int group_size=0) -> Tensor");
     ops.impl("quant_batch_matmul_v3", torch::kPrivateUse1, &vllm_ascend::quant_batch_matmul_v3);
+
+    ops.def(
+        "npu_copy_and_expand_dflash_inputs(Tensor next_token_ids, Tensor target_positions, "
+        "Tensor context_slot_mapping, Tensor query_start_loc, Tensor seq_lens, "
+        "Tensor block_table, Tensor num_rejected_tokens, "
+        "int parallel_drafting_token_id, int block_size, int num_query_per_req, "
+        "int num_speculative_tokens, bool sample_from_anchor) -> "
+        "(Tensor out_input_ids, Tensor out_query_positions, Tensor out_query_slot_mapping, "
+        "Tensor out_context_positions, Tensor out_context_slot_mapping, Tensor out_token_indices)"
+    );
+    ops.impl("npu_copy_and_expand_dflash_inputs", torch::kPrivateUse1, &vllm_ascend::npu_copy_and_expand_dflash_inputs);
+
+    ops.def(
+        "adn_rms_norm(Tensor x, Tensor gamma, float epsilon=1e-6) -> Tensor");
+    ops.impl("adn_rms_norm", torch::kPrivateUse1, &vllm_ascend::adn_rms_norm);
+
+    ops.def(
+        "npu_rejection_sample_greedy_310(Tensor cu_num_draft_tokens, Tensor draft_token_ids, "
+        "Tensor target_argmax, Tensor bonus_token_ids, Tensor(a!) output_token_ids, "
+        "int max_spec_len) -> Tensor(a!)"
+    );
+    ops.impl("npu_rejection_sample_greedy_310", torch::kPrivateUse1, &vllm_ascend::npu_rejection_sample_greedy_310);
 }
 #else
 // Pybind on other platform

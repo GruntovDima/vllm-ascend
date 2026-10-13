@@ -16,13 +16,18 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import pytest
 import torch
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod310
 from vllm_ascend._310p.fused_moe.moe_comm_method import AllGatherCommImpl310
-from vllm_ascend._310p.fused_moe.moe_mlp import apply_moe_mlp
+from vllm_ascend._310p.fused_moe.moe_mlp import (
+    _quant_grouped_matmul,
+    _supports_named_quant_gmm,
+    apply_moe_mlp,
+)
 from vllm_ascend._310p.quantization.methods.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod310
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import (
     MoEWeights,
@@ -435,6 +440,7 @@ class TestApplyMoeMLPFullChain310(TestBase):
                     weight_scale=layer.w13_weight_scale,
                     group_list=mlp_compute_input.group_list,
                     quant_mode="pertoken",
+                    x_scale=None,
                 ),
                 call(
                     x=mock_swiglu.return_value,
@@ -442,6 +448,7 @@ class TestApplyMoeMLPFullChain310(TestBase):
                     weight_scale=layer.w2_weight_scale,
                     group_list=mlp_compute_input.group_list,
                     quant_mode="pertoken",
+                    x_scale=None,
                 ),
             ],
             any_order=True,
@@ -532,3 +539,196 @@ class TestAllGatherCommImpl310FusedExperts(TestBase):
             mock_ctx.moe_comm_method = object()
             with self.assertRaises(NotImplementedError):
                 comm.fused_experts(fused_experts_input=fused_experts_input)
+
+
+@pytest.fixture
+def quant_gmm_mocks():
+    with (
+        patch("torch_npu.get_npu_format", return_value=29, create=True) as get_format,
+        patch("torch_npu.npu_quant_grouped_matmul_dequant", create=True) as gmm,
+    ):
+        yield get_format, gmm
+
+
+def make_quant_gmm_inputs(
+    rows=640,
+    k=256,
+    n=2048,
+    experts=256,
+    x_dtype=torch.float16,
+    weight_dtype=torch.int8,
+    scale_dtype=torch.float32,
+    group_dtype=torch.int64,
+):
+    x = torch.full((rows, k), 0.5, dtype=x_dtype)
+    # Metadata-only weights avoid allocating hundreds of MB in CPU unit tests.
+    weight = torch.empty((experts, n, k), dtype=weight_dtype, device="meta")
+    scale = torch.empty((experts, n), dtype=scale_dtype, device="meta")
+    groups = torch.empty(experts, dtype=group_dtype, device="meta")
+    return x, weight, scale, groups
+
+
+@pytest.mark.parametrize("k,n", [(2048, 512), (256, 2048)])
+def test_batch_scale_is_per_row_and_preserves_gmm_arguments(quant_gmm_mocks, k, n):
+    get_format, gmm = quant_gmm_mocks
+    x, weight, weight_scale, groups = make_quant_gmm_inputs(k=k, n=n)
+    # Cover all-zero, negative maximum, subnormal and largest finite FP16 rows.
+    x[0] = 0
+    x[1, 0] = -2
+    x[2] = torch.finfo(torch.float16).smallest_normal / 2
+    x[3, 0] = torch.finfo(torch.float16).max
+    original = x.clone()
+
+    result = _quant_grouped_matmul(x, weight, weight_scale, groups)
+
+    kwargs = gmm.call_args.kwargs
+    assert result is gmm.return_value
+    assert kwargs["x"] is x
+    assert kwargs["quantized_weight"] is weight
+    assert kwargs["weight_scale"] is weight_scale
+    assert kwargs["group_list"] is groups
+    assert kwargs["quant_mode"] == "pertoken"
+    assert set(kwargs) == {"x", "quantized_weight", "weight_scale", "group_list", "quant_mode", "x_scale"}
+    expected = original.float().abs().amax(dim=-1) / 127.0
+    expected[0] = 1
+    torch.testing.assert_close(kwargs["x_scale"], expected, rtol=0, atol=0)
+    assert kwargs["x_scale"].shape == (640,)
+    assert kwargs["x_scale"].dtype == torch.float32
+    assert kwargs["x_scale"].device == x.device
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+    get_format.assert_called_once_with(weight)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"rows": 0},
+        {"rows": 80},
+        {"rows": 639},
+        {"rows": 641},
+        {"rows": 1280},  # K15/C10 must not activate the K7/C10 shape guard.
+        {"k": 128},
+        {"n": 1024},
+        {"experts": 128},
+        {"x_dtype": torch.float32},
+        {"x_dtype": torch.bfloat16},
+        {"weight_dtype": torch.float16},
+        {"scale_dtype": torch.float16},
+        {"group_dtype": torch.int32},
+    ],
+)
+def test_unvalidated_contract_uses_internal_scale(quant_gmm_mocks, overrides):
+    get_format, gmm = quant_gmm_mocks
+    inputs = make_quant_gmm_inputs(**overrides)
+    _quant_grouped_matmul(*inputs)
+    assert gmm.call_args.kwargs["x_scale"] is None
+    get_format.assert_not_called()
+
+
+def test_non_nz_weight_uses_internal_scale(quant_gmm_mocks):
+    get_format, gmm = quant_gmm_mocks
+    get_format.return_value = 2
+    _quant_grouped_matmul(*make_quant_gmm_inputs())
+    assert gmm.call_args.kwargs["x_scale"] is None
+
+
+def test_batch_scale_is_recomputed_for_each_call(quant_gmm_mocks):
+    _, gmm = quant_gmm_mocks
+    x, weight, scale, groups = make_quant_gmm_inputs()
+    _quant_grouped_matmul(x, weight, scale, groups)
+    first_scale = gmm.call_args.kwargs["x_scale"]
+    x.mul_(2)
+    _quant_grouped_matmul(x, weight, scale, groups)
+    torch.testing.assert_close(gmm.call_args.kwargs["x_scale"], first_scale * 2, rtol=0, atol=0)
+
+
+def test_quant_mlp_computes_separate_scales_around_swiglu(quant_gmm_mocks):
+    """Adapted from the dflash ``quant_apply_mlp`` test: the merged 310P quant
+    MLP entry routes gmm1+swiglu+gmm2 through the method hooks, so the
+    per-row scale contract is checked directly on the merged
+    ``_quant_grouped_matmul`` helper on both sides of the activation."""
+    _, gmm = quant_gmm_mocks
+    x, w1, w1_scale, _ = make_quant_gmm_inputs(k=2048, n=512)
+    act_out, w2, w2_scale, _ = make_quant_gmm_inputs()
+    act_out.mul_(4)
+    counts = torch.zeros(256, dtype=torch.int64)
+    counts[-1] = x.shape[0]
+    groups = counts.cumsum(dim=0)
+    gmm1_out = torch.empty((640, 512), dtype=torch.float16)
+    gmm2_out = torch.empty_like(x)
+    gmm.side_effect = [gmm1_out, gmm2_out]
+
+    with patch("torch_npu.npu_swiglu", return_value=act_out) as swiglu:
+        hidden_states = _quant_grouped_matmul(x, w1, w1_scale, groups)
+        hidden_states = swiglu(hidden_states)
+        result = _quant_grouped_matmul(hidden_states, w2, w2_scale, groups)
+
+    assert result is gmm2_out
+    swiglu.assert_called_once_with(gmm1_out)
+    assert gmm.call_count == 2
+    first, second = [c.kwargs for c in gmm.call_args_list]
+    assert first["x"] is x
+    assert second["x"] is act_out
+    torch.testing.assert_close(first["x_scale"], torch.full((640,), 0.5 / 127.0), rtol=0, atol=0)
+    torch.testing.assert_close(second["x_scale"], torch.full((640,), 2.0 / 127.0), rtol=0, atol=0)
+    torch.testing.assert_close(first["group_list"], groups)
+    torch.testing.assert_close(second["group_list"], groups)
+
+
+@pytest.mark.parametrize("use_named", [True, False])
+def test_named_op_dispatch_and_old_extension_compatibility(quant_gmm_mocks, use_named):
+    _, cann = quant_gmm_mocks
+    inputs = make_quant_gmm_inputs()
+    named = MagicMock() if use_named else None
+    with (
+        patch.object(torch.ops._C_ascend, "npu_quant_grouped_matmul_dequant_310", named, create=True),
+        patch("vllm_ascend._310p.fused_moe.moe_mlp._supports_named_quant_gmm", return_value=True),
+    ):
+        result = _quant_grouped_matmul(*inputs)
+    if use_named:
+        assert result is named.return_value
+        cann.assert_not_called()
+        assert named.call_args.args[:4] == inputs
+        torch.testing.assert_close(named.call_args.args[4], torch.full((640,), 0.5 / 127), rtol=0, atol=0)
+    else:
+        assert result is cann.return_value
+
+
+def test_named_op_errors_are_not_silently_retried(quant_gmm_mocks):
+    _, cann = quant_gmm_mocks
+    with (
+        patch.object(
+            torch.ops._C_ascend,
+            "npu_quant_grouped_matmul_dequant_310",
+            MagicMock(side_effect=RuntimeError("kernel failed")),
+            create=True,
+        ),
+        patch("vllm_ascend._310p.fused_moe.moe_mlp._supports_named_quant_gmm", return_value=True),
+        pytest.raises(RuntimeError, match="kernel failed"),
+    ):
+        _quant_grouped_matmul(*make_quant_gmm_inputs())
+    cann.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid", [None, "device", "scale_shape", "group_shape", "strided", "format"])
+def test_named_layout_guard_reads_only_metadata(invalid):
+    tensors = [MagicMock(spec=torch.Tensor) for _ in range(4)]
+    x, weight, scale, groups = tensors
+    device = MagicMock()
+    device.type = "npu"
+    for tensor in tensors:
+        tensor.device = device
+        tensor.is_contiguous.return_value = True
+        tensor.cpu.side_effect = AssertionError("must not read device values")
+        tensor.item.side_effect = AssertionError("must not read device values")
+    x.shape, weight.shape, scale.shape, groups.shape = (640, 256), (256, 2048, 256), (256, 2048), (256,)
+    if invalid == "device":
+        groups.device = MagicMock()
+    elif invalid == "scale_shape":
+        scale.shape = (256, 2047)
+    elif invalid == "group_shape":
+        groups.shape = (255,)
+    elif invalid == "strided":
+        x.is_contiguous.return_value = False
+    with patch("torch_npu.get_npu_format", return_value=29 if invalid == "format" else 2, create=True):
+        assert _supports_named_quant_gmm(*tensors) == (invalid is None)

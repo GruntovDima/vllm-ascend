@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.patch.platform.dflash_kv_context import resolve_kv_use_eagle
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
@@ -347,6 +348,48 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         block_sizes = [self._get_effective_block_size(group.spec) for group in self.attention_groups]
         self.lcm_block_size = lcm(*block_sizes)
 
+    def _finalize_common_prefix_hit(
+        self,
+        hit_blocks_by_group: list[list[KVCacheBlock] | None],
+        hit_length: int,
+        longest_hit_length: int | None = None,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """Trim and validate every FullAttention group at the final hit."""
+        for spec, group_ids, *_ in self.attention_groups:
+            if not isinstance(spec, FullAttentionSpec):
+                continue
+
+            effective_block_size = self._get_effective_block_size(spec)
+            if hit_length % effective_block_size != 0:
+                raise RuntimeError(
+                    "FullAttention prefix hit is not block aligned: "
+                    f"hit_length={hit_length}, "
+                    f"block_size={effective_block_size}"
+                )
+
+            expected_blocks = hit_length // effective_block_size
+            for group_id in group_ids:
+                blocks = hit_blocks_by_group[group_id]
+                if blocks is None:
+                    blocks = []
+                    hit_blocks_by_group[group_id] = blocks
+                del blocks[expected_blocks:]
+                if len(blocks) != expected_blocks:
+                    raise RuntimeError(
+                        "FullAttention prefix coverage mismatch: "
+                        f"group_id={group_id}, hit_length={hit_length}, "
+                        f"expected_blocks={expected_blocks}, "
+                        f"actual_blocks={len(blocks)}"
+                    )
+
+        if longest_hit_length is not None:
+            self.num_uncached_common_prefix_tokens = longest_hit_length - hit_length
+
+        return (
+            tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group),
+            hit_length,
+        )
+
     def find_longest_cache_hit(
         self,
         block_hashes: list[BlockHash],
@@ -445,6 +488,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
 
                 longest_hit_length = max(longest_hit_length, curr_hit_length)
 
+                longest_hit_length = max(longest_hit_length, curr_hit_length)
+
             if curr_hit_length >= hit_length:
                 break
             hit_length = curr_hit_length
@@ -519,6 +564,9 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
     # Keep pcp_world_size in this patched function for upstream call
     # compatibility; platform validation guarantees that it is one.
     del pcp_world_size
+    # While a DFlash scheduler builds its KV managers, EAGLE's KV-tail drop
+    # must stay disabled (see patch_mamba_scheduler_310).
+    use_eagle = resolve_kv_use_eagle(use_eagle)
     token_budget = _select_kv_token_budget(max_model_len, max_in_flight_tokens)
     hybrid_kwargs = dict(
         kv_cache_config=kv_cache_config,

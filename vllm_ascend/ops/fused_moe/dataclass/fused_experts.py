@@ -28,6 +28,14 @@ from vllm_ascend.ops.fused_moe.dataclass.router_input import MoeRouterInput
 from vllm_ascend.quantization.quant_type import QuantType
 
 
+def maybe_record_fused_moe_event(record_events: bool):
+    """Record a synchronization event only when the caller requires one."""
+
+    if not record_events:
+        return None
+    return torch.npu.current_stream().record_event()
+
+
 @dataclass(frozen=True, slots=True)
 class MoEWeights:
     """Dense and quantized weight payloads consumed by MoE execution."""
@@ -62,6 +70,9 @@ class MoEFusedExpertsInput:
     activation: MoEActivation | str = MoEActivation.SILU
     need_trans: bool = False
     dynamic_eplb: bool = False
+    # Skip synchronization-event recording (e.g. under FULL_DECODE_ONLY
+    # graph capture, where stream events cannot be replayed).
+    record_events: bool = True
     # Optional per-layer MoE LoRA state (vllm_ascend.lora MoELoRAContext).
     # ``Any`` avoids coupling the core contracts to the LoRA module; only the
     # unquant MLP path reads it, and only when a LoRA adapter is active.
@@ -100,6 +111,7 @@ def build_fused_experts_input(
     w2_scale_bias: list[torch.Tensor] | torch.Tensor | None = None,
     w1_offset: torch.Tensor | None = None,
     w2_offset: torch.Tensor | None = None,
+    record_events: bool = True,
     lora_context=None,
 ) -> MoEFusedExpertsInput:
     return MoEFusedExpertsInput(
@@ -129,6 +141,7 @@ def build_fused_experts_input(
         activation=activation,
         need_trans=need_trans,
         dynamic_eplb=dynamic_eplb,
+        record_events=record_events,
         layer=layer,
         quant=build_quant_params(
             quant_type=quant_type,
