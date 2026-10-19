@@ -16,8 +16,12 @@ layers and 27B. It is not a universal accuracy bound. The check reuses dead
 Gram scratch for vector multiplication/reduction, without another matmul or
 additional UB allocation. Existing FP32 fallback/retry remains unchanged.
 
-Current kernel SHA256:
+Packaged source SHA256 (Windows CRLF):
 `600d5b7c5d1eecebf83b931d111c5247612785da6fa4931cba408ce2c9a3ef13`.
+Canonical Git/LF source SHA256:
+`2a4eb273ac47e3fef1fbc03ca126516845dce2c58cd46960123016e41508260d`.
+The committed kernel is byte-identical to the GDN Git blob; its LF-normalized
+contents match the packaged, tested source.
 
 The exact GDN kernel was freshly built: 15 existing and 8 new native cases
 passed, with five repeats. On 116 captured calls, new strict-reference
@@ -29,6 +33,31 @@ The HQ_TEST backport was freshly rebuilt on CANN 9.1.0-beta.1: 76 native
 regression cases passed (23 WY, 12 FwdH and 41 FwdO). All 467 Python source
 files and non-GDN runtime binaries remained unchanged. Scoped Ruff, formatting,
 mypy and source-contract checks passed; this is not a full CI result.
+
+The private HQ_TEST runtime then completed a 9B W8A8 timing matrix with an
+FP16 LM head, TP1, DFlash15 and Custom QBMM. Chunked prefill and prefix caching
+were disabled; model length and token budget were held at 8192. Each case
+used three measured waves after excluded warmups, with 2048 output tokens per
+request (`ignore_eos=True`). Inputs were meaningful English continuations
+with thinking disabled and exact supplied token IDs, not random IDs.
+
+| BS | Input/request | TTFT mean, ms | TPOT mean/weighted, ms | Output tok/s | Draft acceptance |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 2048 | 1178.332 | 35.346 | 27.852 | 17.27% |
+| 2 | 1024 | 1344.156 | 44.404 | 43.079 | 15.32% |
+| 4 | 512 | 1432.957 | 54.923 | 66.882 | 15.54% |
+
+All 21 requests completed with exactly 2048 outputs. Token IDs were stable
+across repeats of each request. Actual target and draft graph-replay counters
+increased in every measured wave; WY and Custom QBMM dispatch were observed
+only during excluded warmup. Observation wrappers were removed before timing.
+
+These are offline `engine.step` cumulative-event measurements with bundled
+DFlash output, not HTTP/AIS timing or a quality/equivalence test. There is no
+matched baseline for an isolated GDN speedup claim. Existing integer ArgSort
+warnings report AiCPU execution for multi-request cases. Other devices on the
+shared host were active, but the selected NPU7 had only the experiment worker.
+The private runtime did not replace the existing global installation.
 
 The sections below retain historical evidence for the earlier inverse/split
 kernel. Its old hash and measurements do not describe the current energy gate.
