@@ -138,8 +138,10 @@ at::Tensor CatTensorList(const std::vector<at::Tensor> &list)
 // ND stacked -> NZ byte stream via the production aclnn format cast.
 at::Tensor CastNdToNz(const at::Tensor &w)
 {
+    // Local stack: torch_npu 2.9 accepts a single customize dtype; the newer
+    // torch_npu (26.x) two-dtype overload is not available here.
     return at_npu::native::custom_ops::npu_format_cast(w, kAclCastTargetFractalNz,
-                                                                kAclDtFloat8E4m3Fn, kAclDtFloat4E2m1FnX2);
+                                                                kAclDtFloat8E4m3Fn);
 }
 
 // Shared core: dynamic ACL inputs encode either one stacked tensor or E

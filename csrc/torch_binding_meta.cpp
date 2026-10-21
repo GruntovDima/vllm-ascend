@@ -783,6 +783,16 @@ at::Tensor npu_causal_conv1d_310_meta(
     return output;
 }
 
+at::Tensor npu_swiglu_quant_v310_meta(
+    const at::Tensor& x,
+    const at::Tensor& scale,
+    const at::Tensor& offset)
+{
+    auto outShape = x.sym_sizes().vec();
+    outShape.back() = outShape.back() / 2;
+    return at::empty_symint(outShape, x.options().dtype(at::kChar));
+}
+
 at::Tensor npu_recurrent_gated_delta_rule_310_meta(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -1926,6 +1936,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     // causal_conv1d_310
     ops.impl("npu_causal_conv1d_310", &vllm_ascend::meta::npu_causal_conv1d_310_meta);
     // npu_recurrent_gated_delta_rule_310
+    ops.impl("npu_swiglu_quant_v310", &vllm_ascend::meta::npu_swiglu_quant_v310_meta);
     ops.impl("npu_recurrent_gated_delta_rule_310", &vllm_ascend::meta::npu_recurrent_gated_delta_rule_310_meta);
     // chunk_gated_delta_rule_fwd_h_vllm
     ops.impl("chunk_gated_delta_rule_fwd_h_vllm", &vllm_ascend::meta::chunk_gated_delta_rule_fwd_h_vllm_meta);

@@ -318,9 +318,14 @@ class cmake_build_ext(build_ext):
         torch_npu_command = "python3 -m pip show torch-npu | grep '^Location:' | awk '{print $2}'"
         try:
             torch_npu_path = subprocess.check_output(torch_npu_command, shell=True).decode().strip()
-            torch_npu_path += "/torch_npu"
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Retrieve torch version version failed: {e}")
+        if not torch_npu_path:
+            import importlib.util as _ilu
+            _spec = _ilu.find_spec("torch_npu")
+            torch_npu_path = os.path.dirname(_spec.origin)
+        else:
+            torch_npu_path += "/torch_npu"
 
         # add TORCH_NPU_PATH
         cmake_args += [f"-DTORCH_NPU_PATH={torch_npu_path}"]

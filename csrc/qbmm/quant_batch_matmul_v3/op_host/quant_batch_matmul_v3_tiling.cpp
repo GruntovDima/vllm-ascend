@@ -20,6 +20,8 @@
 #include "quant_batch_matmul_v3_tiling.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstdio>
 #include <vector>
 #include "register/op_impl_registry.h"
 #include "../op_kernel/quant_batch_matmul_v3_tiling_key.h"
@@ -33,6 +35,12 @@
 using namespace ge;
 
 namespace optiling {
+
+// Experiment-only env overrides (local tuning; unset = no effect).
+static uint32_t EnvU32(const char *name) {
+    const char *v = std::getenv(name);
+    return v ? static_cast<uint32_t>(std::atoi(v)) : 0U;
+}
 
 static inline uint32_t AlignUpU(uint32_t val, uint32_t align) {
     return ((val + align - 1) / align) * align;
@@ -323,6 +331,14 @@ static Int8TilingResult ComputeInt8Tiling(
             // cost model sees the actual MTE2 cadence.
             const uint32_t candWChunk = ComputeWChunkKPasses(
                 tryM, baseN, tryK, K, Kq, l1Size);
+            const uint32_t forceBM = EnvU32("QBM_T_BM");
+            const uint32_t forceBN = EnvU32("QBM_T_BN");
+            const uint32_t forceBK = EnvU32("QBM_T_BK");
+            if ((forceBM != 0 && tryM != forceBM) ||
+                (forceBN != 0 && baseN != forceBN) ||
+                (forceBK != 0 && tryK != forceBK)) {
+                continue;
+            }
             candidates.push_back({tryM, baseN, tryK, chunk, candWChunk});
 
             bool better = false;
@@ -358,6 +374,19 @@ static Int8TilingResult ComputeInt8Tiling(
     shape.isPerTensor = (isPerTensor != 0);
     shape.scaleType   = scaleType;
 
+    // L0B band structure: a Nb whose N0-fractal count is not a power of two
+    // (96->6, 192->12, 320->20) strides L0B rows across banks unevenly; the
+    // cost model assumes Nb-independent MTE1/cube efficiency and otherwise
+    // prefers these cells for their exact-divide tail. Measured on 310P:
+    // pow2 Nb beats them by 10-15% at equal work (e.g. prefill N=12288:
+    // Nb=64 2.83 ms vs Nb=96 3.34 ms). Demote non-pow2 Nb so a pow2
+    // alternative wins unless the model sees a large (>30%) deficit.
+    auto withL0bBandPenalty = [](uint64_t cyc, uint32_t baseN) -> uint64_t {
+        const uint32_t n0 = baseN / COL_ALIGN;
+        const bool pow2 = (n0 != 0) && ((n0 & (n0 - 1)) == 0);
+        return pow2 ? cyc : cyc * 13 / 10;
+    };
+
     uint64_t bestCyc = UINT64_MAX;
     Int8TilingResult pick{0, 0, 0, 0, 0};
     for (const auto& c : candidates) {
@@ -365,8 +394,14 @@ static Int8TilingResult ComputeInt8Tiling(
             Q, c.baseN, N, isPerTensor, scaleType);
         TilingCandidate tile{c.baseM, c.baseN, c.baseK, c.phaseXChunk,
                              c.wChunkKPasses, candCoalesce};
-        uint64_t cyc = EstimatePerCoreCriticalPath(tile, shape, aicNum);
-        if (cyc < bestCyc) {
+        uint64_t cyc = withL0bBandPenalty(
+            EstimatePerCoreCriticalPath(tile, shape, aicNum), c.baseN);
+        if (std::getenv("QBM_T_DBG") != nullptr) {
+            std::fprintf(stderr, "QBMCAND bm=%u bn=%u bk=%u cyc=%llu\n",
+                         c.baseM, c.baseN, c.baseK,
+                         (unsigned long long)cyc);
+        }
+        if (cyc < bestCyc || (cyc == bestCyc && c.baseN > pick.baseN)) {
             bestCyc = cyc;
             pick = c;
         }
@@ -392,8 +427,8 @@ static Int8TilingResult ComputeInt8Tiling(
             TilingCandidate ct{c.baseM, c.baseN, c.baseK,
                                 c.phaseXChunk, c.wChunkKPasses,
                                 candCoalesce};
-            uint64_t candCyc = EstimatePerCoreCriticalPath(
-                ct, shape, aicNum);
+            uint64_t candCyc = withL0bBandPenalty(
+                EstimatePerCoreCriticalPath(ct, shape, aicNum), c.baseN);
             if (candCyc > bestCyc) continue;
             bestCbCount = candCb;
             pick = c;
@@ -691,6 +726,14 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     gridShape.scaleType = scaleType;
     CoreGrid grid = PickCoreGrid(aicNum, virtualM, totalColBatch,
                                   gridTile, gridShape);
+    {
+        const uint32_t forceMC = EnvU32("QBM_T_MC");
+        const uint32_t forceNC = EnvU32("QBM_T_NC");
+        if (forceMC != 0 && forceNC != 0 && forceMC * forceNC <= aicNum) {
+            grid.MCoreNum = forceMC;
+            grid.NCoreNum = forceNC;
+        }
+    }
     uint32_t gridCores = grid.MCoreNum * grid.NCoreNum;
     uint32_t usedCoreNum = std::min(gridCores, std::max(1U, totalWork));
 
@@ -765,6 +808,17 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     const uint32_t dbL0c =
         (2U * l0cHalfBytes <= l0CSize) ? 1U : 0U;
     tilingData.set_dbL0c(dbL0c);
+
+    if (std::getenv("QBM_T_DBG") != nullptr) {
+        std::fprintf(stderr,
+                     "QBMDBG M=%u N=%u K=%u baseM=%u baseN=%u baseK=%u "
+                     "pxChunk=%u wCh=%u grid=%ux%u cores=%u work=%u "
+                     "l2=%u dbL0c=%u\n",
+                     M, N, K, baseM, baseN, baseK,
+                     t.phaseXChunk, t.wChunkKPasses,
+                     grid.MCoreNum, grid.NCoreNum, usedCoreNum, totalWork,
+                     l2HintMode, dbL0c);
+    }
 
     // Pertoken coalesce: when (B*M*4) fits a small UB budget, fire
     // ONE MTE2 at Process entry covering ALL B*M floats; per-mTile use

@@ -45,6 +45,7 @@
 #include "attention/kv_compress_epilog_v2/kv_compress_epilog_v2_torch_adpt.h"
 #include "attention/quant_lightning_indexer_v2/quant_lightning_indexer_v2_torch_adpt.h"
 #include "attention/kv_quant_sparse_flash_attention_vllm/kv_quant_sparse_flash_attention_vllm_torch_adpt.h"
+#include "attention/swiglu_quant_v310/swiglu_quant_v310_torch_adpt.h"
 #include "attention/fused_sparse_attention_overlap/fused_sparse_attention_overlap_torch_adpt.h"
 #include "attention/fused_lightning_indexer_manage/fused_lightning_indexer_manage_torch_adpt.h"
 #include "attention/fused_scatter_copy_sparse_flash_attention/fused_scatter_copy_sparse_flash_attention_torch_adpt.h"
@@ -55,6 +56,7 @@
 #include "attention/kda_gate_cumsum_vllm/kda_gate_cumsum_vllm_torch_adpt.h"
 #include "attention/kda_layout_swap12/kda_layout_swap12_torch_adpt.h"
 #include "qbmm/quant_batch_matmul_v3/quant_batch_matmul_v3_torch_adpt.h"
+#include "qbmm/quant_batch_matmul_v3_x/quant_batch_matmul_v3_x_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
 #include "attention/k2q_csr/k2q_csr_torch_adpt.h"
 #include "attention/msa_index_score/msa_index_score_torch_adpt.h"
@@ -3132,6 +3134,25 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                       bool transpose_x2=False, "
         "                       int group_size=0) -> Tensor");
     ops.impl("quant_batch_matmul_v3", torch::kPrivateUse1, &vllm_ascend::quant_batch_matmul_v3);
+
+    ops.def(
+        "quant_batch_matmul_v3_x(Tensor x1, "
+        "                         Tensor x2, "
+        "                         Tensor scale, "
+        "                         Tensor? offset=None, "
+        "                         Tensor? pertoken_scale=None, "
+        "                         Tensor? bias=None, "
+        "                         bool transpose_x1=False, "
+        "                         bool transpose_x2=False, "
+        "                         int group_size=0, "
+        "                         bool enable_k_pipeline=False) -> Tensor");
+    ops.impl("quant_batch_matmul_v3_x", torch::kPrivateUse1, &vllm_ascend::quant_batch_matmul_v3_x);
+
+    ops.def(
+        "npu_swiglu_quant_v310(Tensor x, "
+        "                      Tensor scale, "
+        "                      Tensor offset) -> (Tensor output)");
+    ops.impl("npu_swiglu_quant_v310", torch::kPrivateUse1, &vllm_ascend::npu_swiglu_quant_v310);
 
     ops.def(
         "npu_copy_and_expand_dflash_inputs(Tensor next_token_ids, Tensor target_positions, "

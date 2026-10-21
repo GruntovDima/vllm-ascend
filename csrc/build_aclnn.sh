@@ -84,11 +84,13 @@ if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
 
     CUSTOM_OPS_ARRAY=(
         "causal_conv1d_v310"
+        "swiglu_quant_v310"
         "recurrent_gated_delta_rule_v310"
         "chunk_fwd_o_vllm"
         "chunk_gated_delta_rule_compute_wy"
         "chunk_gated_delta_rule_fwd_h_vllm"
         "quant_batch_matmul_v3"
+        "quant_batch_matmul_v3_x"
         "copy_and_expand_dflash_inputs"
         "adn_rms_norm"
         "rejection_sample_greedy_v310"
