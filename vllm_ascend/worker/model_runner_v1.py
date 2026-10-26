@@ -2555,12 +2555,15 @@ class NPUModelRunner(GPUModelRunner):
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
             if ascend_envs.VLLM_ASCEND_LAST_PREFILL_MLP:
                 get_forward_context().last_prefill_mlp_rows = scheduler_output.total_num_scheduled_tokens
+                if self.input_batch.num_reqs > 1:
+                    # Per-request last rows (BS2): the helpers gather/scatter these.
+                    get_forward_context().last_prefill_mlp_keep_rows = logits_indices
                 # Explicit consumer contract: no prompt-logprob/pooling/all-row
                 # consumer, one request and one last-row logit, no verification.
                 # The model helper additionally checks aux layers and runtime.
                 get_forward_context().last_prefill_mlp_allowed = (
                     is_310p_dflash_full_decode_only(self.vllm_config)
-                    and self.input_batch.num_reqs == 1
+                    and 1 <= self.input_batch.num_reqs <= max(1, ascend_envs.VLLM_ASCEND_LAST_PREFILL_MAX_REQS)
                     and spec_decode_metadata is None
                     and not scheduler_output.scheduled_spec_decode_tokens
                     and not self.num_prompt_logprobs
@@ -2571,7 +2574,7 @@ class NPUModelRunner(GPUModelRunner):
                     and self.parallel_config.tensor_parallel_size == 1
                     and self.parallel_config.pipeline_parallel_size == 1
                     and self.lora_config is None
-                    and logits_indices.shape[0] == 1
+                    and logits_indices.shape[0] == self.input_batch.num_reqs
                     and num_tokens_padded == scheduler_output.total_num_scheduled_tokens
                 )
             hidden_states = self._model_forward(

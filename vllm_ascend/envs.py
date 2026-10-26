@@ -181,6 +181,22 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LAST_PREFILL_ATTN_OUTPUT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_LAST_PREFILL_ATTN_OUTPUT", "0"))
     ),
+    # Maximum number of new requests for which the LAST_PREFILL shortcuts keep
+    # per-request last rows (1 = original single-request contract, 2 = BS2).
+    "VLLM_ASCEND_LAST_PREFILL_MAX_REQS": lambda: int(
+        os.getenv("VLLM_ASCEND_LAST_PREFILL_MAX_REQS", "1")
+    ),
+    # Engine-core input coalescing (startup-only, non-sensitive, numerically
+    # neutral): after an idle->busy transition, wait up to GRACE ms (and at
+    # least QUIET ms after the last handled message) for requests that arrive
+    # together, so simultaneous prefills are batched instead of serialized.
+    # 0 disables. Milliseconds.
+    "VLLM_ASCEND_INPUT_BURST_GRACE_MS": lambda: float(
+        os.getenv("VLLM_ASCEND_INPUT_BURST_GRACE_MS", "0")
+    ),
+    "VLLM_ASCEND_INPUT_BURST_QUIET_MS": lambda: float(
+        os.getenv("VLLM_ASCEND_INPUT_BURST_QUIET_MS", "5")
+    ),
     # Optional 310P QBMM prefill row-alignment policy. Comma-separated
     # output-width:row-alignment pairs, e.g. ``12288:64,24576:32``.
     # Empty means no model-side padding. Startup-only, non-sensitive.

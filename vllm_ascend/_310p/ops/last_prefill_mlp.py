@@ -73,10 +73,22 @@ def last_prefill_mlp_eligible(context, rows, aux_layers, final_capture_index):
     )
 
 
+def _kept_rows(context):
+    keep = getattr(context, "last_prefill_mlp_keep_rows", None)
+    return 1 if keep is None else int(keep.numel())
+
+
 def selected_mlp_output(mlp, x):
-    last = mlp(x[-1:])
-    output = torch.zeros_like(x)
-    output[-1:] = last
+    keep = getattr(get_forward_context(), "last_prefill_mlp_keep_rows", None)
+    if keep is None:
+        last = mlp(x[-1:])
+        output = torch.zeros_like(x)
+        output[-1:] = last
+        return output
+    # BS2: compute the MLP only for each request's last actual row.
+    picked = mlp(x.index_select(0, keep))
+    output = x.new_zeros((x.shape[0], picked.shape[-1]))
+    output.index_copy_(0, keep, picked)
     return output
 
 
@@ -107,18 +119,27 @@ def maybe_last_prefill_mlp(decoder, x):
         return None
     output = selected_mlp_output(decoder.mlp, x)
     decoder.last_prefill_mlp_calls += 1
-    decoder.last_prefill_mlp_skipped_rows += x.shape[0] - 1
+    decoder.last_prefill_mlp_skipped_rows += x.shape[0] - _kept_rows(get_forward_context())
     return output
 
 
 def selected_attention_output(attention, x, gate):
     """Keep full QKV/attention/cache work; shorten only the pure output tail."""
-    last = x[-1:]
+    keep = getattr(get_forward_context(), "last_prefill_mlp_keep_rows", None)
+    if keep is None:
+        last = x[-1:]
+        if gate is not None:
+            last = last * torch.sigmoid(gate[-1:])
+        last, _ = attention.o_proj(last)
+        output = last.new_zeros((x.shape[0], last.shape[-1]))
+        output[-1:] = last
+        return output
+    picked = x.index_select(0, keep)
     if gate is not None:
-        last = last * torch.sigmoid(gate[-1:])
-    last, _ = attention.o_proj(last)
-    output = last.new_zeros((x.shape[0], last.shape[-1]))
-    output[-1:] = last
+        picked = picked * torch.sigmoid(gate.index_select(0, keep))
+    picked, _ = attention.o_proj(picked)
+    output = picked.new_zeros((x.shape[0], picked.shape[-1]))
+    output.index_copy_(0, keep, picked)
     return output
 
 
@@ -131,16 +152,25 @@ def maybe_last_prefill_attention_output(attention, x, gate):
         return None
     output = selected_attention_output(attention, x, gate)
     attention.last_prefill_attn_output_calls += 1
-    attention.last_prefill_attn_output_skipped_rows += x.shape[0] - 1
+    attention.last_prefill_attn_output_skipped_rows += x.shape[0] - _kept_rows(get_forward_context())
     return output
 
 
 def selected_norm_output(norm, norm_fn, x, residual):
-    last, last_residual = norm_fn(x[-1:], residual[-1:], norm.weight, norm.variance_epsilon)
+    keep = getattr(get_forward_context(), "last_prefill_mlp_keep_rows", None)
+    if keep is None:
+        last, last_residual = norm_fn(x[-1:], residual[-1:], norm.weight, norm.variance_epsilon)
+        output = torch.zeros_like(x)
+        output_residual = torch.zeros_like(residual)
+        output[-1:] = last
+        output_residual[-1:] = last_residual
+        return output, output_residual
+    picked, picked_residual = norm_fn(
+        x.index_select(0, keep), residual.index_select(0, keep), norm.weight, norm.variance_epsilon)
     output = torch.zeros_like(x)
     output_residual = torch.zeros_like(residual)
-    output[-1:] = last
-    output_residual[-1:] = last_residual
+    output.index_copy_(0, keep, picked)
+    output.index_copy_(0, keep, picked_residual)
     return output, output_residual
 
 
@@ -157,5 +187,5 @@ def maybe_last_prefill_norm(norm, norm_fn, x, residual):
         return None
     output = selected_norm_output(norm, norm_fn, x, residual)
     norm.last_prefill_norm_calls += 1
-    norm.last_prefill_norm_skipped_rows += x.shape[0] - 1
+    norm.last_prefill_norm_skipped_rows += x.shape[0] - _kept_rows(get_forward_context())
     return output
