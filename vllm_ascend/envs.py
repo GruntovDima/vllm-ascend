@@ -154,6 +154,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_GDN_PREFILL_HOST_COMMIT", "0"))
     ),
+    "VLLM_ASCEND_SWIGLU_QUANT_310P": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SWIGLU_QUANT_310P", "0"))
+    ),
     # Experimental existing-CANN AddRmsNormQuant before a compatible W8A8 MLP.
     # 0/1, default off, non-sensitive, startup-only. Changes rounding in prefill;
     # graph/decode and attention input normalization retain their original path.

@@ -43,6 +43,11 @@ def ascend_process_weights_after_loading(
 
         prepare_shared_gdn_quant(model)
 
+    if is_310p() and envs.VLLM_ASCEND_SWIGLU_QUANT_310P:
+        from vllm_ascend._310p.ops.swiglu_quant_310p import prepare_swiglu_quant
+
+        prepare_swiglu_quant(model)
+
     if is_310p() and envs.VLLM_ASCEND_LAST_PREFILL_MLP:
         from vllm_ascend._310p.ops.last_prefill_mlp import prepare_last_prefill_mlp
 

@@ -2016,6 +2016,38 @@ class NPUModelRunner(GPUModelRunner):
             getattr(self, "pcp_size", 1),
         )
 
+    def _defer_first_propose(self, scheduler_output, spec_decode_metadata) -> bool:
+        """Move the first (prefill-step) draft proposal from sample_tokens into
+        take_draft_token_ids (post_step). With MPClient the step outputs reach the
+        client at output_queue.put, before post_step runs, so the draft pass of
+        the first step no longer sits on the first-token path. The computation
+        itself is unchanged: same frame, same kernels, same device order."""
+        import os
+
+        if os.environ.get("VLLM_ASCEND_DEFER_FIRST_DRAFT", "0") != "1":
+            return False
+        if self.speculative_config is None:
+            return False
+        if getattr(self.speculative_config, "method", None) != "dflash":
+            return False
+        if self.use_async_scheduling:
+            return False
+        if getattr(self, "_deferred_propose", None) is not None:
+            return False
+        # Defer on every step that schedules new (prefill) requests, including
+        # mixed prefill+decode steps (spec metadata present for the decoders).
+        return bool(getattr(scheduler_output, "scheduled_new_reqs", None))
+
+    @torch.inference_mode()
+    def take_draft_token_ids(self):
+        pending = getattr(self, "_deferred_propose", None)
+        if pending is not None:
+            self._deferred_propose = None
+            with record_function_or_nullcontext("draft_token_deferred"):
+                self._draft_token_ids = self.propose_draft_token_ids(*pending)
+                self._copy_draft_token_ids_to_cpu(pending[2])
+        return super().take_draft_token_ids()
+
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
     ) -> None:
@@ -2808,7 +2840,25 @@ class NPUModelRunner(GPUModelRunner):
                 if use_padded_batch and not early_pp_padded_drafter:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
-                    propose_draft_token_ids(sampler_output.sampled_token_ids)
+                    if self._defer_first_propose(scheduler_output, spec_decode_metadata):
+                        # Same propose, same frame: only moved into post_step
+                        # (take_draft_token_ids) so the MPClient output queue is
+                        # not blocked by the draft pass of the first step.
+                        self._deferred_propose = (
+                            sampler_output.sampled_token_ids,
+                            self.input_batch.sampling_metadata,
+                            scheduler_output,
+                            spec_decode_metadata,
+                            spec_decode_common_attn_metadata,
+                            positions,
+                            scheduler_output.total_num_scheduled_tokens,
+                            hidden_states,
+                            aux_hidden_states,
+                            sample_hidden_states,
+                            batch_desc,
+                        )
+                    else:
+                        propose_draft_token_ids(sampler_output.sampled_token_ids)
                 if self.speculative_config and not use_padded_batch:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
