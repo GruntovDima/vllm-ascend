@@ -388,6 +388,26 @@ def test_non_spec_prefill_metadata_matches_original_inputs_and_runtime_helpers(
     )
 
 
+@pytest.mark.parametrize(
+    ("query_lens", "draft_tokens", "expected_spec", "expected_non_spec"),
+    [
+        ([8] * 8 + [1920], [7] * 8 + [-1], list(range(0, 65, 8)), [0, 1920]),
+        ([3, 0, 8, 5, 1], [2, -1, 7, -1, -1], [0, 3, 11], [0, 0, 5, 6]),
+    ],
+)
+def test_mixed_spec_query_boundaries(query_lens, draft_tokens, expected_spec, expected_non_spec):
+    _, _, metadata = _build_attn_metadata(
+        BatchSpec(seq_lens=query_lens, query_lens=query_lens),
+        num_speculative_tokens=7,
+        num_decode_draft_tokens_cpu=torch.tensor(draft_tokens, dtype=torch.int32),
+    )
+
+    assert metadata.spec_query_start_loc.dtype == torch.int32
+    assert metadata.non_spec_query_start_loc.dtype == torch.int32
+    assert metadata.spec_query_start_loc.tolist() == expected_spec
+    assert metadata.non_spec_query_start_loc.tolist() == expected_non_spec
+
+
 def test_non_spec_prefill_metadata_uses_prefill_tail_for_chunk_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -733,6 +753,9 @@ def test_builder_builds_prebuilt_chunk_metadata_with_prefill_query_start_loc(mon
         attn_metadata.prefill_query_start_loc,
     )
     assert chunk_meta.cu_seqlens_host == tuple(attn_metadata.prefill_query_start_loc.to(torch.int64).tolist())
+    assert attn_metadata.non_spec_prefill_metadata.query_start_loc_host == tuple(
+        attn_metadata.non_spec_query_start_loc.to(torch.int64).tolist()
+    )
     expected_chunk_indices = runtime_prepare_chunk_indices(
         attn_metadata.prefill_query_start_loc,
         ascend_gdn_attn_builder._GDN_CHUNK_SIZE,
