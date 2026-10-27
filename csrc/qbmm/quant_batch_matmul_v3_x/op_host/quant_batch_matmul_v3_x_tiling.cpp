@@ -17,26 +17,30 @@
  * cores. Picker prefers smaller baseN when a larger choice leaves
  * cores idle, then refines with the cycle cost model.
  */
-#include <algorithm>
-#include <vector>
-#ifndef QBM_HOST_PICKER_TEST
 #include "quant_batch_matmul_v3_x_tiling.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstdio>
+#include <vector>
 #include "register/op_impl_registry.h"
 #include "../op_kernel/quant_batch_matmul_v3_x_tiling_key.h"
-#endif
 #include "../op_kernel/quant_batch_matmul_v3_x_config.h"
 #include "tiling_cost_model.h"
-#include "qbmm_k_pipeline_policy.h"
 
-#ifndef QBM_HOST_PICKER_TEST
 #ifndef ASCENDC_EXTERN_C
 #define ASCENDC_EXTERN_C extern "C"
 #endif
 
 using namespace ge;
-#endif
 
 namespace optiling {
+
+// Experiment-only env overrides (local tuning; unset = no effect).
+static uint32_t EnvU32(const char *name) {
+    const char *v = std::getenv(name);
+    return v ? static_cast<uint32_t>(std::atoi(v)) : 0U;
+}
 
 static inline uint32_t AlignUpU(uint32_t val, uint32_t align) {
     return ((val + align - 1) / align) * align;
@@ -132,7 +136,7 @@ static Int8TilingResult ComputeInt8Tiling(
 
     std::vector<uint32_t> kbCands;
     BuildKbCandidates(Kq, kbCands);
-    if (kbCands.empty()) return {0, 0, 0, 0, 0};
+    if (kbCands.empty()) return {0, 0, 0, 0};
 
     // L0 ping/pong: each L0 buffer holds two K-passes, so per-pass budget
     // is half the physical L0 size. Halved here; kernel alternates offsets.
@@ -327,6 +331,21 @@ static Int8TilingResult ComputeInt8Tiling(
             // cost model sees the actual MTE2 cadence.
             const uint32_t candWChunk = ComputeWChunkKPasses(
                 tryM, baseN, tryK, K, Kq, l1Size);
+            const uint32_t forceBM = EnvU32("QBM_T_BM");
+            const uint32_t forceBN = EnvU32("QBM_T_BN");
+            const uint32_t forceBK = EnvU32("QBM_T_BK");
+            // Decode-only Nb override. Wide decode shapes (N >= 8192, M <= 32)
+            // measured faster with baseN=320 on 310P; prefill (M > 32) and the
+            // small GDN projections keep the automatic tiling.
+            const uint32_t forceDecodeN = EnvU32("QBM_DECODE_BN");
+            const bool applyDecodeN =
+                (forceDecodeN != 0) && (M <= 32) && (N >= 8192);
+            if ((forceBM != 0 && tryM != forceBM) ||
+                (forceBN != 0 && baseN != forceBN) ||
+                (forceBK != 0 && tryK != forceBK) ||
+                (applyDecodeN && baseN != forceDecodeN)) {
+                continue;
+            }
             candidates.push_back({tryM, baseN, tryK, chunk, candWChunk});
 
             bool better = false;
@@ -362,6 +381,19 @@ static Int8TilingResult ComputeInt8Tiling(
     shape.isPerTensor = (isPerTensor != 0);
     shape.scaleType   = scaleType;
 
+    // L0B band structure: a Nb whose N0-fractal count is not a power of two
+    // (96->6, 192->12, 320->20) strides L0B rows across banks unevenly; the
+    // cost model assumes Nb-independent MTE1/cube efficiency and otherwise
+    // prefers these cells for their exact-divide tail. Measured on 310P:
+    // pow2 Nb beats them by 10-15% at equal work (e.g. prefill N=12288:
+    // Nb=64 2.83 ms vs Nb=96 3.34 ms). Demote non-pow2 Nb so a pow2
+    // alternative wins unless the model sees a large (>30%) deficit.
+    auto withL0bBandPenalty = [](uint64_t cyc, uint32_t baseN) -> uint64_t {
+        const uint32_t n0 = baseN / COL_ALIGN;
+        const bool pow2 = (n0 != 0) && ((n0 & (n0 - 1)) == 0);
+        return pow2 ? cyc : cyc * 13 / 10;
+    };
+
     uint64_t bestCyc = UINT64_MAX;
     Int8TilingResult pick{0, 0, 0, 0, 0};
     for (const auto& c : candidates) {
@@ -369,8 +401,14 @@ static Int8TilingResult ComputeInt8Tiling(
             Q, c.baseN, N, isPerTensor, scaleType);
         TilingCandidate tile{c.baseM, c.baseN, c.baseK, c.phaseXChunk,
                              c.wChunkKPasses, candCoalesce};
-        uint64_t cyc = EstimatePerCoreCriticalPath(tile, shape, aicNum);
-        if (cyc < bestCyc) {
+        uint64_t cyc = withL0bBandPenalty(
+            EstimatePerCoreCriticalPath(tile, shape, aicNum), c.baseN);
+        if (std::getenv("QBM_T_DBG") != nullptr) {
+            std::fprintf(stderr, "QBMCAND bm=%u bn=%u bk=%u cyc=%llu\n",
+                         c.baseM, c.baseN, c.baseK,
+                         (unsigned long long)cyc);
+        }
+        if (cyc < bestCyc || (cyc == bestCyc && c.baseN > pick.baseN)) {
             bestCyc = cyc;
             pick = c;
         }
@@ -396,8 +434,8 @@ static Int8TilingResult ComputeInt8Tiling(
             TilingCandidate ct{c.baseM, c.baseN, c.baseK,
                                 c.phaseXChunk, c.wChunkKPasses,
                                 candCoalesce};
-            uint64_t candCyc = EstimatePerCoreCriticalPath(
-                ct, shape, aicNum);
+            uint64_t candCyc = withL0bBandPenalty(
+                EstimatePerCoreCriticalPath(ct, shape, aicNum), c.baseN);
             if (candCyc > bestCyc) continue;
             bestCbCount = candCb;
             pick = c;
@@ -512,7 +550,6 @@ static void BuildKbCandidates(uint32_t K, std::vector<uint32_t> &out)
     out.erase(std::unique(out.begin(), out.end()), out.end());
 }
 
-#ifndef QBM_HOST_PICKER_TEST
 ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     if (context == nullptr) return ge::GRAPH_FAILED;
 
@@ -553,13 +590,10 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
 
     // Get transpose_x2 attr (index 2 in attr list)
     bool transposeX2 = false;
-    bool requestKPipeline = false;
     auto attrs = context->GetAttrs();
     if (attrs != nullptr) {
         auto tx2 = attrs->GetAttrPointer<bool>(2);
         if (tx2 != nullptr) transposeX2 = *tx2;
-        auto kPipeline = attrs->GetAttrPointer<bool>(4);
-        if (kPipeline != nullptr) requestKPipeline = *kPipeline;
     }
 
     // Get N from x2 (FRACTAL_NZ or ND, respecting transpose_x2)
@@ -640,16 +674,6 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     // K-tail by the caller's ND->ZN conversion. (Grouped quant already
     // requires K % (Q*32) == 0 above, which implies kTail == 0 for Q>1.)
     uint32_t kTail = K % 32U;
-
-    // The partial K-fractal MTE2 in WeightMte2 reads the compact
-    // [N1, N0, K_tail] GM section with a per-N0 stride of CUBE_N0 * kTail
-    // bytes, which must land on a 32-byte block boundary. CUBE_N0 is 16, so
-    // that holds only for even kTail; an odd kTail silently mis-strides the
-    // weight reads. Reject it here rather than corrupt results.
-    if (kTail % 2U != 0U) {
-        return ge::GRAPH_FAILED;
-    }
-
     uint32_t K_padded = (kTail != 0) ? (K + (32U - kTail)) : K;
 
     // Reserve UB for the persistent ubBias_ buffer (N int32 + bank pad)
@@ -709,6 +733,14 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     gridShape.scaleType = scaleType;
     CoreGrid grid = PickCoreGrid(aicNum, virtualM, totalColBatch,
                                   gridTile, gridShape);
+    {
+        const uint32_t forceMC = EnvU32("QBM_T_MC");
+        const uint32_t forceNC = EnvU32("QBM_T_NC");
+        if (forceMC != 0 && forceNC != 0 && forceMC * forceNC <= aicNum) {
+            grid.MCoreNum = forceMC;
+            grid.NCoreNum = forceNC;
+        }
+    }
     uint32_t gridCores = grid.MCoreNum * grid.NCoreNum;
     uint32_t usedCoreNum = std::min(gridCores, std::max(1U, totalWork));
 
@@ -784,6 +816,17 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
         (2U * l0cHalfBytes <= l0CSize) ? 1U : 0U;
     tilingData.set_dbL0c(dbL0c);
 
+    if (std::getenv("QBM_T_DBG") != nullptr) {
+        std::fprintf(stderr,
+                     "QBMDBG M=%u N=%u K=%u baseM=%u baseN=%u baseK=%u "
+                     "pxChunk=%u wCh=%u grid=%ux%u cores=%u work=%u "
+                     "l2=%u dbL0c=%u\n",
+                     M, N, K, baseM, baseN, baseK,
+                     t.phaseXChunk, t.wChunkKPasses,
+                     grid.MCoreNum, grid.NCoreNum, usedCoreNum, totalWork,
+                     l2HintMode, dbL0c);
+    }
+
     // Pertoken coalesce: when (B*M*4) fits a small UB budget, fire
     // ONE MTE2 at Process entry covering ALL B*M floats; per-mTile use
     // indexes into the persistent buffer. Saves ~422 cyc setup *
@@ -801,27 +844,14 @@ ASCENDC_EXTERN_C ge::graphStatus TilingQBM(gert::TilingContext* context) {
     // single-shot Phase D drain over the full mAligned range.
     tilingData.set_ubCalcM(0U);
 
-    // Default-off, deliberately narrow specialization. This changes only
-    // the enqueue point for the already-existing next-weight prefetch; it
-    // does not alter tile sizes, core ownership, arithmetic, or buffers.
-    // Static W8A8 uses encoded INT64/UINT64 scale, no per-token scale, and
-    // Q == 1. The one-pass L1 chunk is the only baseline case whose next
-    // weight DMA is currently deferred until after the MMAD loop.
-    const uint32_t kPasses =
-        (K_padded + baseK - 1U) / baseK;
-    const uint32_t enableKPipeline = SelectQbmKPipeline(
-        requestKPipeline, quantGroupNum, scaleType, isPerTensor,
-        hasPertoken, kTail, N, t.wChunkKPasses, kPasses);
-    tilingData.set_enableKPipeline(enableKPipeline);
-
     context->SetBlockDim(usedCoreNum);
 
     // 310P uses BASIC + NOT_PERTOKEN: unified vector dequant for all paths.
     context->SetTilingKey(GET_TPL_TILING_KEY(
-        QUANT_BATCH_MATMUL_V3_X_B_TRANS,
-        QUANT_BATCH_MATMUL_V3_X_KERNEL_TEMPLATE_TYPE_BASIC,
-        QUANT_BATCH_MATMUL_V3_X_NOT_PERTOKEN,
-        QUANT_BATCH_MATMUL_V3_X_OPTION_ATTR_NONE));
+        QUANT_BATCH_MATMUL_V3_B_TRANS,
+        QUANT_BATCH_MATMUL_V3_KERNEL_TEMPLATE_TYPE_BASIC,
+        QUANT_BATCH_MATMUL_V3_NOT_PERTOKEN,
+        QUANT_BATCH_MATMUL_V3_OPTION_ATTR_NONE));
 
     tilingData.SaveToBuffer(context->GetRawTilingData()->GetData(),
                             context->GetRawTilingData()->GetCapacity());
@@ -843,6 +873,5 @@ ASCENDC_EXTERN_C ge::graphStatus TilingPrepareForQBM(gert::TilingParseContext* c
 IMPL_OP_OPTILING(QuantBatchMatmulV3X)
 .Tiling(TilingQBM)
 .TilingParse<QBMCompileInfo>(TilingPrepareForQBM);
-#endif
 
 }  // namespace optiling

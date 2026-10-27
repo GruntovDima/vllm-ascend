@@ -97,8 +97,8 @@
  *   MTE1_MTE2       (ID0/1) wL1Ping/wL1Pong free (MTE1 -> MTE2)
  */
 
-#ifndef QUANT_BATCH_MATMUL_V3_X_INT8_H
-#define QUANT_BATCH_MATMUL_V3_X_INT8_H
+#ifndef QUANT_BATCH_MATMUL_V3_INT8_H
+#define QUANT_BATCH_MATMUL_V3_INT8_H
 
 #include "quant_batch_matmul_v3_x_utils.h"
 #include "quant_batch_matmul_v3_x_config.h"
@@ -170,7 +170,6 @@ private:
     uint32_t dbL0c_;                    // 1 = L0C ping-pong (alternate halves per cb)
     uint32_t pertokenCoalesce_;         // 1 = single MTE2 covers all B*M; 0 = per-mTile
     uint32_t hasBias_;                  // 1 = bias[N] int32 broadcast into L0C before Mmad
-    uint32_t enableKPipeline_;          // 1 = prefetch next single-pass wL1 buffer before current Mmad
     uint32_t ubCalcM_;                  // Inner-tile Phase D rows per mu (0 = disabled)
     uint32_t kTail_;                    // K % 32 (0 = K0-aligned; >0 = partial last K0-group)
     uint32_t kPadded_;                  // K rounded up to K0=32 (= K_ when kTail_==0)
@@ -240,4 +239,4 @@ private:
 #include "quant_batch_matmul_v3_x_int8_helpers.h"
 #include "quant_batch_matmul_v3_x_int8_process.h"
 
-#endif  // QUANT_BATCH_MATMUL_V3_X_INT8_H
+#endif  // QUANT_BATCH_MATMUL_V3_INT8_H

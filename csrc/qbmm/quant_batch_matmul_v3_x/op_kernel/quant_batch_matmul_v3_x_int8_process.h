@@ -16,8 +16,8 @@
  * Included by quant_batch_matmul_v3_x_int8.h AFTER the class
  * declaration; do not include directly.
  */
-#ifndef QUANT_BATCH_MATMUL_V3_X_INT8_PROCESS_H
-#define QUANT_BATCH_MATMUL_V3_X_INT8_PROCESS_H
+#ifndef QUANT_BATCH_MATMUL_V3_INT8_PROCESS_H
+#define QUANT_BATCH_MATMUL_V3_INT8_PROCESS_H
 
 namespace QBM {
 
@@ -579,14 +579,9 @@ __aicore__ inline void QBMInt8Compute<SCALE_TYPE>::Process()
 
                         // Pre-loop next-chunk MTE2 (overlaps with Cube/MTE1).
                         // Order: next chunk -> next ch -> next cb. Only when
-                        // wChunkKPasses_ > 1 in the established path. The
-                        // guarded experiment extends this enqueue point to
-                        // wChunkKPasses_ == 1: ping/pong keeps the destination
-                        // disjoint from curWL1, so the next weight MTE2 can run
-                        // while this pass's L0 loads and MMAD consume current
-                        // data. The old post-loop ordering remains the fallback.
+                        // wChunkKPasses_ > 1; post-loop emit covers the rest.
                         bool nxPrefetchFired = false;
-                        if (wChunkKPasses_ > 1 || enableKPipeline_) {
+                        if (wChunkKPasses_ > 1) {
                             uint32_t nxChunkStartKpPre = chunkStartKp + chunkKps;
                             bool hasNextPre = false;
                             uint32_t nxChPre = 0, nxCbPre = 0;
@@ -1083,4 +1078,4 @@ __aicore__ inline void QBMInt8Compute<SCALE_TYPE>::Process()
 
 }  // namespace QBM
 
-#endif  // QUANT_BATCH_MATMUL_V3_X_INT8_PROCESS_H
+#endif  // QUANT_BATCH_MATMUL_V3_INT8_PROCESS_H

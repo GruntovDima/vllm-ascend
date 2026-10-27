@@ -13,8 +13,8 @@
  * \brief TilingData declarations for QuantBatchMatmulV3X (Ascend 310P).
  * \author Feodor Pisnitchenko
  */
-#ifndef QUANT_BATCH_MATMUL_V3_X_TILING_H
-#define QUANT_BATCH_MATMUL_V3_X_TILING_H
+#ifndef QUANT_BATCH_MATMUL_V3_TILING_H
+#define QUANT_BATCH_MATMUL_V3_TILING_H
 
 #include <exe_graph/runtime/tiling_context.h>
 #include "register/tilingdata_base.h"
@@ -65,9 +65,6 @@ TILING_DATA_FIELD_DEF(uint32_t, kTail);            // K % 32; non-zero requires 
 //                                partial VDEQ16 does not race with the
 //                                still-in-flight MTE3 CopyOut.
 TILING_DATA_FIELD_DEF(uint32_t, ubCalcM);
-// Opt-in specialization: with one K-pass per weight-L1 buffer, enqueue the
-// next buffer's MTE2 before the current MMAD. Zero preserves old ordering.
-TILING_DATA_FIELD_DEF(uint32_t, enableKPipeline);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(QuantBatchMatmulV3X, QBMTilingData)
@@ -99,4 +96,4 @@ inline int64_t DeriveN(const ShapeT& x2Shape, bool transposeX2)
 
 }  // namespace optiling
 
-#endif  // QUANT_BATCH_MATMUL_V3_X_TILING_H
+#endif  // QUANT_BATCH_MATMUL_V3_TILING_H

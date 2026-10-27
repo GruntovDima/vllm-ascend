@@ -16,8 +16,8 @@
  * Included by quant_batch_matmul_v3_x_int8.h AFTER the class
  * declaration; do not include directly.
  */
-#ifndef QUANT_BATCH_MATMUL_V3_X_INT8_INIT_H
-#define QUANT_BATCH_MATMUL_V3_X_INT8_INIT_H
+#ifndef QUANT_BATCH_MATMUL_V3_INT8_INIT_H
+#define QUANT_BATCH_MATMUL_V3_INT8_INIT_H
 
 namespace QBM {
 
@@ -105,11 +105,6 @@ __aicore__ inline void QBMInt8Compute<SCALE_TYPE>::Init(
         // init_c=false so X@W accumulates onto bias. VDEQ16 then
         // dequantizes (bias + X@W) * scale in one fp16 truncation.
         hasBias_ = p->hasBias;
-
-        // The host has already applied all specialization guards. Keeping
-        // this as tiling data (rather than a device-side shape heuristic)
-        // makes the default and fallback paths explicit and deterministic.
-        enableKPipeline_ = p->enableKPipeline;
 
         // Inner-tile Phase D: rows per mu slice in the cb-loop tail (0 = disabled).
         ubCalcM_ = p->ubCalcM;
@@ -384,4 +379,4 @@ __aicore__ inline void QBMInt8Compute<SCALE_TYPE>::Init(
 
 }  // namespace QBM
 
-#endif  // QUANT_BATCH_MATMUL_V3_X_INT8_INIT_H
+#endif  // QUANT_BATCH_MATMUL_V3_INT8_INIT_H

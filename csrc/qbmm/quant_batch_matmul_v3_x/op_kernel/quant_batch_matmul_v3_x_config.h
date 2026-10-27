@@ -16,8 +16,8 @@
  * No __aicore__ content -- safe to include from both host tiling and
  * kernel code.
  */
-#ifndef QUANT_BATCH_MATMUL_V3_X_CONFIG_H
-#define QUANT_BATCH_MATMUL_V3_X_CONFIG_H
+#ifndef QUANT_BATCH_MATMUL_V3_CONFIG_H
+#define QUANT_BATCH_MATMUL_V3_CONFIG_H
 
 #include <cstdint>
 
@@ -106,4 +106,4 @@ constexpr uint32_t BLOCKED_ZN_N_ELEMS = BLOCKED_ZN_NG * 16;
 
 }  // namespace qbmv3
 
-#endif  // QUANT_BATCH_MATMUL_V3_X_CONFIG_H
+#endif  // QUANT_BATCH_MATMUL_V3_CONFIG_H

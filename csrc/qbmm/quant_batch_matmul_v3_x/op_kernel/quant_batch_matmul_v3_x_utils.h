@@ -13,8 +13,8 @@
  * \brief Kernel-side scalar utilities (AlignUp, Min, scale-type tag) for the INT8 kernel.
  * \author Feodor Pisnitchenko
  */
-#ifndef QUANT_BATCH_MATMUL_V3_X_UTILS_H
-#define QUANT_BATCH_MATMUL_V3_X_UTILS_H
+#ifndef QUANT_BATCH_MATMUL_V3_UTILS_H
+#define QUANT_BATCH_MATMUL_V3_UTILS_H
 
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
@@ -52,4 +52,4 @@ __aicore__ inline T Min(T a, T b) {
 
 }  // namespace QBM
 
-#endif  // QUANT_BATCH_MATMUL_V3_X_UTILS_H
+#endif  // QUANT_BATCH_MATMUL_V3_UTILS_H

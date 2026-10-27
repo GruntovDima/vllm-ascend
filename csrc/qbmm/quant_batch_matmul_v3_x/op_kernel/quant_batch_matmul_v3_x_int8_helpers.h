@@ -16,8 +16,8 @@
  * Included by quant_batch_matmul_v3_x_int8.h AFTER the class
  * declaration; do not include directly.
  */
-#ifndef QUANT_BATCH_MATMUL_V3_X_INT8_HELPERS_H
-#define QUANT_BATCH_MATMUL_V3_X_INT8_HELPERS_H
+#ifndef QUANT_BATCH_MATMUL_V3_INT8_HELPERS_H
+#define QUANT_BATCH_MATMUL_V3_INT8_HELPERS_H
 
 namespace QBM {
 
@@ -211,4 +211,4 @@ __aicore__ inline void QBMInt8Compute<SCALE_TYPE>::PrefetchWeightToL1(uint32_t c
 
 }  // namespace QBM
 
-#endif  // QUANT_BATCH_MATMUL_V3_X_INT8_HELPERS_H
+#endif  // QUANT_BATCH_MATMUL_V3_INT8_HELPERS_H
